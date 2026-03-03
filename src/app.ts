@@ -9,6 +9,7 @@ import settingsRouter from "./routes/settings";
 import webhooksRouter from "./routes/webhooks";
 import unipileRouter from "./routes/unipile";
 import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
+import phoneLineRouter from "./routes/phone-lines";
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use("/api", requireAuth(), apiRouter);
 app.use("/api", requireAuth(), settingsRouter);
 app.use("/api", requireAuth(), unipileRouter);
 app.use("/api", requireAuth(), twilioAuthRouter);
+app.use("/api", requireAuth(), phoneLineRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

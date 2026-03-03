@@ -5,6 +5,9 @@ import { imports } from "./imports";
 import { settings } from "./settings";
 import { linkedinRateLimits } from "./linkedin-rate-limits";
 import { organizations, users } from "./organizations";
+import { phoneLines } from "./phone-lines";
+import { regulatoryBundles } from "./regulatory-bundles";
+import { callRecords } from "./call-records";
 
 export const funnelsRelations = relations(funnels, ({ many }) => ({
   steps: many(funnelSteps),
@@ -53,5 +56,18 @@ export const usersRelations = relations(users, ({ one }) => ({
   organization: one(organizations, {
     fields: [users.organizationId],
     references: [organizations.id],
+  }),
+}));
+
+export const phoneLinesRelations = relations(phoneLines, ({ many }) => ({
+  callRecords: many(callRecords),
+}));
+
+export const regulatoryBundlesRelations = relations(regulatoryBundles, () => ({}));
+
+export const callRecordsRelations = relations(callRecords, ({ one }) => ({
+  phoneLine: one(phoneLines, {
+    fields: [callRecords.lineId],
+    references: [phoneLines.id],
   }),
 }));
