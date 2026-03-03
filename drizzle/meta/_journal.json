@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1770558484591,
+      "tag": "0000_tricky_metal_master",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1770619333294,
+      "tag": "0001_silent_gorgon",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1770658404975,
+      "tag": "0002_fancy_black_bolt",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1770661302444,
+      "tag": "0003_massive_invisible_woman",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1770662306031,
+      "tag": "0004_glorious_doctor_faustus",
+      "breakpoints": true
+    }
+  ]
+}
