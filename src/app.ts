@@ -10,6 +10,8 @@ import webhooksRouter from "./routes/webhooks";
 import unipileRouter from "./routes/unipile";
 import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
 import phoneLineRouter from "./routes/phone-lines";
+import adminRouter from "./routes/admin";
+import { requireAdmin } from "./lib/admin-auth";
 
 const app = express();
 
@@ -37,6 +39,9 @@ app.use("/api", requireAuth(), settingsRouter);
 app.use("/api", requireAuth(), unipileRouter);
 app.use("/api", requireAuth(), twilioAuthRouter);
 app.use("/api", requireAuth(), phoneLineRouter);
+
+// Admin routes (authenticated + admin role check)
+app.use("/api/admin", requireAuth(), requireAdmin, adminRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
