@@ -7,6 +7,8 @@ export { organizations, users } from "./organizations";
 export { phoneLines } from "./phone-lines";
 export { regulatoryBundles } from "./regulatory-bundles";
 export { callRecords } from "./call-records";
+export { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
+export { discoveryRuns, scraperContacts } from "./contacts";
 export {
   funnelsRelations,
   funnelStepsRelations,
@@ -20,4 +22,9 @@ export {
   phoneLinesRelations,
   regulatoryBundlesRelations,
   callRecordsRelations,
+  scraperAssignmentsRelations,
+  scraperRunsRelations,
+  scraperSignalsRelations,
+  discoveryRunsRelations,
+  scraperContactsRelations,
 } from "./relations";

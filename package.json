@@ -14,7 +14,7 @@
     "db:seed": "tsx scripts/seed.ts"
   },
   "dependencies": {
-    "@clerk/express": "^1.7.69",
+    "@clerk/express": "^2.0.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.39.0",

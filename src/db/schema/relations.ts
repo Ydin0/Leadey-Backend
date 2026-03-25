@@ -8,6 +8,8 @@ import { organizations, users } from "./organizations";
 import { phoneLines } from "./phone-lines";
 import { regulatoryBundles } from "./regulatory-bundles";
 import { callRecords } from "./call-records";
+import { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
+import { discoveryRuns, scraperContacts } from "./contacts";
 
 export const funnelsRelations = relations(funnels, ({ many }) => ({
   steps: many(funnelSteps),
@@ -69,5 +71,50 @@ export const callRecordsRelations = relations(callRecords, ({ one }) => ({
   phoneLine: one(phoneLines, {
     fields: [callRecords.lineId],
     references: [phoneLines.id],
+  }),
+}));
+
+export const scraperAssignmentsRelations = relations(scraperAssignments, ({ many }) => ({
+  runs: many(scraperRuns),
+  signals: many(scraperSignals),
+  discoveryRuns: many(discoveryRuns),
+  contacts: many(scraperContacts),
+}));
+
+export const scraperRunsRelations = relations(scraperRuns, ({ one, many }) => ({
+  assignment: one(scraperAssignments, {
+    fields: [scraperRuns.assignmentId],
+    references: [scraperAssignments.id],
+  }),
+  signals: many(scraperSignals),
+}));
+
+export const scraperSignalsRelations = relations(scraperSignals, ({ one }) => ({
+  assignment: one(scraperAssignments, {
+    fields: [scraperSignals.assignmentId],
+    references: [scraperAssignments.id],
+  }),
+  run: one(scraperRuns, {
+    fields: [scraperSignals.runId],
+    references: [scraperRuns.id],
+  }),
+}));
+
+export const discoveryRunsRelations = relations(discoveryRuns, ({ one, many }) => ({
+  assignment: one(scraperAssignments, {
+    fields: [discoveryRuns.assignmentId],
+    references: [scraperAssignments.id],
+  }),
+  contacts: many(scraperContacts),
+}));
+
+export const scraperContactsRelations = relations(scraperContacts, ({ one }) => ({
+  assignment: one(scraperAssignments, {
+    fields: [scraperContacts.assignmentId],
+    references: [scraperAssignments.id],
+  }),
+  discoveryRun: one(discoveryRuns, {
+    fields: [scraperContacts.discoveryRunId],
+    references: [discoveryRuns.id],
   }),
 }));

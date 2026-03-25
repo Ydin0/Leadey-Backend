@@ -19,6 +19,7 @@ export const users = pgTable("users", {
   lastName: text("last_name"),
   imageUrl: text("image_url"),
   role: text("role"),
+  platformRole: text("platform_role"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
