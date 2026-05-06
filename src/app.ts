@@ -13,7 +13,12 @@ import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
 import phoneLineRouter from "./routes/phone-lines";
 import scraperRouter from "./routes/scrapers";
 import contactsRouter from "./routes/contacts";
-import adminRouter from "./routes/admin";
+import templatesRouter from "./routes/templates";
+import billingRouter from "./routes/billing";
+import masterRouter from "./routes/master";
+import teamRouter from "./routes/team";
+import adminRouter, { adminMeRouter } from "./routes/admin";
+import { planGuard } from "./lib/plan-guard";
 import { requireApiAuth, requireAdmin } from "./lib/admin-auth";
 
 const app = express();
@@ -31,8 +36,9 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
-// Raw body needed for Clerk webhook signature verification — must be before express.json()
+// Raw body needed for webhook signature verification — must be before express.json()
 app.use("/webhooks/clerk", express.raw({ type: "application/json" }));
+app.use("/webhooks/stripe", express.raw({ type: "application/json" }));
 
 app.use(express.json({ limit: "8mb" }));
 app.use(express.urlencoded({ extended: false, limit: "8mb" }));
@@ -40,8 +46,11 @@ app.use(express.urlencoded({ extended: false, limit: "8mb" }));
 // Clerk session parsing (does NOT block unauthenticated requests)
 app.use(clerkMiddleware());
 
-// Admin routes — verifies JWT directly via @clerk/backend, no clerkMiddleware dependency
-app.use("/api/admin", requireApiAuth, requireAdmin, adminRouter);
+// Admin routes — verifies JWT directly via @clerk/backend, no clerkMiddleware dependency.
+// /me is authenticated but NOT admin-gated, so the frontend can probe role for any logged-in user.
+app.use("/api/admin", requireApiAuth);
+app.use("/api/admin", adminMeRouter);
+app.use("/api/admin", requireAdmin, adminRouter);
 
 // Authenticated API routes
 app.use("/api", requireAuth(), dashboardRouter);
@@ -51,7 +60,11 @@ app.use("/api", requireAuth(), unipileRouter);
 app.use("/api", requireAuth(), twilioAuthRouter);
 app.use("/api", requireAuth(), phoneLineRouter);
 app.use("/api", requireAuth(), scraperRouter);
-app.use("/api", requireAuth(), contactsRouter);
+app.use("/api", requireAuth(), billingRouter);
+app.use("/api", requireAuth(), masterRouter);
+app.use("/api", requireAuth(), teamRouter);
+app.use("/api", requireAuth(), planGuard(), contactsRouter);
+app.use("/api", requireAuth(), planGuard(), templatesRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

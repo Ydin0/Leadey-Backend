@@ -29,9 +29,11 @@ export interface BetterContactResult {
 
 export class BetterContactClient {
   private apiKey: string;
+  private webhookUrl: string | null;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, webhookUrl?: string) {
     this.apiKey = apiKey;
+    this.webhookUrl = webhookUrl || null;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -55,11 +57,15 @@ export class BetterContactClient {
 
   async submitBatch(contacts: BetterContactInput[]): Promise<BetterContactSubmitResponse> {
     const chunk = contacts.slice(0, MAX_BATCH_SIZE);
-    return this.request<BetterContactSubmitResponse>("POST", "/async", {
+    const body: Record<string, unknown> = {
       data: chunk,
       enrich_email_address: true,
       enrich_phone_number: true,
-    });
+    };
+    if (this.webhookUrl) {
+      body.webhook = this.webhookUrl;
+    }
+    return this.request<BetterContactSubmitResponse>("POST", "/async", body);
   }
 
   /**
@@ -69,11 +75,15 @@ export class BetterContactClient {
     const responses: BetterContactSubmitResponse[] = [];
     for (let i = 0; i < contacts.length; i += MAX_BATCH_SIZE) {
       const chunk = contacts.slice(i, i + MAX_BATCH_SIZE);
-      const resp = await this.request<BetterContactSubmitResponse>("POST", "/async", {
+      const body: Record<string, unknown> = {
         data: chunk,
         enrich_email_address: true,
         enrich_phone_number: true,
-      });
+      };
+      if (this.webhookUrl) {
+        body.webhook = this.webhookUrl;
+      }
+      const resp = await this.request<BetterContactSubmitResponse>("POST", "/async", body);
       responses.push(resp);
     }
     return responses;

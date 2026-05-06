@@ -1,10 +1,13 @@
 import { Router, Request, Response } from "express";
-import { eq } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { Webhook } from "svix";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
+import { scraperContacts } from "../db/schema/contacts";
+import { callRecords } from "../db/schema/call-records";
 import { organizations, users } from "../db/schema/organizations";
 import { createId } from "../lib/helpers";
+import { stripe, getPlanFromPriceId, getPlanConfig } from "../lib/stripe";
 
 const router = Router();
 
@@ -136,6 +139,9 @@ router.post("/clerk", async (req: Request, res: Response) => {
           name: data.name,
           slug: data.slug,
           imageUrl: data.image_url,
+          plan: "trial",
+          planStatus: "trialing",
+          trialEndsAt: new Date(Date.now() + 14 * 86400000), // 14-day trial
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
@@ -243,6 +249,358 @@ router.post("/clerk", async (req: Request, res: Response) => {
   } catch (err) {
     console.error(`Error handling Clerk webhook (${type}):`, err);
     res.status(500).json({ error: "Internal error processing webhook" });
+  }
+});
+
+// ─── POST /webhooks/twilio/recording ─────────────────────────────────────
+// Twilio sends recording metadata when a call recording is complete
+
+router.post("/twilio/recording", async (req: Request, res: Response) => {
+  try {
+    const callSid = req.body?.CallSid as string | undefined;
+    const recordingSid = req.body?.RecordingSid as string | undefined;
+    const recordingUrl = req.body?.RecordingUrl as string | undefined;
+    const recordingDuration = parseInt(req.body?.RecordingDuration || "0", 10);
+
+    console.log(`[Twilio Recording] CallSid=${callSid} RecordingSid=${recordingSid} Duration=${recordingDuration}s`);
+
+    if (!callSid || !recordingUrl) {
+      res.status(200).send("OK");
+      return;
+    }
+
+    // Find the call record by Twilio CallSid
+    const record = await db.query.callRecords.findFirst({
+      where: eq(callRecords.twilioCallSid, callSid),
+    });
+
+    if (record) {
+      await db
+        .update(callRecords)
+        .set({
+          recordingUrl: `${recordingUrl}.mp3`,
+          recordingSid: recordingSid || null,
+          recordingDuration,
+        })
+        .where(eq(callRecords.id, record.id));
+      console.log(`[Twilio Recording] Updated call record ${record.id} with recording URL`);
+    } else {
+      console.log(`[Twilio Recording] No call record found for CallSid=${callSid}`);
+    }
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("[Twilio Recording] Error:", err);
+    res.status(200).send("OK");
+  }
+});
+
+// ─── POST /webhooks/bettercontact ────────────────────────────────────────
+// BetterContact sends results here when enrichment completes
+
+router.post("/bettercontact", async (req: Request, res: Response) => {
+  try {
+    const body = req.body;
+    console.log(`[BetterContact Webhook] Full payload:`, JSON.stringify(body).slice(0, 2000));
+
+    // BetterContact webhook payload: { id, status, data: [...contacts] }
+    const requestId = body?.id;
+    const status = body?.status;
+    const data = body?.data;
+
+    console.log(`[BetterContact Webhook] requestId=${requestId} status=${status} contacts=${data?.length ?? 0}`);
+
+    if (!requestId) {
+      res.status(200).json({ ok: true, skipped: true, reason: "no_request_id" });
+      return;
+    }
+
+    // Always process data first if it exists — regardless of status
+    // BetterContact webhook uses different field names than the polling API:
+    //   webhook: contact_email_address, contact_phone_number, contact_first_name, contact_last_name
+    //   polling: email, phone, linkedin_url
+    let updated = 0;
+    if (Array.isArray(data) && data.length > 0) {
+      for (const item of data) {
+        // Normalize field names — support both webhook and polling formats
+        const email = item.contact_email_address || item.email || null;
+        const emailStatus = item.contact_email_address_status || item.email_status || null;
+        const phone = item.contact_phone_number || item.phone || null;
+        const phoneStatus = item.contact_phone_number_status || item.phone_status || null;
+        const firstName = item.contact_first_name || item.first_name || "";
+        const lastName = item.contact_last_name || item.last_name || "";
+        const linkedinUrl = item.linkedin_url || null;
+
+        const hasContactData = !!(email || phone);
+
+        // Match by linkedin_url if available, otherwise by first_name + last_name
+        let matchResult: { id: string }[] | undefined;
+        if (linkedinUrl) {
+          matchResult = await db
+            .update(scraperContacts)
+            .set({
+              email,
+              emailStatus,
+              phone,
+              phoneStatus,
+              enrichmentStatus: hasContactData ? "enriched" : "failed",
+              enrichedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(scraperContacts.bettercontactRequestId, requestId),
+                sql`lower(${scraperContacts.linkedinUrl}) = lower(${linkedinUrl})`,
+              ),
+            )
+            .returning({ id: scraperContacts.id });
+        }
+
+        // Fallback: match by first_name + last_name if LinkedIn URL match failed or wasn't available
+        if (!matchResult?.length && firstName && lastName) {
+          matchResult = await db
+            .update(scraperContacts)
+            .set({
+              email,
+              emailStatus,
+              phone,
+              phoneStatus,
+              enrichmentStatus: hasContactData ? "enriched" : "failed",
+              enrichedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(scraperContacts.bettercontactRequestId, requestId),
+                sql`lower(${scraperContacts.firstName}) = lower(${firstName})`,
+                sql`lower(${scraperContacts.lastName}) = lower(${lastName})`,
+              ),
+            )
+            .returning({ id: scraperContacts.id });
+        }
+
+        if (matchResult?.length) {
+          updated++;
+          // Also update master contacts with enrichment data
+          if (linkedinUrl && hasContactData) {
+            try {
+              const { upsertMasterContact } = await import("../lib/master-db");
+              // Find the org from the scraper contact
+              const contact = await db.query.scraperContacts.findFirst({
+                where: eq(scraperContacts.bettercontactRequestId, requestId),
+                columns: { organizationId: true },
+              });
+              if (contact) {
+                await upsertMasterContact(contact.organizationId, {
+                  linkedinUrl,
+                  email,
+                  emailStatus,
+                  phone,
+                  phoneStatus,
+                  enrichmentStatus: "enriched",
+                  firstName,
+                  lastName,
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+      console.log(`[BetterContact Webhook] Processed ${updated}/${data.length} contacts for requestId=${requestId}`);
+    }
+
+    // If status is terminal and some contacts weren't in the data array, mark them failed
+    if (status === "failed" || status === "terminated" || status === "finished" || status === "completed") {
+      await db
+        .update(scraperContacts)
+        .set({ enrichmentStatus: "failed", updatedAt: new Date() })
+        .where(
+          and(
+            eq(scraperContacts.bettercontactRequestId, requestId),
+            eq(scraperContacts.enrichmentStatus, "pending"),
+          ),
+        );
+    }
+
+    res.status(200).json({ ok: true, action: updated > 0 ? "updated" : "acknowledged", count: updated, status });
+  } catch (err) {
+    console.error("[BetterContact Webhook] Error:", err);
+    res.status(200).json({ ok: true, error: "internal" });
+  }
+});
+
+// ─── POST /webhooks/stripe ───────────────────────────────────────────────
+// Stripe subscription events
+
+router.post("/stripe", async (req: Request, res: Response) => {
+  const sig = req.headers["stripe-signature"] as string;
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event: any;
+
+  if (webhookSecret && sig) {
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err) {
+      console.error("[Stripe Webhook] Signature verification failed:", err);
+      res.status(400).send("Webhook signature verification failed");
+      return;
+    }
+  } else {
+    // In dev without webhook secret, parse body directly
+    event = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+  }
+
+  console.log(`[Stripe Webhook] ${event.type}`);
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        let orgId = session.metadata?.orgId;
+        const subscriptionId = session.subscription;
+        const customerId = session.customer;
+
+        // Fallback: find org by stripeCustomerId if metadata missing
+        if (!orgId && customerId) {
+          const [org] = await db.select({ id: organizations.id }).from(organizations)
+            .where(eq(organizations.stripeCustomerId, customerId as string));
+          if (org) orgId = org.id;
+        }
+
+        console.log(`[Stripe Checkout] orgId=${orgId} subscriptionId=${subscriptionId} customerId=${customerId}`);
+
+        if (orgId && subscriptionId) {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId as string) as any;
+          const priceId = sub.items?.data?.[0]?.price?.id || "";
+          const plan = getPlanFromPriceId(priceId);
+          const config = getPlanConfig(plan);
+          const quantity = sub.items?.data?.[0]?.quantity || config.seats;
+
+          await db
+            .update(organizations)
+            .set({
+              stripeCustomerId: customerId as string,
+              stripeSubscriptionId: subscriptionId as string,
+              stripePriceId: priceId,
+              plan,
+              planStatus: "active",
+              currentPeriodEnd: new Date(sub.current_period_end * 1000),
+              seatsIncluded: quantity,
+              creditsIncluded: config.scraperCredits * quantity,
+              updatedAt: new Date(),
+            })
+            .where(eq(organizations.id, orgId));
+
+          console.log(`[Stripe] Org ${orgId} subscribed to ${plan} with ${quantity} seats`);
+        }
+        break;
+      }
+
+      case "customer.subscription.updated": {
+        const sub = event.data.object;
+        let orgId = sub.metadata?.orgId;
+
+        // Fallback: find org by stripeCustomerId
+        if (!orgId && sub.customer) {
+          const [org] = await db.select({ id: organizations.id }).from(organizations)
+            .where(eq(organizations.stripeCustomerId, sub.customer as string));
+          if (org) orgId = org.id;
+        }
+        if (!orgId) break;
+
+        const priceId = sub.items?.data?.[0]?.price?.id || "";
+        const plan = getPlanFromPriceId(priceId);
+        const config = getPlanConfig(plan);
+        const quantity = sub.items?.data?.[0]?.quantity || config.seats;
+
+        const statusMap: Record<string, string> = {
+          active: "active",
+          trialing: "trialing",
+          past_due: "past_due",
+          canceled: "cancelled",
+          unpaid: "past_due",
+          incomplete: "past_due",
+        };
+
+        await db
+          .update(organizations)
+          .set({
+            stripePriceId: priceId,
+            plan,
+            planStatus: statusMap[sub.status] || "active",
+            currentPeriodEnd: new Date(sub.current_period_end * 1000),
+            seatsIncluded: quantity,
+            creditsIncluded: config.scraperCredits * quantity,
+            updatedAt: new Date(),
+          })
+          .where(eq(organizations.id, orgId));
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        const orgId = sub.metadata?.orgId;
+        if (!orgId) break;
+
+        await db
+          .update(organizations)
+          .set({
+            plan: "cancelled",
+            planStatus: "cancelled",
+            stripeSubscriptionId: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(organizations.id, orgId));
+
+        console.log(`[Stripe] Org ${orgId} subscription cancelled`);
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        const customerId = invoice.customer;
+
+        // Reset monthly credits on successful payment
+        const [org] = await db
+          .select()
+          .from(organizations)
+          .where(eq(organizations.stripeCustomerId, customerId as string));
+
+        if (org) {
+          await db
+            .update(organizations)
+            .set({ creditsUsed: 0, planStatus: "active", updatedAt: new Date() })
+            .where(eq(organizations.id, org.id));
+        }
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        const customerId = invoice.customer;
+
+        const [org] = await db
+          .select()
+          .from(organizations)
+          .where(eq(organizations.stripeCustomerId, customerId as string));
+
+        if (org) {
+          await db
+            .update(organizations)
+            .set({ planStatus: "past_due", updatedAt: new Date() })
+            .where(eq(organizations.id, org.id));
+
+          console.log(`[Stripe] Payment failed for org ${org.id}`);
+        }
+        break;
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("[Stripe Webhook] Error processing:", err);
+    res.status(200).json({ received: true, error: "processing_error" });
   }
 });
 

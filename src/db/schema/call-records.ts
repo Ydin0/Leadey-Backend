@@ -16,6 +16,16 @@ export const callRecords = pgTable("call_records", {
   companyName: text("company_name"),
   duration: integer("duration").notNull().default(0),
   disposition: text("disposition").notNull().default("completed"),
+  // Recording
+  recordingUrl: text("recording_url"),
+  recordingSid: text("recording_sid"),
+  recordingDuration: integer("recording_duration"),
+  // Transcription + AI
+  transcript: text("transcript"),
+  summary: text("summary"),
+  // Rep who made/received the call
+  userId: text("user_id"),
+  userName: text("user_name"),
   calledAt: timestamp("called_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

@@ -153,16 +153,25 @@ webhookRouter.post(
 
     const response = new VoiceResponse();
 
+    const webhookBase = process.env.WEBHOOK_BASE_URL;
+    const recordingCallback = webhookBase ? `${webhookBase}/webhooks/twilio/recording` : undefined;
+
     if (to && /^[\d+\-() ]+$/.test(to)) {
       // Outbound call to a phone number
       const dial = response.dial({
         callerId: callerId || from || undefined,
+        record: "record-from-answer-dual" as any,
+        recordingStatusCallback: recordingCallback,
+        recordingStatusCallbackEvent: "completed" as any,
       });
       dial.number(to);
     } else if (to) {
       // Outbound call to a Twilio client identity (browser-to-browser)
       const dial = response.dial({
         callerId: callerId || from || undefined,
+        record: "record-from-answer-dual" as any,
+        recordingStatusCallback: recordingCallback,
+        recordingStatusCallbackEvent: "completed" as any,
       });
       dial.client(to);
     } else {

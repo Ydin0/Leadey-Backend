@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm";
-import { funnels, funnelSteps } from "./funnels";
+import { funnels, funnelSteps, funnelMembers } from "./funnels";
 import { leads, leadEvents } from "./leads";
 import { imports } from "./imports";
 import { settings } from "./settings";
@@ -15,6 +15,11 @@ export const funnelsRelations = relations(funnels, ({ many }) => ({
   steps: many(funnelSteps),
   leads: many(leads),
   imports: many(imports),
+  members: many(funnelMembers),
+}));
+
+export const funnelMembersRelations = relations(funnelMembers, ({ one }) => ({
+  funnel: one(funnels, { fields: [funnelMembers.funnelId], references: [funnels.id] }),
 }));
 
 export const funnelStepsRelations = relations(funnelSteps, ({ one }) => ({

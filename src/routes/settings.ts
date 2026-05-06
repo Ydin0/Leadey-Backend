@@ -147,4 +147,38 @@ router.use(
   },
 );
 
+// ─── Organization Settings ──────────────────────────────────────────
+
+router.get(
+  "/settings/organization",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const country = await getSetting(orgId, "org_country");
+    const billingEmail = await getSetting(orgId, "org_billing_email");
+    const website = await getSetting(orgId, "org_website");
+
+    res.json({
+      data: {
+        country: country || "",
+        billingEmail: billingEmail || "",
+        website: website || "",
+      },
+    });
+  }),
+);
+
+router.put(
+  "/settings/organization",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const { country, billingEmail, website } = req.body;
+
+    if (country !== undefined) await upsertSetting(orgId, "org_country", country || "");
+    if (billingEmail !== undefined) await upsertSetting(orgId, "org_billing_email", billingEmail || "");
+    if (website !== undefined) await upsertSetting(orgId, "org_website", website || "");
+
+    res.json({ data: { country, billingEmail, website } });
+  }),
+);
+
 export default router;

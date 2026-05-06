@@ -1,4 +1,4 @@
-import { pgTable, text, integer, jsonb, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, jsonb, timestamp, unique } from "drizzle-orm/pg-core";
 
 export const funnels = pgTable("funnels", {
   id: text("id").primaryKey(),
@@ -24,3 +24,15 @@ export const funnelSteps = pgTable("funnel_steps", {
   emailBody: text("email_body"),
   action: text("action"),
 });
+
+export const funnelMembers = pgTable("funnel_members", {
+  id: text("id").primaryKey(),
+  funnelId: text("funnel_id")
+    .notNull()
+    .references(() => funnels.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  role: text("role").notNull().default("contributor"), // "owner" | "contributor" | "viewer"
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique().on(t.funnelId, t.userId),
+]);

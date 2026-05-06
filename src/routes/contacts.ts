@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc, count, inArray, sql } from "drizzle-orm";
+import { eq, and, or, desc, count, inArray, sql, ilike, isNotNull, isNull } from "drizzle-orm";
 import { db } from "../db/index";
 import { scraperSignals } from "../db/schema/scrapers";
 import { discoveryRuns, scraperContacts } from "../db/schema/contacts";
@@ -11,6 +11,7 @@ import { SmartleadClient, type SmartleadLeadInput } from "../lib/smartlead-clien
 import { getSetting } from "../lib/settings-service";
 import { ApiError, createId, DAY_MS, scoreLead, dedupeKey } from "../lib/helpers";
 import { getOrgId } from "../lib/auth";
+import { upsertMasterContact } from "../lib/master-db";
 
 const router = Router();
 
@@ -39,7 +40,9 @@ function getBetterContactClient(): BetterContactClient {
   if (!apiKey) {
     throw new ApiError(500, "BETTERCONTACT_API_KEY environment variable is not configured");
   }
-  return new BetterContactClient(apiKey);
+  const webhookBase = process.env.WEBHOOK_BASE_URL;
+  const webhookUrl = webhookBase ? `${webhookBase}/webhooks/bettercontact` : undefined;
+  return new BetterContactClient(apiKey, webhookUrl);
 }
 
 // ─── POST /contacts/discover/:assignmentId ──────────────────────────
@@ -414,6 +417,21 @@ router.post(
         rawData: rawItem,
       });
       contactsInserted++;
+
+      // Upsert to master contacts (best-effort)
+      try {
+        await upsertMasterContact(orgId, {
+          linkedinUrl,
+          firstName: item.firstName || null,
+          lastName: item.lastName || null,
+          fullName: item.fullName || null,
+          headline: item.headline || (rawItem.summary as string) || null,
+          profileImageUrl: item.profileImageUrl || null,
+          currentTitle: item.title || null,
+          currentCompany: companyName,
+          location: locationStr,
+        });
+      } catch {}
     }
 
     const partialFailNote = failedStatuses.length > 0
@@ -482,6 +500,11 @@ router.get(
     const assignmentId = req.query.assignmentId as string | undefined;
     const status = req.query.status as string | undefined;
     const enrichmentStatus = req.query.enrichmentStatus as string | undefined;
+    const company = req.query.company as string | undefined;
+    const title = req.query.title as string | undefined;
+    const location = req.query.location as string | undefined;
+    const hasEmail = req.query.hasEmail as string | undefined;
+    const hasPhone = req.query.hasPhone as string | undefined;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize as string) || 25));
 
@@ -489,6 +512,31 @@ router.get(
     if (assignmentId) conditions.push(eq(scraperContacts.assignmentId, assignmentId));
     if (status) conditions.push(eq(scraperContacts.status, status));
     if (enrichmentStatus) conditions.push(eq(scraperContacts.enrichmentStatus, enrichmentStatus));
+    if (company) {
+      // Support comma-separated company names for multi-select
+      const companies = company.split(",").map((c) => c.trim()).filter(Boolean);
+      if (companies.length === 1) {
+        conditions.push(ilike(scraperContacts.companyName, `%${companies[0]}%`));
+      } else if (companies.length > 1) {
+        conditions.push(or(...companies.map((c) => ilike(scraperContacts.companyName, `%${c}%`)))!);
+      }
+    }
+    if (title) {
+      conditions.push(ilike(scraperContacts.currentTitle, `%${title}%`));
+    }
+    if (location) {
+      conditions.push(ilike(scraperContacts.location, `%${location}%`));
+    }
+    if (hasEmail === "true") {
+      conditions.push(isNotNull(scraperContacts.email));
+    } else if (hasEmail === "false") {
+      conditions.push(isNull(scraperContacts.email));
+    }
+    if (hasPhone === "true") {
+      conditions.push(isNotNull(scraperContacts.phone));
+    } else if (hasPhone === "false") {
+      conditions.push(isNull(scraperContacts.phone));
+    }
 
     const whereClause = and(...conditions);
 
@@ -542,14 +590,43 @@ router.post(
       throw new ApiError(404, "No contacts found");
     }
 
+    // Look up missing company domains from scraper signals
+    const missingDomainCompanies = contacts
+      .filter((c) => !c.companyDomain && c.companyName)
+      .map((c) => c.companyName!.toLowerCase());
+
+    const domainLookup = new Map<string, string>();
+    if (missingDomainCompanies.length > 0) {
+      // Get unique company names that need domain lookup
+      const uniqueCompanies = [...new Set(missingDomainCompanies)];
+      for (const companyName of uniqueCompanies) {
+        const signal = await db.query.scraperSignals.findFirst({
+          where: and(
+            eq(scraperSignals.organizationId, orgId),
+            sql`lower(${scraperSignals.company}) = lower(${companyName})`,
+          ),
+          columns: { companyDomain: true },
+        });
+        if (signal?.companyDomain) {
+          domainLookup.set(companyName, signal.companyDomain);
+        }
+      }
+    }
+
     // Build BetterContact input
-    const bcInput: BetterContactInput[] = contacts.map((c) => ({
-      first_name: c.firstName || "",
-      last_name: c.lastName || "",
-      company: c.companyName || c.currentCompany || "",
-      company_domain: c.companyDomain || "",
-      linkedin_url: c.linkedinUrl || "",
-    }));
+    const bcInput: BetterContactInput[] = contacts.map((c) => {
+      let domain = c.companyDomain || "";
+      if (!domain && c.companyName) {
+        domain = domainLookup.get(c.companyName.toLowerCase()) || "";
+      }
+      return {
+        first_name: c.firstName || "",
+        last_name: c.lastName || "",
+        company: c.companyName || c.currentCompany || "",
+        company_domain: domain,
+        linkedin_url: c.linkedinUrl || "",
+      };
+    });
 
     const client = getBetterContactClient();
     const responses = await client.submitAll(bcInput);
@@ -614,35 +691,64 @@ router.post(
         continue;
       }
 
-      if (result.status !== "finished") {
+      if (result.status !== "finished" && result.status !== "completed") {
         allFinished = false;
         continue;
       }
 
-      // Update contacts with results — match by requestId + linkedin_url (case-insensitive)
+      // Update contacts with results — support both polling and webhook field names
       if (result.data) {
         for (const item of result.data) {
-          const linkedinUrl = item.linkedin_url;
-          if (!linkedinUrl) continue;
+          const email = (item as any).contact_email_address || item.email || null;
+          const emailStatus = (item as any).contact_email_address_status || item.email_status || null;
+          const phone = (item as any).contact_phone_number || item.phone || null;
+          const phoneStatus = (item as any).contact_phone_number_status || item.phone_status || null;
+          const linkedinUrl = item.linkedin_url || null;
+          const firstName = (item as any).contact_first_name || (item as any).first_name || "";
+          const lastName = (item as any).contact_last_name || (item as any).last_name || "";
 
-          await db
-            .update(scraperContacts)
-            .set({
-              email: item.email || null,
-              emailStatus: item.email_status || null,
-              phone: item.phone || null,
-              phoneStatus: item.phone_status || null,
-              enrichmentStatus: item.email || item.phone ? "enriched" : "failed",
-              enrichedAt: new Date(),
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(scraperContacts.organizationId, orgId),
-                eq(scraperContacts.bettercontactRequestId, requestId),
-                sql`lower(${scraperContacts.linkedinUrl}) = lower(${linkedinUrl})`,
-              ),
-            );
+          const hasContactData = !!(email || phone);
+
+          // Try matching by linkedin_url first
+          let matched = false;
+          if (linkedinUrl) {
+            const res = await db
+              .update(scraperContacts)
+              .set({
+                email, emailStatus, phone, phoneStatus,
+                enrichmentStatus: hasContactData ? "enriched" : "failed",
+                enrichedAt: new Date(), updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(scraperContacts.organizationId, orgId),
+                  eq(scraperContacts.bettercontactRequestId, requestId),
+                  sql`lower(${scraperContacts.linkedinUrl}) = lower(${linkedinUrl})`,
+                ),
+              )
+              .returning({ id: scraperContacts.id });
+            matched = res.length > 0;
+          }
+
+          // Fallback: match by first_name + last_name
+          if (!matched && firstName && lastName) {
+            await db
+              .update(scraperContacts)
+              .set({
+                email, emailStatus, phone, phoneStatus,
+                enrichmentStatus: hasContactData ? "enriched" : "failed",
+                enrichedAt: new Date(), updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(scraperContacts.organizationId, orgId),
+                  eq(scraperContacts.bettercontactRequestId, requestId),
+                  sql`lower(${scraperContacts.firstName}) = lower(${firstName})`,
+                  sql`lower(${scraperContacts.lastName}) = lower(${lastName})`,
+                ),
+              );
+          }
+
           totalEnriched++;
         }
       }
@@ -748,6 +854,24 @@ router.post(
       existingLeads.map((l) => dedupeKey(l.name, l.company, l.email)),
     );
 
+    // Look up company metadata from scraper signals for enrichment
+    const companyNames = [...new Set(contacts.map((c) => c.currentCompany || c.companyName || "").filter(Boolean))];
+    const companyMeta = new Map<string, { domain?: string; industry?: string; employeeCount?: number; location?: string }>();
+    for (const companyName of companyNames) {
+      const signal = await db.query.scraperSignals.findFirst({
+        where: sql`lower(${scraperSignals.company}) = lower(${companyName})`,
+        columns: { companyDomain: true, companyIndustry: true, companyEmployeeCount: true, location: true },
+      });
+      if (signal) {
+        companyMeta.set(companyName.toLowerCase(), {
+          domain: signal.companyDomain || undefined,
+          industry: signal.companyIndustry || undefined,
+          employeeCount: signal.companyEmployeeCount || undefined,
+          location: signal.location || undefined,
+        });
+      }
+    }
+
     const now = Date.now();
     const firstStep = steps[0];
     const newLeads: Array<typeof leads.$inferInsert> = [];
@@ -768,6 +892,7 @@ router.post(
 
       const leadId = createId("lead");
       const initialDue = new Date(now + firstStep.dayOffset * DAY_MS);
+      const meta = companyMeta.get(company.toLowerCase());
 
       newLeads.push({
         id: leadId,
@@ -786,6 +911,10 @@ router.post(
         source: "Contact Discovery",
         sourceType: "companies",
         score: scoreLead({ name, title: c.currentTitle || "", company, email, phone: c.phone || "", linkedinUrl: c.linkedinUrl || "" }),
+        companyDomain: c.companyDomain || meta?.domain || null,
+        companyIndustry: meta?.industry || null,
+        companyEmployeeCount: meta?.employeeCount || null,
+        companyLocation: meta?.location || null,
         createdAt: new Date(now),
         updatedAt: new Date(now),
       });
@@ -912,7 +1041,7 @@ router.post(
 );
 
 // ─── POST /contacts/reset-enrichment ────────────────────────────────
-// Reset failed enrichment so contacts can be re-enriched
+// Reset enrichment so contacts can be re-enriched (works for both "failed" and "pending" states)
 router.post(
   "/contacts/reset-enrichment",
   asyncHandler(async (req, res) => {
@@ -941,6 +1070,37 @@ router.post(
       );
 
     res.json({ data: { reset: contactIds.length } });
+  }),
+);
+
+// ─── POST /contacts/reset-stuck ─────────────────────────────────────
+// Reset all contacts stuck in "pending" enrichment for a given assignment
+router.post(
+  "/contacts/reset-stuck",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const { assignmentId } = req.body as { assignmentId: string };
+
+    if (!assignmentId) throw new ApiError(400, "assignmentId is required");
+
+    const result = await db
+      .update(scraperContacts)
+      .set({
+        enrichmentStatus: "none",
+        bettercontactRequestId: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(scraperContacts.organizationId, orgId),
+          eq(scraperContacts.assignmentId, assignmentId),
+          eq(scraperContacts.enrichmentStatus, "pending"),
+        ),
+      )
+      .returning({ id: scraperContacts.id });
+
+    console.log(`[Reset Stuck] Reset ${result.length} pending contacts for assignment ${assignmentId}`);
+    res.json({ data: { reset: result.length } });
   }),
 );
 

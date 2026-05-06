@@ -10,6 +10,7 @@ import {
 import { scoreSignal, type NormalizedJob } from "../lib/signal-scoring";
 import { ApiError, createId } from "../lib/helpers";
 import { getOrgId } from "../lib/auth";
+import { upsertMasterCompany } from "../lib/master-db";
 
 const router = Router();
 
@@ -88,6 +89,15 @@ function buildSearchParams(
       include_total_results: true,
       limit: Math.min(assignment.maxSignalsPerRun || 100, 500),
     };
+    // Migrate legacy exact-match title filters to pattern (contains) match
+    if (params.job_title_or && !params.job_title_pattern_or) {
+      params.job_title_pattern_or = params.job_title_or;
+      delete params.job_title_or;
+    }
+    if (params.job_title_not && !params.job_title_pattern_not) {
+      params.job_title_pattern_not = params.job_title_not;
+      delete params.job_title_not;
+    }
     // Ensure a date filter is present (TheirStack requires one)
     if (!params.posted_at_max_age_days && !params.posted_at_gte && !params.discovered_at_max_age_days) {
       params.posted_at_max_age_days = assignment.lookbackDays || 7;
@@ -108,10 +118,10 @@ function buildSearchParams(
   };
 
   if (assignment.keywords.length > 0) {
-    params.job_title_or = assignment.keywords;
+    params.job_title_pattern_or = assignment.keywords;
   }
   if (assignment.excludedKeywords.length > 0) {
-    params.job_title_not = assignment.excludedKeywords;
+    params.job_title_pattern_not = assignment.excludedKeywords;
   }
   if (assignment.countries.length > 0) {
     params.job_country_code_or = assignment.countries;
@@ -415,7 +425,7 @@ router.post(
           // Rich signal data
           companyLogo: job.company_object?.logo || null,
           companyIndustry: job.company_object?.industry || null,
-          companyEmployeeCount: job.company_object?.employee_count != null ? Math.round(job.company_object.employee_count) : null,
+          companyEmployeeCount: job.company_object?.employee_count != null ? Math.min(Math.round(job.company_object.employee_count), 2000000000) : null,
           companyRevenue: job.company_object?.annual_revenue_usd != null ? Math.round(job.company_object.annual_revenue_usd) : null,
           companyFunding: job.company_object?.total_funding_usd != null ? Math.round(job.company_object.total_funding_usd) : null,
           companyFundingStage: job.company_object?.funding_stage || null,
@@ -441,6 +451,23 @@ router.post(
           rawData: job as unknown as Record<string, unknown>,
         });
         signalsCreated++;
+
+        // Upsert to master companies table (best-effort, don't block signal creation)
+        try {
+          await upsertMasterCompany(orgId, {
+            name: normalized.company,
+            domain: normalized.companyDomain,
+            linkedinUrl: job.company_object?.linkedin_url || null,
+            industry: job.company_object?.industry || null,
+            employeeCount: job.company_object?.employee_count != null ? Math.min(Math.round(job.company_object.employee_count), 2000000000) : null,
+            revenue: job.company_object?.annual_revenue_usd != null ? Math.round(job.company_object.annual_revenue_usd) : null,
+            funding: job.company_object?.total_funding_usd != null ? Math.round(job.company_object.total_funding_usd) : null,
+            fundingStage: job.company_object?.funding_stage || null,
+            country: job.company_object?.country || job.country || null,
+            city: job.company_object?.city || job.cities?.[0] || null,
+            logo: job.company_object?.logo || null,
+          });
+        } catch {}
       }
 
       // Update run record

@@ -57,6 +57,55 @@
       "when": 1773224342694,
       "tag": "0007_optimal_gambit",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1774628388068,
+      "tag": "0008_pretty_rumiko_fujikawa",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1774629853686,
+      "tag": "0009_aromatic_young_avengers",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1774632644263,
+      "tag": "0010_peaceful_ozymandias",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1774646459749,
+      "tag": "0011_famous_ezekiel",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1774648713733,
+      "tag": "0012_hard_marten_broadcloak",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1774722903240,
+      "tag": "0013_bored_king_bedlam",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1775500957270,
+      "tag": "0014_flimsy_nextwave",
+      "breakpoints": true
     }
   ]
 }

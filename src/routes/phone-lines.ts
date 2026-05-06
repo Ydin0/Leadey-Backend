@@ -1,10 +1,14 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, desc, sql, ilike, isNotNull, gte, lte, or, count } from "drizzle-orm";
+import multer from "multer";
+import { getAuth } from "@clerk/express";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { phoneLines } from "../db/schema/phone-lines";
-import { regulatoryBundles } from "../db/schema/regulatory-bundles";
+import { regulatoryBundles, bundleDocuments } from "../db/schema/regulatory-bundles";
 import { callRecords } from "../db/schema/call-records";
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
 import { createId, ApiError } from "../lib/helpers";
 
@@ -336,17 +340,44 @@ router.get(
     const orgId = getOrgId(req);
     const lineId = req.query.lineId as string | undefined;
     const direction = req.query.direction as string | undefined;
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
-    const offset = parseInt(req.query.offset as string) || 0;
+    const userId = req.query.userId as string | undefined;
+    const hasRecording = req.query.hasRecording as string | undefined;
+    const search = req.query.search as string | undefined;
+    const disposition = req.query.disposition as string | undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 25, 200);
+    const offset = req.query.page ? (page - 1) * limit : parseInt(req.query.offset as string) || 0;
 
     const conditions = [eq(callRecords.organizationId, orgId)];
     if (lineId) conditions.push(eq(callRecords.lineId, lineId));
     if (direction) conditions.push(eq(callRecords.direction, direction));
+    if (userId) conditions.push(eq(callRecords.userId, userId));
+    if (disposition) conditions.push(eq(callRecords.disposition, disposition));
+    if (hasRecording === "true") conditions.push(isNotNull(callRecords.recordingUrl));
+    if (search) {
+      conditions.push(
+        or(
+          ilike(callRecords.contactName, `%${search}%`),
+          ilike(callRecords.companyName, `%${search}%`),
+          ilike(callRecords.fromNumber, `%${search}%`),
+          ilike(callRecords.toNumber, `%${search}%`),
+        )!,
+      );
+    }
+
+    const whereClause = and(...conditions);
+
+    const [{ total }] = await db
+      .select({ total: count() })
+      .from(callRecords)
+      .where(whereClause);
+
+    const totalCount = Number(total);
 
     const rows = await db
       .select()
       .from(callRecords)
-      .where(and(...conditions))
+      .where(whereClause)
       .orderBy(desc(callRecords.calledAt))
       .limit(limit)
       .offset(offset);
@@ -361,10 +392,17 @@ router.get(
       lineId: r.lineId,
       duration: r.duration,
       disposition: r.disposition,
+      recordingUrl: r.recordingUrl,
+      recordingSid: r.recordingSid,
+      recordingDuration: r.recordingDuration,
+      transcript: r.transcript,
+      summary: r.summary,
+      userId: r.userId,
+      userName: r.userName,
       timestamp: r.calledAt.toISOString(),
     }));
 
-    res.json({ data });
+    res.json({ data, meta: { page, pageSize: limit, totalCount, totalPages: Math.ceil(totalCount / limit) } });
   }),
 );
 
@@ -383,6 +421,8 @@ router.post(
       companyName,
       duration,
       disposition,
+      userId,
+      userName,
     } = req.body;
 
     if (!direction || !fromNumber || !toNumber) {
@@ -404,6 +444,8 @@ router.post(
         companyName: companyName || null,
         duration: duration ?? 0,
         disposition: disposition || "completed",
+        userId: userId || null,
+        userName: userName || null,
       })
       .returning();
 
@@ -426,32 +468,34 @@ router.post(
 
 // ── Regulatory Bundles ────────────────────────────
 
+function serializeBundle(b: typeof regulatoryBundles.$inferSelect) {
+  return {
+    id: b.id,
+    name: b.name,
+    country: b.country,
+    countryCode: b.countryCode,
+    status: b.status,
+    businessName: b.businessName,
+    businessAddress: b.businessAddress,
+    businessRegistrationNumber: b.businessRegistrationNumber,
+    businessType: b.businessType,
+    contactEmail: b.contactEmail,
+    contactPhone: b.contactPhone,
+    identityDocumentName: b.identityDocumentName,
+    twilioBundleSid: b.twilioBundleSid,
+    createdAt: b.createdAt.toISOString(),
+  };
+}
+
 // GET /api/phone-lines/bundles — list bundles for org
 router.get(
   "/phone-lines/bundles",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-
-    const rows = await db
-      .select()
-      .from(regulatoryBundles)
+    const rows = await db.select().from(regulatoryBundles)
       .where(eq(regulatoryBundles.organizationId, orgId))
       .orderBy(desc(regulatoryBundles.createdAt));
-
-    const data = rows.map((b) => ({
-      id: b.id,
-      name: b.name,
-      country: b.country,
-      countryCode: b.countryCode,
-      status: b.status,
-      businessName: b.businessName,
-      businessAddress: b.businessAddress,
-      identityDocumentName: b.identityDocumentName,
-      twilioBundleSid: b.twilioBundleSid,
-      createdAt: b.createdAt.toISOString(),
-    }));
-
-    res.json({ data });
+    res.json({ data: rows.map(serializeBundle) });
   }),
 );
 
@@ -460,122 +504,252 @@ router.post(
   "/phone-lines/bundles",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { name, country, countryCode, businessName, businessAddress, identityDocumentName } =
-      req.body;
+    const auth = getAuth(req);
+    const {
+      name, country, countryCode, businessName, businessAddress,
+      businessRegistrationNumber, businessType, contactEmail, contactPhone,
+      identityDocumentName,
+    } = req.body;
 
     if (!country || !countryCode || !businessName) {
       throw new ApiError(400, "country, countryCode, and businessName are required");
     }
 
     const id = createId("bun");
-    const [bundle] = await db
-      .insert(regulatoryBundles)
-      .values({
-        id,
-        organizationId: orgId,
-        name: name || `${country} Business Bundle`,
-        country,
-        countryCode,
-        businessName,
-        businessAddress: businessAddress || "",
-        identityDocumentName: identityDocumentName || "",
-      })
-      .returning();
+    const [bundle] = await db.insert(regulatoryBundles).values({
+      id,
+      organizationId: orgId,
+      name: name || `${country} Business Bundle`,
+      country,
+      countryCode,
+      businessName,
+      businessAddress: businessAddress || "",
+      businessRegistrationNumber: businessRegistrationNumber || "",
+      businessType: businessType || "limited_company",
+      contactEmail: contactEmail || "",
+      contactPhone: contactPhone || "",
+      identityDocumentName: identityDocumentName || "",
+    }).returning();
+
+    res.status(201).json({ data: serializeBundle(bundle) });
+  }),
+);
+
+// GET /api/phone-lines/bundles/:id/documents — list documents for a bundle
+router.get(
+  "/phone-lines/bundles/:id/documents",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const bundleId = req.params.id;
+
+    // Verify bundle belongs to org
+    const [bundle] = await db.select().from(regulatoryBundles)
+      .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
+    if (!bundle) throw new ApiError(404, "Bundle not found");
+
+    const docs = await db.select().from(bundleDocuments)
+      .where(eq(bundleDocuments.bundleId, bundleId))
+      .orderBy(desc(bundleDocuments.createdAt));
+
+    res.json({
+      data: docs.map((d) => ({
+        id: d.id,
+        documentType: d.documentType,
+        fileName: d.fileName,
+        status: d.status,
+        twilioDocumentSid: d.twilioDocumentSid,
+        createdAt: d.createdAt.toISOString(),
+      })),
+    });
+  }),
+);
+
+// POST /api/phone-lines/bundles/:id/documents — upload a document
+router.post(
+  "/phone-lines/bundles/:id/documents",
+  upload.single("file"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const bundleId = req.params.id;
+    const documentType = req.body.documentType as string;
+    const file = (req as any).file as Express.Multer.File | undefined;
+
+    console.log(`[Bundle Upload] bundleId=${bundleId} docType=${documentType} file=${file?.originalname} size=${file?.size}`);
+
+    if (!file) throw new ApiError(400, "file is required");
+    if (!documentType) throw new ApiError(400, "documentType is required");
+
+    const [bundle] = await db.select().from(regulatoryBundles)
+      .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
+    if (!bundle) throw new ApiError(404, "Bundle not found");
+
+    // Save to DB first (always succeeds)
+    const docId = createId("bdoc");
+    let twilioDocSid: string | null = null;
+
+    // Create Twilio supporting document via Regulatory Compliance API
+    try {
+      const twilioDocTypeMap: Record<string, string> = {
+        business_registration: "business_registration",
+        government_id: "government_id",
+        utility_bill: "utility_bill",
+        passport: "passport",
+      };
+      const docType = twilioDocTypeMap[documentType] || "business_registration";
+
+      const twilioDoc = await client.numbers.v2.regulatoryCompliance.supportingDocuments.create({
+        friendlyName: `${bundle.businessName} - ${documentType} - ${file.originalname}`,
+        type: docType,
+        attributes: {
+          business_name: bundle.businessName,
+        },
+      });
+      twilioDocSid = twilioDoc.sid;
+      console.log(`[Bundle Upload] Twilio doc created: ${twilioDocSid}`);
+    } catch (err) {
+      console.error("[Bundle Upload] Twilio doc creation failed (continuing with DB save):", err);
+    }
+
+    const [savedDoc] = await db.insert(bundleDocuments).values({
+      id: docId,
+      bundleId,
+      twilioDocumentSid: twilioDocSid,
+      documentType,
+      fileName: file.originalname,
+      status: "uploaded",
+    }).returning();
 
     res.status(201).json({
       data: {
-        id: bundle.id,
-        name: bundle.name,
-        country: bundle.country,
-        countryCode: bundle.countryCode,
-        status: bundle.status,
-        businessName: bundle.businessName,
-        businessAddress: bundle.businessAddress,
-        identityDocumentName: bundle.identityDocumentName,
-        twilioBundleSid: bundle.twilioBundleSid,
-        createdAt: bundle.createdAt.toISOString(),
+        id: savedDoc.id,
+        documentType: savedDoc.documentType,
+        fileName: savedDoc.fileName,
+        status: savedDoc.status,
+        twilioDocumentSid: savedDoc.twilioDocumentSid,
+        createdAt: savedDoc.createdAt.toISOString(),
       },
     });
   }),
 );
 
-// POST /api/phone-lines/bundles/:id/submit — submit bundle to Twilio
+// DELETE /api/phone-lines/bundles/:id/documents/:docId — remove document
+router.delete(
+  "/phone-lines/bundles/:id/documents/:docId",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const bundleId = req.params.id;
+    const docId = req.params.docId;
+
+    const [bundle] = await db.select().from(regulatoryBundles)
+      .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
+    if (!bundle) throw new ApiError(404, "Bundle not found");
+
+    await db.delete(bundleDocuments).where(eq(bundleDocuments.id, docId));
+    res.json({ data: { id: docId, deleted: true } });
+  }),
+);
+
+// POST /api/phone-lines/bundles/:id/submit — submit bundle to Twilio Trust Hub
 router.post(
   "/phone-lines/bundles/:id/submit",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const bundleId = req.params.id;
 
-    const [bundle] = await db
-      .select()
-      .from(regulatoryBundles)
+    const [bundle] = await db.select().from(regulatoryBundles)
       .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
-
     if (!bundle) throw new ApiError(404, "Bundle not found");
     if (bundle.status !== "draft") throw new ApiError(400, "Only draft bundles can be submitted");
 
-    // Create End-User on Twilio
-    const endUser = await client.trusthub.v1.endUsers.create({
-      friendlyName: bundle.businessName,
-      type: "customer_profile_business_information",
-      attributes: {
-        business_name: bundle.businessName,
-        business_registration_number: "",
-        business_identity: bundle.identityDocumentName,
-      },
-    });
+    // Get uploaded documents
+    const docs = await db.select().from(bundleDocuments)
+      .where(eq(bundleDocuments.bundleId, bundleId));
+    if (docs.length === 0) throw new ApiError(400, "Upload at least one document before submitting");
 
-    // Create Supporting Document
-    const doc = await client.trusthub.v1.supportingDocuments.create({
-      friendlyName: `${bundle.businessName} - ${bundle.identityDocumentName}`,
-      type: "customer_profile_address",
-      attributes: {
-        address_sids: bundle.businessAddress,
-      },
-    });
+    try {
+      const countryCode = bundle.countryCode.toUpperCase();
 
-    // Create Regulatory Bundle
-    const twilioBundle = await client.trusthub.v1.customerProfiles.create({
-      friendlyName: bundle.name,
-      email: "compliance@leadey.com",
-      policySid: "RN" + bundle.countryCode.toLowerCase(),
-      statusCallback: undefined,
-    });
+      // 1. Find the correct regulation for this country (Business, Local number type)
+      const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
+        isoCountry: countryCode,
+        limit: 20,
+      });
 
-    // Attach items
-    await client.trusthub.v1
-      .customerProfiles(twilioBundle.sid)
-      .customerProfilesEntityAssignments.create({ objectSid: endUser.sid });
+      // Prefer Business Local, fall back to Business National, then any Business
+      let regulation = regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "local")
+        || regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "national")
+        || regulations.find((r: any) => r.friendlyName?.includes("Business"))
+        || regulations[0];
 
-    await client.trusthub.v1
-      .customerProfiles(twilioBundle.sid)
-      .customerProfilesEntityAssignments.create({ objectSid: doc.sid });
+      if (!regulation) {
+        throw new ApiError(400, `No Twilio regulation found for ${bundle.country}. Phone number compliance may not be available for this country.`);
+      }
 
-    // Submit for review
-    await client.trusthub.v1
-      .customerProfiles(twilioBundle.sid)
-      .update({ status: "pending-review" });
+      console.log(`[Bundle Submit] Using regulation ${regulation.sid} (${regulation.friendlyName}) for ${countryCode}`);
 
-    // Update DB
-    const [updated] = await db
-      .update(regulatoryBundles)
-      .set({
+      // 2. Create End-User on Twilio
+      const endUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
+        friendlyName: bundle.businessName,
+        type: "business",
+        attributes: {
+          business_name: bundle.businessName,
+          business_registration_number: bundle.businessRegistrationNumber || "",
+        },
+      });
+
+      console.log(`[Bundle Submit] End-User created: ${endUser.sid}`);
+
+      // 3. Create Regulatory Bundle
+      const twilioBundle = await client.numbers.v2.regulatoryCompliance.bundles.create({
+        friendlyName: bundle.name,
+        email: bundle.contactEmail || "compliance@leadey.com",
+        regulationSid: regulation.sid,
+        isoCountry: countryCode,
+        numberType: regulation.numberType || "local",
+        endUserType: "business",
+      });
+
+      console.log(`[Bundle Submit] Bundle created: ${twilioBundle.sid}`);
+
+      // 4. Assign End-User to bundle
+      await client.numbers.v2.regulatoryCompliance
+        .bundles(twilioBundle.sid)
+        .itemAssignments.create({ objectSid: endUser.sid });
+
+      // 5. Assign uploaded documents
+      for (const doc of docs) {
+        if (doc.twilioDocumentSid) {
+          try {
+            await client.numbers.v2.regulatoryCompliance
+              .bundles(twilioBundle.sid)
+              .itemAssignments.create({ objectSid: doc.twilioDocumentSid });
+          } catch (assignErr: any) {
+            console.error(`[Bundle Submit] Failed to assign doc ${doc.id}:`, assignErr.message);
+          }
+        }
+      }
+
+      // 6. Submit for review
+      await client.numbers.v2.regulatoryCompliance
+        .bundles(twilioBundle.sid)
+        .update({ status: "pending-review" });
+
+      console.log(`[Bundle Submit] Bundle ${twilioBundle.sid} submitted for review`);
+
+      // Update DB
+      const [updated] = await db.update(regulatoryBundles).set({
         status: "pending-review",
         twilioBundleSid: twilioBundle.sid,
         twilioEndUserSid: endUser.sid,
-        twilioDocumentSid: doc.sid,
         updatedAt: new Date(),
-      })
-      .where(eq(regulatoryBundles.id, bundleId))
-      .returning();
+      }).where(eq(regulatoryBundles.id, bundleId)).returning();
 
-    res.json({
-      data: {
-        id: updated.id,
-        status: updated.status,
-        twilioBundleSid: updated.twilioBundleSid,
-      },
-    });
+      res.json({ data: { id: updated.id, status: updated.status, twilioBundleSid: updated.twilioBundleSid } });
+    } catch (err: any) {
+      console.error("[Bundle Submit] Error:", err);
+      const message = err?.message || err?.errors?.[0]?.message || "Failed to submit bundle to Twilio";
+      throw new ApiError(400, message);
+    }
   }),
 );
 
@@ -586,17 +760,12 @@ router.post(
     const orgId = getOrgId(req);
     const bundleId = req.params.id;
 
-    const [bundle] = await db
-      .select()
-      .from(regulatoryBundles)
+    const [bundle] = await db.select().from(regulatoryBundles)
       .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
-
     if (!bundle) throw new ApiError(404, "Bundle not found");
     if (!bundle.twilioBundleSid) throw new ApiError(400, "Bundle has not been submitted to Twilio");
 
-    const twilioBundle = await client.trusthub.v1
-      .customerProfiles(bundle.twilioBundleSid)
-      .fetch();
+    const twilioBundle = await client.numbers.v2.regulatoryCompliance.bundles(bundle.twilioBundleSid).fetch() as any;
 
     const statusMap: Record<string, string> = {
       draft: "draft",
@@ -607,20 +776,49 @@ router.post(
     };
 
     const newStatus = statusMap[twilioBundle.status] || bundle.status;
-
-    const [updated] = await db
-      .update(regulatoryBundles)
+    const [updated] = await db.update(regulatoryBundles)
       .set({ status: newStatus, updatedAt: new Date() })
       .where(eq(regulatoryBundles.id, bundleId))
       .returning();
 
-    res.json({
-      data: {
-        id: updated.id,
-        status: updated.status,
-        twilioBundleSid: updated.twilioBundleSid,
-      },
-    });
+    res.json({ data: { id: updated.id, status: updated.status, twilioBundleSid: updated.twilioBundleSid } });
+  }),
+);
+
+// POST /api/phone-lines/call-records/:id/summarize — trigger AI summarization
+router.post(
+  "/phone-lines/call-records/:id/summarize",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = req.params.id as string;
+
+    const [record] = await db
+      .select()
+      .from(callRecords)
+      .where(and(eq(callRecords.id, id), eq(callRecords.organizationId, orgId)));
+
+    if (!record) throw new ApiError(404, "Call record not found");
+    if (!record.recordingUrl) throw new ApiError(400, "No recording available for this call");
+
+    try {
+      const { transcribeAndSummarize } = await import("../lib/transcription-service");
+      await transcribeAndSummarize(record.id, record.recordingUrl);
+
+      const [updated] = await db
+        .select()
+        .from(callRecords)
+        .where(eq(callRecords.id, id));
+
+      res.json({
+        data: {
+          transcript: updated.transcript,
+          summary: updated.summary,
+        },
+      });
+    } catch (err) {
+      console.error("[Summarize] Error:", err);
+      throw new ApiError(500, "Failed to transcribe and summarize call");
+    }
   }),
 );
 

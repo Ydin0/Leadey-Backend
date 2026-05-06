@@ -18,6 +18,34 @@ function asyncHandler<P = Record<string, string>>(handler: AsyncHandler<P>) {
   };
 }
 
+// ─── /me — authenticated, NOT admin-gated ────────────────────────────────
+// Returns the caller's platform_role so the admin frontend can decide
+// whether to render the panel without relying on Clerk publicMetadata.
+
+export const adminMeRouter = Router();
+
+adminMeRouter.get(
+  "/me",
+  asyncHandler(async (req, res) => {
+    const userId = (req as any)._adminAuth?.userId;
+    if (!userId) throw new ApiError(401, "Authentication required");
+
+    const result = await db
+      .select({ platformRole: users.platformRole })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    res.json({
+      data: {
+        userId,
+        platformRole: result[0]?.platformRole ?? null,
+        isAdmin: result[0]?.platformRole === "admin",
+      },
+    });
+  }),
+);
+
 // ─── GET /stats ───────────────────────────────────────────────────────────
 
 router.get(

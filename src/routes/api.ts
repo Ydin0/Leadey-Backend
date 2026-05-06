@@ -1,8 +1,10 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import { db } from "../db/index";
-import { funnels, funnelSteps } from "../db/schema/funnels";
+import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
+import { users } from "../db/schema/organizations";
 import { leads, leadEvents } from "../db/schema/leads";
+import { scraperSignals } from "../db/schema/scrapers";
 import { imports } from "../db/schema/imports";
 import {
   ApiError,
@@ -20,6 +22,7 @@ import {
   resolveAction,
   type MappingEntry,
 } from "../lib/helpers";
+import { getAuth } from "@clerk/express";
 import {
   buildFunnelPayload,
   computeNextStepSchedule,
@@ -105,6 +108,10 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
       score: l.score,
       smartleadLeadId: l.smartleadLeadId,
       unipileProviderId: l.unipileProviderId,
+      companyDomain: l.companyDomain,
+      companyIndustry: l.companyIndustry,
+      companyEmployeeCount: l.companyEmployeeCount,
+      companyLocation: l.companyLocation,
       notes: l.notes,
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
@@ -167,6 +174,10 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
       score: l.score,
       smartleadLeadId: l.smartleadLeadId,
       unipileProviderId: l.unipileProviderId,
+      companyDomain: l.companyDomain,
+      companyIndustry: l.companyIndustry,
+      companyEmployeeCount: l.companyEmployeeCount,
+      companyLocation: l.companyLocation,
       notes: l.notes,
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
@@ -223,7 +234,24 @@ router.get(
       await loadFunnel(orgId, req.params.funnelId),
       req.params.funnelId,
     );
-    res.json({ data: buildFunnelPayload(funnel, { includeLeads: true }) });
+    // Fetch real members
+    const members = await db.select().from(funnelMembers)
+      .where(eq(funnelMembers.funnelId, req.params.funnelId));
+    const memberData = [];
+    for (const m of members) {
+      const [user] = await db.select().from(users).where(eq(users.id, m.userId));
+      memberData.push({
+        teamMemberId: m.userId,
+        role: m.role,
+        addedAt: m.createdAt.toISOString(),
+        email: user?.email || "",
+        firstName: user?.firstName || null,
+        lastName: user?.lastName || null,
+      });
+    }
+    const payload = buildFunnelPayload(funnel, { includeLeads: true }) as any;
+    payload.members = memberData;
+    res.json({ data: payload });
   }),
 );
 
@@ -371,6 +399,17 @@ router.post(
         );
       }
     });
+
+    // Auto-assign creator as funnel owner
+    const auth = getAuth(req);
+    if (auth?.userId) {
+      await db.insert(funnelMembers).values({
+        id: createId("fm"),
+        funnelId,
+        userId: auth.userId,
+        role: "owner",
+      }).onConflictDoNothing();
+    }
 
     // Smartlead integration: create campaign if email steps have content
     const emailStepsWithContent = normalizedSteps.filter(
@@ -913,6 +952,194 @@ router.use(
       },
     });
   },
+);
+
+// ─── Funnel Members ─────────────────────────────────────────────────────
+
+// GET /funnels/:funnelId/members — list funnel members
+router.get(
+  "/funnels/:funnelId/members",
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, funnelId),
+      funnelId,
+    );
+
+    const members = await db.select().from(funnelMembers)
+      .where(eq(funnelMembers.funnelId, funnelId));
+
+    // Enrich with user data
+    const memberData = [];
+    for (const m of members) {
+      const [user] = await db.select().from(users).where(eq(users.id, m.userId));
+      memberData.push({
+        id: m.id,
+        userId: m.userId,
+        role: m.role,
+        email: user?.email || "",
+        firstName: user?.firstName || null,
+        lastName: user?.lastName || null,
+        imageUrl: user?.imageUrl || null,
+        createdAt: m.createdAt.toISOString(),
+      });
+    }
+
+    res.json({ data: memberData });
+  }),
+);
+
+// POST /funnels/:funnelId/members — add member to funnel
+router.post(
+  "/funnels/:funnelId/members",
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+    const { userId, role } = req.body;
+
+    if (!userId) throw new ApiError(400, "userId is required");
+
+    getFunnelOrThrow(await loadFunnel(orgId, funnelId), funnelId);
+
+    // Check if already a member
+    const existing = await db.query.funnelMembers.findFirst({
+      where: and(eq(funnelMembers.funnelId, funnelId), eq(funnelMembers.userId, userId)),
+    });
+    if (existing) throw new ApiError(400, "User is already a member of this funnel");
+
+    const id = createId("fm");
+    const [member] = await db.insert(funnelMembers).values({
+      id,
+      funnelId,
+      userId,
+      role: role || "contributor",
+    }).returning();
+
+    const [user] = await db.select().from(users).where(eq(users.id, userId));
+
+    res.status(201).json({
+      data: {
+        id: member.id,
+        userId: member.userId,
+        role: member.role,
+        email: user?.email || "",
+        firstName: user?.firstName || null,
+        lastName: user?.lastName || null,
+        imageUrl: user?.imageUrl || null,
+        createdAt: member.createdAt.toISOString(),
+      },
+    });
+  }),
+);
+
+// PATCH /funnels/:funnelId/members/:userId — update member role
+router.patch(
+  "/funnels/:funnelId/members/:userId",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId as string;
+    const userId = req.params.userId as string;
+    const { role } = req.body;
+
+    if (!role) throw new ApiError(400, "role is required");
+
+    const [updated] = await db.update(funnelMembers)
+      .set({ role })
+      .where(and(eq(funnelMembers.funnelId, funnelId), eq(funnelMembers.userId, userId)))
+      .returning();
+
+    if (!updated) throw new ApiError(404, "Member not found");
+
+    res.json({ data: { id: updated.id, userId: updated.userId, role: updated.role } });
+  }),
+);
+
+// DELETE /funnels/:funnelId/members/:userId — remove member
+router.delete(
+  "/funnels/:funnelId/members/:userId",
+  asyncHandler(async (req, res) => {
+    const funnelId = req.params.funnelId as string;
+    const userId = req.params.userId as string;
+
+    await db.delete(funnelMembers)
+      .where(and(eq(funnelMembers.funnelId, funnelId), eq(funnelMembers.userId, userId)));
+
+    res.json({ data: { userId, removed: true } });
+  }),
+);
+
+// ─── POST /funnels/backfill-company-data ─────────────────────────────────
+// One-time backfill: populate company metadata on leads from scraper signals
+router.post(
+  "/funnels/backfill-company-data",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+
+    // Get all leads missing company data
+    const leadsToFix = await db
+      .select({ id: leads.id, company: leads.company })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(
+        and(
+          eq(funnels.organizationId, orgId),
+          isNull(leads.companyDomain),
+        ),
+      );
+
+    let updated = 0;
+    const seen = new Map<string, { domain?: string; industry?: string; employeeCount?: number; location?: string }>();
+
+    for (const lead of leadsToFix) {
+      const key = lead.company.toLowerCase();
+
+      if (!seen.has(key)) {
+        // Try exact match first, then fuzzy (LIKE %name%)
+        let signal = await db.query.scraperSignals.findFirst({
+          where: and(
+            eq(scraperSignals.organizationId, orgId),
+            sql`lower(${scraperSignals.company}) = lower(${lead.company})`,
+          ),
+          columns: { companyDomain: true, companyIndustry: true, companyEmployeeCount: true, location: true },
+        });
+        if (!signal) {
+          signal = await db.query.scraperSignals.findFirst({
+            where: and(
+              eq(scraperSignals.organizationId, orgId),
+              sql`lower(${scraperSignals.company}) LIKE '%' || lower(${lead.company}) || '%'`,
+            ),
+            columns: { companyDomain: true, companyIndustry: true, companyEmployeeCount: true, location: true },
+          });
+        }
+        seen.set(key, signal ? {
+          domain: signal.companyDomain || undefined,
+          industry: signal.companyIndustry || undefined,
+          employeeCount: signal.companyEmployeeCount || undefined,
+          location: signal.location || undefined,
+        } : {});
+      }
+
+      const meta = seen.get(key)!;
+      if (meta.domain || meta.industry || meta.employeeCount || meta.location) {
+        await db
+          .update(leads)
+          .set({
+            companyDomain: meta.domain || null,
+            companyIndustry: meta.industry || null,
+            companyEmployeeCount: meta.employeeCount || null,
+            companyLocation: meta.location || null,
+            updatedAt: new Date(),
+          })
+          .where(eq(leads.id, lead.id));
+        updated++;
+      }
+    }
+
+    console.log(`[Backfill] Updated ${updated}/${leadsToFix.length} leads with company data`);
+    res.json({ data: { total: leadsToFix.length, updated } });
+  }),
 );
 
 export default router;

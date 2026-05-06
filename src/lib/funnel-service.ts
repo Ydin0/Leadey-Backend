@@ -45,6 +45,10 @@ export interface Lead {
   score: number;
   smartleadLeadId: string | null;
   unipileProviderId: string | null;
+  companyDomain?: string | null;
+  companyIndustry?: string | null;
+  companyEmployeeCount?: number | null;
+  companyLocation?: string | null;
   notes: Record<string, string> | null;
   createdAt: Date;
   updatedAt: Date;
@@ -81,6 +85,10 @@ function serializeLead(lead: Lead) {
     sourceType: lead.sourceType,
     score: lead.score,
     unipileProviderId: lead.unipileProviderId,
+    companyDomain: lead.companyDomain,
+    companyIndustry: lead.companyIndustry,
+    companyEmployeeCount: lead.companyEmployeeCount,
+    companyLocation: lead.companyLocation,
     notes: lead.notes,
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),
