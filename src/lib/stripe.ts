@@ -3,11 +3,24 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations } from "../db/schema/organizations";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2025-03-31.basil" as any,
-});
+// Lazy: don't construct Stripe at module load — STRIPE_SECRET_KEY may be
+// unset on environments that don't use billing yet. Throws on first use.
+let _stripe: Stripe | null = null;
+function getStripe(): Stripe {
+  if (_stripe) return _stripe;
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) {
+    throw new Error("STRIPE_SECRET_KEY is not set");
+  }
+  _stripe = new Stripe(key, { apiVersion: "2025-03-31.basil" as any });
+  return _stripe;
+}
 
-export { stripe };
+export const stripe = new Proxy({} as Stripe, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getStripe(), prop, receiver);
+  },
+});
 
 // ── Plan Configuration ──────────────────────────────────────────────
 
