@@ -181,6 +181,62 @@ router.post("/clerk", async (req: Request, res: Response) => {
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
+
+        // If this user signed up via a custom invitation (created by our admin
+        // flow with public_metadata.organization_id), automatically add them
+        // to the target organization with the requested role.
+        const targetOrgId = data.public_metadata?.organization_id as
+          | string
+          | undefined;
+        const targetRole =
+          (data.public_metadata?.organization_role as string | undefined) ||
+          "org:member";
+
+        if (targetOrgId) {
+          try {
+            const clerkSecretKey = process.env.CLERK_SECRET_KEY;
+            if (clerkSecretKey) {
+              const membershipRes = await fetch(
+                `https://api.clerk.com/v1/organizations/${targetOrgId}/memberships`,
+                {
+                  method: "POST",
+                  headers: {
+                    Authorization: `Bearer ${clerkSecretKey}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    user_id: data.id,
+                    role: targetRole,
+                  }),
+                },
+              );
+              if (!membershipRes.ok) {
+                const body = await membershipRes.json().catch(() => null);
+                console.error(
+                  `[clerk webhook] auto-join failed for ${data.id} → ${targetOrgId}:`,
+                  body,
+                );
+              } else {
+                // organizationMembership.created webhook will fire and update
+                // the DB row's organization_id/role — but we mirror locally
+                // here too in case the membership webhook is delayed.
+                await db
+                  .update(users)
+                  .set({
+                    organizationId: targetOrgId,
+                    role: targetRole,
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(users.id, data.id));
+                console.log(
+                  `[clerk webhook] auto-joined ${data.id} to ${targetOrgId} as ${targetRole}`,
+                );
+              }
+            }
+          } catch (err) {
+            console.error("[clerk webhook] auto-join error:", err);
+          }
+        }
         break;
       }
       case "user.updated": {

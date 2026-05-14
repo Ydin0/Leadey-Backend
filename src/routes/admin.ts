@@ -6,6 +6,7 @@ import { adminAuditLog } from "../db/schema/admin-audit-log";
 import { ApiError } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
+import { inviteEmailToOrganization } from "../lib/invitations";
 
 const router = Router();
 
@@ -288,14 +289,36 @@ router.post(
       body: JSON.stringify({ name: name.trim() }),
     });
 
+    let inviteResult: { emailSent?: boolean; directlyAdded?: boolean } = {};
     if (adminEmail?.trim()) {
-      await clerkFetch(`/organizations/${orgData.id}/invitations`, {
-        method: "POST",
-        body: JSON.stringify({
-          email_address: adminEmail.trim(),
+      // Build a "Invited by <name>" string from the actor's DB row, if any
+      const [actorRow] = await db
+        .select({
+          firstName: users.firstName,
+          lastName: users.lastName,
+          email: users.email,
+        })
+        .from(users)
+        .where(eq(users.id, actor));
+      const invitedBy = actorRow
+        ? [actorRow.firstName, actorRow.lastName].filter(Boolean).join(" ") ||
+          actorRow.email
+        : undefined;
+
+      try {
+        inviteResult = await inviteEmailToOrganization({
+          email: adminEmail.trim(),
+          organizationId: orgData.id,
+          organizationName: name.trim(),
           role: "org:admin",
-        }),
-      });
+          template: "welcome",
+          invitedBy,
+        });
+      } catch (err: any) {
+        // The org is already created — surface the invite failure but don't 500
+        console.error("[admin.org.create] invitation failed:", err.message);
+        inviteResult = { emailSent: false };
+      }
     }
 
     await recordAudit({
@@ -303,10 +326,20 @@ router.post(
       action: "org.create",
       targetType: "organization",
       targetId: orgData.id,
-      after: { name: name.trim(), adminEmail: adminEmail?.trim() || null },
+      after: {
+        name: name.trim(),
+        adminEmail: adminEmail?.trim() || null,
+        emailSent: inviteResult.emailSent || false,
+        directlyAdded: inviteResult.directlyAdded || false,
+      },
     });
 
-    res.status(201).json({ data: orgData });
+    res.status(201).json({
+      data: {
+        ...orgData,
+        invitation: inviteResult,
+      },
+    });
   }),
 );
 
@@ -378,29 +411,52 @@ router.post(
   asyncHandler<OrgParams>(async (req, res) => {
     const { email, role } = req.body || {};
     const actor = getActorId(req);
+    const finalRole: "org:admin" | "org:member" =
+      role === "org:admin" ? "org:admin" : "org:member";
 
     if (!email?.trim()) throw new ApiError(400, "Email is required");
 
-    const inviteData = await clerkFetch(
-      `/organizations/${req.params.id}/invitations`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          email_address: email.trim(),
-          role: role || "org:member",
-        }),
-      },
-    );
+    const [org] = await db
+      .select({ name: organizations.name })
+      .from(organizations)
+      .where(eq(organizations.id, req.params.id));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const [actorRow] = await db
+      .select({
+        firstName: users.firstName,
+        lastName: users.lastName,
+        email: users.email,
+      })
+      .from(users)
+      .where(eq(users.id, actor));
+    const invitedBy = actorRow
+      ? [actorRow.firstName, actorRow.lastName].filter(Boolean).join(" ") ||
+        actorRow.email
+      : undefined;
+
+    const result = await inviteEmailToOrganization({
+      email: email.trim(),
+      organizationId: req.params.id,
+      organizationName: org.name,
+      role: finalRole,
+      template: "member",
+      invitedBy,
+    });
 
     await recordAudit({
       actorUserId: actor,
       action: "org.member.invite",
       targetType: "organization",
       targetId: req.params.id,
-      after: { email: email.trim(), role: role || "org:member" },
+      after: {
+        email: email.trim(),
+        role: finalRole,
+        directlyAdded: result.directlyAdded,
+      },
     });
 
-    res.status(201).json({ data: inviteData });
+    res.status(201).json({ data: result });
   }),
 );
 
