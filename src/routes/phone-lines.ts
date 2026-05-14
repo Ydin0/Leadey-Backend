@@ -475,14 +475,36 @@ function serializeBundle(b: typeof regulatoryBundles.$inferSelect) {
     country: b.country,
     countryCode: b.countryCode,
     status: b.status,
+
     businessName: b.businessName,
-    businessAddress: b.businessAddress,
-    businessRegistrationNumber: b.businessRegistrationNumber,
     businessType: b.businessType,
+    businessRegistrationAuthority: b.businessRegistrationAuthority,
+    businessRegistrationNumber: b.businessRegistrationNumber,
+    businessWebsite: b.businessWebsite,
+    businessClassification: b.businessClassification,
+
+    addressStreet1: b.addressStreet1,
+    addressStreet2: b.addressStreet2,
+    addressCity: b.addressCity,
+    addressSubdivision: b.addressSubdivision,
+    addressPostalCode: b.addressPostalCode,
+
+    representativeFirstName: b.representativeFirstName,
+    representativeLastName: b.representativeLastName,
+    representativeEmail: b.representativeEmail,
+    representativePhone: b.representativePhone,
+
+    // legacy
+    businessAddress: b.businessAddress,
     contactEmail: b.contactEmail,
     contactPhone: b.contactPhone,
     identityDocumentName: b.identityDocumentName,
+
     twilioBundleSid: b.twilioBundleSid,
+    twilioEndUserSid: b.twilioEndUserSid,
+    twilioAddressSid: b.twilioAddressSid,
+    twilioIndividualEndUserSid: b.twilioIndividualEndUserSid,
+
     createdAt: b.createdAt.toISOString(),
   };
 }
@@ -504,11 +526,16 @@ router.post(
   "/phone-lines/bundles",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const auth = getAuth(req);
     const {
-      name, country, countryCode, businessName, businessAddress,
-      businessRegistrationNumber, businessType, contactEmail, contactPhone,
-      identityDocumentName,
+      name, country, countryCode,
+      businessName, businessType,
+      businessRegistrationAuthority, businessRegistrationNumber,
+      businessWebsite, businessClassification,
+      addressStreet1, addressStreet2, addressCity, addressSubdivision, addressPostalCode,
+      representativeFirstName, representativeLastName,
+      representativeEmail, representativePhone,
+      // legacy aliases
+      businessAddress, contactEmail, contactPhone, identityDocumentName,
     } = req.body;
 
     if (!country || !countryCode || !businessName) {
@@ -523,15 +550,67 @@ router.post(
       country,
       countryCode,
       businessName,
-      businessAddress: businessAddress || "",
-      businessRegistrationNumber: businessRegistrationNumber || "",
       businessType: businessType || "limited_company",
+      businessRegistrationAuthority: businessRegistrationAuthority || "",
+      businessRegistrationNumber: businessRegistrationNumber || "",
+      businessWebsite: businessWebsite || "",
+      businessClassification: businessClassification || "INDEPENDENT_SOFTWARE_VENDOR",
+      addressStreet1: addressStreet1 || "",
+      addressStreet2: addressStreet2 || "",
+      addressCity: addressCity || "",
+      addressSubdivision: addressSubdivision || "",
+      addressPostalCode: addressPostalCode || "",
+      representativeFirstName: representativeFirstName || "",
+      representativeLastName: representativeLastName || "",
+      representativeEmail: representativeEmail || contactEmail || "",
+      representativePhone: representativePhone || contactPhone || "",
+      // legacy
+      businessAddress: businessAddress || "",
       contactEmail: contactEmail || "",
       contactPhone: contactPhone || "",
       identityDocumentName: identityDocumentName || "",
     }).returning();
 
     res.status(201).json({ data: serializeBundle(bundle) });
+  }),
+);
+
+// PATCH /api/phone-lines/bundles/:id — update bundle details (draft only)
+router.patch(
+  "/phone-lines/bundles/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const bundleId = req.params.id;
+
+    const [existing] = await db.select().from(regulatoryBundles)
+      .where(and(eq(regulatoryBundles.id, bundleId), eq(regulatoryBundles.organizationId, orgId)));
+    if (!existing) throw new ApiError(404, "Bundle not found");
+    if (existing.status !== "draft") {
+      throw new ApiError(400, "Only draft bundles can be edited");
+    }
+
+    const allowed: Array<keyof typeof regulatoryBundles.$inferInsert> = [
+      "name", "businessName", "businessType",
+      "businessRegistrationAuthority", "businessRegistrationNumber",
+      "businessWebsite", "businessClassification",
+      "addressStreet1", "addressStreet2", "addressCity",
+      "addressSubdivision", "addressPostalCode",
+      "representativeFirstName", "representativeLastName",
+      "representativeEmail", "representativePhone",
+    ];
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    for (const key of allowed) {
+      if (key in req.body) updates[key] = req.body[key];
+    }
+
+    const [updated] = await db
+      .update(regulatoryBundles)
+      .set(updates)
+      .where(eq(regulatoryBundles.id, bundleId))
+      .returning();
+
+    res.json({ data: serializeBundle(updated) });
   }),
 );
 
@@ -666,17 +745,35 @@ router.post(
       .where(eq(bundleDocuments.bundleId, bundleId));
     if (docs.length === 0) throw new ApiError(400, "Upload at least one document before submitting");
 
+    // Pre-flight validation: make sure required structured fields are filled
+    const missing: string[] = [];
+    if (!bundle.addressStreet1) missing.push("addressStreet1");
+    if (!bundle.addressCity) missing.push("addressCity");
+    if (!bundle.addressPostalCode) missing.push("addressPostalCode");
+    if (!bundle.representativeFirstName) missing.push("representativeFirstName");
+    if (!bundle.representativeLastName) missing.push("representativeLastName");
+    if (!bundle.representativeEmail) missing.push("representativeEmail");
+    if (!bundle.representativePhone) missing.push("representativePhone");
+    if (!bundle.businessRegistrationAuthority) missing.push("businessRegistrationAuthority");
+    if (!bundle.businessRegistrationNumber) missing.push("businessRegistrationNumber");
+    if (missing.length > 0) {
+      throw new ApiError(
+        400,
+        `Missing required fields before Twilio submission: ${missing.join(", ")}`,
+      );
+    }
+
     try {
       const countryCode = bundle.countryCode.toUpperCase();
 
-      // 1. Find the correct regulation for this country (Business, Local number type)
+      // ── 1. Find the correct regulation ─────────────────────────────
       const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
         isoCountry: countryCode,
         limit: 20,
       });
 
       // Prefer Business Local, fall back to Business National, then any Business
-      let regulation = regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "local")
+      const regulation = regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "local")
         || regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "national")
         || regulations.find((r: any) => r.friendlyName?.includes("Business"))
         || regulations[0];
@@ -687,60 +784,95 @@ router.post(
 
       console.log(`[Bundle Submit] Using regulation ${regulation.sid} (${regulation.friendlyName}) for ${countryCode}`);
 
-      // 2. Create End-User on Twilio
-      const endUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
+      // ── 2. Create the Twilio Address ───────────────────────────────
+      const addressFriendlyName = `${bundle.businessName} - ${bundle.country} HQ`.slice(0, 64);
+      const twilioAddress = await client.addresses.create({
+        customerName: bundle.businessName,
+        street: bundle.addressStreet1,
+        ...(bundle.addressStreet2 ? { streetSecondary: bundle.addressStreet2 } : {}),
+        city: bundle.addressCity,
+        region: bundle.addressSubdivision || bundle.addressCity, // some countries require region; default to city
+        postalCode: bundle.addressPostalCode,
+        isoCountry: countryCode,
+        friendlyName: addressFriendlyName,
+      } as any);
+      console.log(`[Bundle Submit] Address created: ${twilioAddress.sid}`);
+
+      // ── 3. Create the Business End-User ────────────────────────────
+      const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
         attributes: {
           business_name: bundle.businessName,
-          business_registration_number: bundle.businessRegistrationNumber || "",
+          business_registration_authority: bundle.businessRegistrationAuthority,
+          business_registration_number: bundle.businessRegistrationNumber,
+          business_identity: bundle.businessClassification,
+          website_url: bundle.businessWebsite || `https://${bundle.businessName.toLowerCase().replace(/\s+/g, "")}.com`,
+          // Twilio uses this to know if the number is for the end customer or the platform
+          is_number_assigned_to_the_end_customer: "false",
         },
       });
+      console.log(`[Bundle Submit] Business End-User created: ${businessEndUser.sid}`);
 
-      console.log(`[Bundle Submit] End-User created: ${endUser.sid}`);
+      // ── 4. Create the Individual (Authorized Representative) ───────
+      const individualEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
+        friendlyName: `${bundle.representativeFirstName} ${bundle.representativeLastName}`.trim(),
+        type: "individual",
+        attributes: {
+          first_name: bundle.representativeFirstName,
+          last_name: bundle.representativeLastName,
+          email: bundle.representativeEmail,
+          phone_number: bundle.representativePhone,
+        },
+      });
+      console.log(`[Bundle Submit] Individual End-User created: ${individualEndUser.sid}`);
 
-      // 3. Create Regulatory Bundle
+      // ── 5. Create the Regulatory Bundle ────────────────────────────
+      // Friendly name pattern makes it easy to spot in Twilio console
+      const bundleFriendlyName = `${bundle.businessName} - ${bundle.country} - ${regulation.numberType || "local"} (${bundle.id})`.slice(0, 64);
       const twilioBundle = await client.numbers.v2.regulatoryCompliance.bundles.create({
-        friendlyName: bundle.name,
-        email: bundle.contactEmail || "compliance@leadey.com",
+        friendlyName: bundleFriendlyName,
+        email: bundle.representativeEmail,
         regulationSid: regulation.sid,
         isoCountry: countryCode,
         numberType: regulation.numberType || "local",
         endUserType: "business",
       });
-
       console.log(`[Bundle Submit] Bundle created: ${twilioBundle.sid}`);
 
-      // 4. Assign End-User to bundle
-      await client.numbers.v2.regulatoryCompliance
-        .bundles(twilioBundle.sid)
-        .itemAssignments.create({ objectSid: endUser.sid });
+      // ── 6. Attach business end-user, individual, address, documents ─
+      const itemSids: Array<{ sid: string; label: string }> = [
+        { sid: businessEndUser.sid, label: "business-end-user" },
+        { sid: individualEndUser.sid, label: "individual-end-user" },
+        { sid: twilioAddress.sid, label: "address" },
+        ...docs
+          .filter((d) => d.twilioDocumentSid)
+          .map((d) => ({ sid: d.twilioDocumentSid as string, label: `doc:${d.documentType}` })),
+      ];
 
-      // 5. Assign uploaded documents
-      for (const doc of docs) {
-        if (doc.twilioDocumentSid) {
-          try {
-            await client.numbers.v2.regulatoryCompliance
-              .bundles(twilioBundle.sid)
-              .itemAssignments.create({ objectSid: doc.twilioDocumentSid });
-          } catch (assignErr: any) {
-            console.error(`[Bundle Submit] Failed to assign doc ${doc.id}:`, assignErr.message);
-          }
+      for (const item of itemSids) {
+        try {
+          await client.numbers.v2.regulatoryCompliance
+            .bundles(twilioBundle.sid)
+            .itemAssignments.create({ objectSid: item.sid });
+          console.log(`[Bundle Submit] Attached ${item.label} (${item.sid})`);
+        } catch (assignErr: any) {
+          console.error(`[Bundle Submit] Failed to attach ${item.label}:`, assignErr.message);
         }
       }
 
-      // 6. Submit for review
+      // ── 7. Submit for review ───────────────────────────────────────
       await client.numbers.v2.regulatoryCompliance
         .bundles(twilioBundle.sid)
         .update({ status: "pending-review" });
-
       console.log(`[Bundle Submit] Bundle ${twilioBundle.sid} submitted for review`);
 
-      // Update DB
       const [updated] = await db.update(regulatoryBundles).set({
         status: "pending-review",
         twilioBundleSid: twilioBundle.sid,
-        twilioEndUserSid: endUser.sid,
+        twilioEndUserSid: businessEndUser.sid,
+        twilioIndividualEndUserSid: individualEndUser.sid,
+        twilioAddressSid: twilioAddress.sid,
         updatedAt: new Date(),
       }).where(eq(regulatoryBundles.id, bundleId)).returning();
 
