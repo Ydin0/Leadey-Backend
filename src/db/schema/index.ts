@@ -11,6 +11,7 @@ export { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
 export { discoveryRuns, scraperContacts } from "./contacts";
 export { templates } from "./templates";
 export { masterCompanies, masterContacts } from "./master";
+export { adminAuditLog } from "./admin-audit-log";
 export {
   funnelsRelations,
   funnelStepsRelations,

@@ -31,6 +31,7 @@ export const users = pgTable("users", {
   imageUrl: text("image_url"),
   role: text("role"),
   platformRole: text("platform_role"),
+  suspendedAt: timestamp("suspended_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
