@@ -33,6 +33,17 @@ function asyncHandler<P = Record<string, string>>(handler: AsyncHandler<P>) {
   };
 }
 
+// Reserved sub-paths under /phone-lines/ that look like a :lineId to Express
+// but are actually their own routes. Without this guard, GET /phone-lines/bundles
+// matches `GET /phone-lines/:lineId` (registered earlier) and returns 404
+// "Phone line not found" before the real /bundles handler is checked.
+const RESERVED_LINE_ID_SUBPATHS = new Set([
+  "bundles",
+  "call-records",
+  "auto-allocate",
+  "provision",
+]);
+
 const router = Router();
 
 // ── Phone Lines ───────────────────────────────────
@@ -114,7 +125,8 @@ router.get(
 // GET /api/phone-lines/:lineId — single line with stats
 router.get(
   "/phone-lines/:lineId",
-  asyncHandler(async (req, res) => {
+  asyncHandler(async (req, res, next) => {
+    if (RESERVED_LINE_ID_SUBPATHS.has(req.params.lineId)) return next();
     const orgId = getOrgId(req);
     const { lineId } = req.params;
 
@@ -176,7 +188,8 @@ router.get(
 // PATCH /api/phone-lines/:lineId — update line fields
 router.patch(
   "/phone-lines/:lineId",
-  asyncHandler(async (req, res) => {
+  asyncHandler(async (req, res, next) => {
+    if (RESERVED_LINE_ID_SUBPATHS.has(req.params.lineId)) return next();
     const orgId = getOrgId(req);
     const { lineId } = req.params;
 
@@ -451,7 +464,8 @@ router.post(
 // DELETE /api/phone-lines/:lineId — release a line
 router.delete(
   "/phone-lines/:lineId",
-  asyncHandler(async (req, res) => {
+  asyncHandler(async (req, res, next) => {
+    if (RESERVED_LINE_ID_SUBPATHS.has(req.params.lineId)) return next();
     const orgId = getOrgId(req);
     const { lineId } = req.params;
 
