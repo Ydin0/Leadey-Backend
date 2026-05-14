@@ -6,6 +6,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
 import { organizations, users } from "../db/schema/organizations";
+import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { createId } from "../lib/helpers";
 import { stripe, getPlanFromPriceId, getPlanConfig } from "../lib/stripe";
 
@@ -311,6 +312,56 @@ router.post("/clerk", async (req: Request, res: Response) => {
   } catch (err) {
     console.error(`Error handling Clerk webhook (${type}):`, err);
     res.status(500).json({ error: "Internal error processing webhook" });
+  }
+});
+
+// ─── POST /webhooks/twilio/bundle-status ─────────────────────────────────
+// Twilio posts here when a Regulatory Bundle changes status
+// (pending-review → twilio-approved | twilio-rejected, or when a
+// twilio-approved bundle gets a valid_until expiry due to a regulation
+// update). Payload shape:
+//   {
+//     account_sid, bundle_sid, status,
+//     valid_until?: ISO date, failure_reason?: string
+//   }
+router.post("/twilio/bundle-status", async (req: Request, res: Response) => {
+  try {
+    const bundleSid: string | undefined = req.body?.bundle_sid || req.body?.BundleSid;
+    const status: string | undefined = req.body?.status || req.body?.Status;
+    const failureReason: string | undefined = req.body?.failure_reason || req.body?.FailureReason;
+    const validUntil: string | undefined = req.body?.valid_until || req.body?.ValidUntil;
+
+    console.log(
+      `[Twilio Bundle Status] sid=${bundleSid} status=${status} validUntil=${validUntil || "-"} failureReason=${failureReason || "-"}`,
+    );
+
+    if (!bundleSid) {
+      res.status(200).send("OK");
+      return;
+    }
+
+    const row = await db.query.regulatoryBundles.findFirst({
+      where: eq(regulatoryBundles.twilioBundleSid, bundleSid),
+    });
+    if (!row) {
+      console.warn(`[Twilio Bundle Status] No DB row matches twilioBundleSid=${bundleSid}`);
+      res.status(200).send("OK");
+      return;
+    }
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    if (status) updates.status = status;
+
+    await db
+      .update(regulatoryBundles)
+      .set(updates)
+      .where(eq(regulatoryBundles.id, row.id));
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("[Twilio Bundle Status] Error:", err);
+    // Always 200 — Twilio retries on non-2xx and we don't want a loop
+    res.status(200).send("OK");
   }
 });
 

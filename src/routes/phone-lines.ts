@@ -11,6 +11,10 @@ import { callRecords } from "../db/schema/call-records";
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
 import { createId, ApiError } from "../lib/helpers";
+import {
+  uploadSupportingDocumentWithFile,
+  updateSupportingDocumentAttributes,
+} from "../lib/twilio-uploads";
 
 const client = twilioSdk(
   process.env.TWILIO_ACCOUNT_SID!,
@@ -666,27 +670,53 @@ router.post(
     const docId = createId("bdoc");
     let twilioDocSid: string | null = null;
 
-    // Create Twilio supporting document via Regulatory Compliance API
-    try {
-      const twilioDocTypeMap: Record<string, string> = {
-        business_registration: "business_registration",
-        government_id: "government_id",
-        utility_bill: "utility_bill",
-        passport: "passport",
-      };
-      const docType = twilioDocTypeMap[documentType] || "business_registration";
+    // Upload the actual file bytes to Twilio. The standard
+    // supportingDocuments.create() only stores metadata — for reviewers to
+    // see the document, we must POST to numbers-upload.twilio.com with the
+    // file as multipart/form-data.
+    //
+    // Per-document-type attributes:
+    //   business_registration  → business_name, document_number (best effort)
+    //   government_id          → first_name, last_name (rep's name)
+    //   utility_bill           → address_sids attached at submit-time
+    //   power_of_attorney      → none required at create-time
+    //   passport               → first_name, last_name
+    const twilioDocTypeMap: Record<string, string> = {
+      business_registration: "business_registration",
+      government_id: "government_id",
+      utility_bill: "utility_bill",
+      passport: "passport",
+      power_of_attorney: "power_of_attorney",
+    };
+    const twilioDocType = twilioDocTypeMap[documentType] || "business_registration";
 
-      const twilioDoc = await client.numbers.v2.regulatoryCompliance.supportingDocuments.create({
-        friendlyName: `${bundle.businessName} - ${documentType} - ${file.originalname}`,
-        type: docType,
-        attributes: {
-          business_name: bundle.businessName,
-        },
+    const attrs: Record<string, unknown> = {};
+    if (documentType === "business_registration") {
+      attrs.business_name = bundle.businessName;
+      if (bundle.businessRegistrationNumber) {
+        attrs.document_number = bundle.businessRegistrationNumber;
+      }
+    } else if (documentType === "government_id" || documentType === "passport") {
+      if (bundle.representativeFirstName) attrs.first_name = bundle.representativeFirstName;
+      if (bundle.representativeLastName) attrs.last_name = bundle.representativeLastName;
+    }
+    // utility_bill and power_of_attorney get their attributes filled in at
+    // submit time (utility_bill needs address_sids — we don't have the SID
+    // until the Address record is created at submit).
+
+    try {
+      const twilioDoc = await uploadSupportingDocumentWithFile({
+        fileBuffer: file.buffer,
+        fileName: file.originalname,
+        mimeType: file.mimetype || "application/octet-stream",
+        friendlyName: `${bundle.businessName} - ${documentType} - ${file.originalname}`.slice(0, 64),
+        type: twilioDocType,
+        attributes: attrs,
       });
       twilioDocSid = twilioDoc.sid;
-      console.log(`[Bundle Upload] Twilio doc created: ${twilioDocSid}`);
-    } catch (err) {
-      console.error("[Bundle Upload] Twilio doc creation failed (continuing with DB save):", err);
+      console.log(`[Bundle Upload] Twilio doc uploaded: ${twilioDocSid} (${twilioDocType})`);
+    } catch (err: any) {
+      console.error("[Bundle Upload] Twilio upload failed (continuing with DB save):", err?.message || err);
     }
 
     const [savedDoc] = await db.insert(bundleDocuments).values({
@@ -785,41 +815,7 @@ router.post(
     try {
       const countryCode = bundle.countryCode.toUpperCase();
 
-      // ── 1. Find the correct regulation ─────────────────────────────
-      const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
-        isoCountry: countryCode,
-        limit: 20,
-      });
-
-      // Prefer Business Local, fall back to Business National, then any Business
-      const regulation = regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "local")
-        || regulations.find((r: any) => r.friendlyName?.includes("Business") && r.numberType === "national")
-        || regulations.find((r: any) => r.friendlyName?.includes("Business"))
-        || regulations[0];
-
-      if (!regulation) {
-        throw new ApiError(400, `No Twilio regulation found for ${bundle.country}. Phone number compliance may not be available for this country.`);
-      }
-
-      console.log(`[Bundle Submit] Using regulation ${regulation.sid} (${regulation.friendlyName}) for ${countryCode}`);
-
-      // ── 2. Create the Twilio Address ───────────────────────────────
-      const addressFriendlyName = `${bundle.businessName} - ${bundle.country} HQ`.slice(0, 64);
-      const twilioAddress = await client.addresses.create({
-        customerName: bundle.businessName,
-        street: bundle.addressStreet1,
-        ...(bundle.addressStreet2 ? { streetSecondary: bundle.addressStreet2 } : {}),
-        city: bundle.addressCity,
-        region: bundle.addressSubdivision || bundle.addressCity, // some countries require region; default to city
-        postalCode: bundle.addressPostalCode,
-        isoCountry: countryCode,
-        friendlyName: addressFriendlyName,
-      } as any);
-      console.log(`[Bundle Submit] Address created: ${twilioAddress.sid}`);
-
-      // ── 3. Create the Business End-User ────────────────────────────
-      // Persist the derived authority back to the DB so it's visible to the
-      // customer / admin panel even though it wasn't a form field.
+      // Persist the derived authority back so it shows in our UI too.
       if (!bundle.businessRegistrationAuthority && derivedAuthority) {
         await db
           .update(regulatoryBundles)
@@ -827,37 +823,110 @@ router.post(
           .where(eq(regulatoryBundles.id, bundleId));
       }
 
+      // ── 1. Find the right Regulation for this country + business ───
+      // A Regulation is unique per (IsoCountry, NumberType, EndUserType).
+      const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
+        isoCountry: countryCode,
+        endUserType: "business",
+        limit: 20,
+      });
+
+      const regulation =
+        regulations.find((r: any) => r.numberType === "local") ||
+        regulations.find((r: any) => r.numberType === "national") ||
+        regulations[0];
+
+      if (!regulation) {
+        throw new ApiError(
+          400,
+          `No Twilio business regulation found for ${bundle.country}. Phone number compliance may not be available for this country.`,
+        );
+      }
+      console.log(`[Bundle Submit] regulation=${regulation.sid} (${regulation.friendlyName})`);
+
+      // ── 2. Create the Address resource (separate API) ──────────────
+      // Used as the Bundle's proof-of-address + linked from utility_bill
+      // supporting docs via address_sids.
+      const twilioAddress = await client.addresses.create({
+        customerName: bundle.businessName,
+        street: bundle.addressStreet1,
+        ...(bundle.addressStreet2 ? { streetSecondary: bundle.addressStreet2 } : {}),
+        city: bundle.addressCity,
+        region: bundle.addressSubdivision || bundle.addressCity,
+        postalCode: bundle.addressPostalCode,
+        isoCountry: countryCode,
+        friendlyName: `${bundle.businessName} - registered address`.slice(0, 64),
+      } as any);
+      console.log(`[Bundle Submit] address=${twilioAddress.sid}`);
+
+      // ── 3. Create the Business End-User ────────────────────────────
+      // Twilio docs show the business end-user's attributes carry BOTH the
+      // business info AND the authorized representative's name (first_name,
+      // last_name). There is no separate "Individual" end-user for business
+      // regulations — the rep is part of the business record.
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
         attributes: {
           business_name: bundle.businessName,
-          business_registration_authority: derivedAuthority,
           business_registration_number: bundle.businessRegistrationNumber,
+          business_registration_authority: derivedAuthority,
           business_identity: bundle.businessClassification,
           ...(bundle.businessWebsite ? { website_url: bundle.businessWebsite } : {}),
-          // Twilio uses this to know if the number is for the end customer or the platform
-          is_number_assigned_to_the_end_customer: "false",
-        },
-      });
-      console.log(`[Bundle Submit] Business End-User created: ${businessEndUser.sid}`);
-
-      // ── 4. Create the Individual (Authorized Representative) ───────
-      const individualEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
-        friendlyName: `${bundle.representativeFirstName} ${bundle.representativeLastName}`.trim(),
-        type: "individual",
-        attributes: {
           first_name: bundle.representativeFirstName,
           last_name: bundle.representativeLastName,
           email: bundle.representativeEmail,
           phone_number: bundle.representativePhone,
+          // The number is NOT being resold to the end customer (the customer
+          // IS the end-user). Twilio expects this flag for hosted-platform
+          // accounts.
+          is_number_assigned_to_the_end_customer: "false",
         },
       });
-      console.log(`[Bundle Submit] Individual End-User created: ${individualEndUser.sid}`);
+      console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
 
-      // ── 5. Create the Regulatory Bundle ────────────────────────────
-      // Friendly name pattern makes it easy to spot in Twilio console
-      const bundleFriendlyName = `${bundle.businessName} - ${bundle.country} - ${regulation.numberType || "local"} (${bundle.id})`.slice(0, 64);
+      // ── 4. Top up Supporting Document attributes that we couldn't
+      //       fill at upload time (utility_bill needs the Address SID).
+      for (const doc of docs) {
+        if (!doc.twilioDocumentSid) continue;
+        try {
+          if (doc.documentType === "utility_bill") {
+            await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
+              address_sids: [twilioAddress.sid],
+              business_name: bundle.businessName,
+            });
+            console.log(`[Bundle Submit] linked address to utility_bill ${doc.twilioDocumentSid}`);
+          } else if (doc.documentType === "business_registration") {
+            await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
+              business_name: bundle.businessName,
+              document_number: bundle.businessRegistrationNumber,
+            });
+          } else if (
+            doc.documentType === "government_id" ||
+            doc.documentType === "passport"
+          ) {
+            await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
+              first_name: bundle.representativeFirstName,
+              last_name: bundle.representativeLastName,
+            });
+          }
+        } catch (attrErr: any) {
+          console.error(
+            `[Bundle Submit] doc-attribute update failed for ${doc.documentType} ${doc.twilioDocumentSid}:`,
+            attrErr?.message || attrErr,
+          );
+        }
+      }
+
+      // ── 5. Create the Regulatory Bundle container ──────────────────
+      // Friendly name patterned so it's identifiable in Twilio console.
+      // status_callback lets Twilio notify our backend on approval/rejection.
+      const statusCallback =
+        process.env.PUBLIC_API_BASE_URL
+          ? `${process.env.PUBLIC_API_BASE_URL.replace(/\/$/, "")}/webhooks/twilio/bundle-status`
+          : undefined;
+
+      const bundleFriendlyName = `${bundle.businessName} · ${bundle.country} ${regulation.numberType || "local"} (${bundle.id})`.slice(0, 64);
       const twilioBundle = await client.numbers.v2.regulatoryCompliance.bundles.create({
         friendlyName: bundleFriendlyName,
         email: bundle.representativeEmail,
@@ -865,13 +934,13 @@ router.post(
         isoCountry: countryCode,
         numberType: regulation.numberType || "local",
         endUserType: "business",
+        ...(statusCallback ? { statusCallback } : {}),
       });
-      console.log(`[Bundle Submit] Bundle created: ${twilioBundle.sid}`);
+      console.log(`[Bundle Submit] bundle=${twilioBundle.sid}`);
 
-      // ── 6. Attach business end-user, individual, address, documents ─
+      // ── 6. Attach items (end-user, address, every supporting doc) ──
       const itemSids: Array<{ sid: string; label: string }> = [
         { sid: businessEndUser.sid, label: "business-end-user" },
-        { sid: individualEndUser.sid, label: "individual-end-user" },
         { sid: twilioAddress.sid, label: "address" },
         ...docs
           .filter((d) => d.twilioDocumentSid)
@@ -883,24 +952,50 @@ router.post(
           await client.numbers.v2.regulatoryCompliance
             .bundles(twilioBundle.sid)
             .itemAssignments.create({ objectSid: item.sid });
-          console.log(`[Bundle Submit] Attached ${item.label} (${item.sid})`);
+          console.log(`[Bundle Submit] attached ${item.label} (${item.sid})`);
         } catch (assignErr: any) {
-          console.error(`[Bundle Submit] Failed to attach ${item.label}:`, assignErr.message);
+          console.error(`[Bundle Submit] failed to attach ${item.label}:`, assignErr.message);
         }
       }
 
-      // ── 7. Submit for review ───────────────────────────────────────
+      // ── 7. Run a self-evaluation BEFORE submitting ─────────────────
+      // If we have a non-compliant evaluation, fail fast with a useful
+      // message instead of letting Twilio reject it days later.
+      try {
+        const evaluation: any = await client.numbers.v2.regulatoryCompliance
+          .bundles(twilioBundle.sid)
+          .evaluations.create();
+        if (evaluation?.status === "noncompliant") {
+          const failures = (evaluation.results || [])
+            .filter((r: any) => r.passed === false)
+            .map((r: any) => r.failure_reason)
+            .filter(Boolean)
+            .join(" | ");
+          throw new ApiError(
+            400,
+            `Twilio evaluation rejected the bundle. ${failures || "See Twilio console for details."}`,
+          );
+        }
+      } catch (evalErr: any) {
+        // If the evaluation API itself errored (not a noncompliant result),
+        // log and continue — Twilio will surface the issue on submit.
+        if (evalErr instanceof ApiError) throw evalErr;
+        console.warn(`[Bundle Submit] evaluation check failed: ${evalErr?.message}`);
+      }
+
+      // ── 8. Submit for review ───────────────────────────────────────
       await client.numbers.v2.regulatoryCompliance
         .bundles(twilioBundle.sid)
         .update({ status: "pending-review" });
-      console.log(`[Bundle Submit] Bundle ${twilioBundle.sid} submitted for review`);
+      console.log(`[Bundle Submit] ${twilioBundle.sid} submitted for review`);
 
       const [updated] = await db.update(regulatoryBundles).set({
         status: "pending-review",
         twilioBundleSid: twilioBundle.sid,
         twilioEndUserSid: businessEndUser.sid,
-        twilioIndividualEndUserSid: individualEndUser.sid,
         twilioAddressSid: twilioAddress.sid,
+        // Individual end-user is no longer created; clear any legacy value
+        twilioIndividualEndUserSid: null,
         updatedAt: new Date(),
       }).where(eq(regulatoryBundles.id, bundleId)).returning();
 
