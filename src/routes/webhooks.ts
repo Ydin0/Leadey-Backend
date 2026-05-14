@@ -177,7 +177,10 @@ router.post("/clerk", async (req: Request, res: Response) => {
           firstName: data.first_name,
           lastName: data.last_name,
           imageUrl: data.image_url,
-          platformRole: data.public_metadata?.role || null,
+          platformRole:
+            data.public_metadata?.platform_role ||
+            data.public_metadata?.role ||
+            null,
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
@@ -252,7 +255,10 @@ router.post("/clerk", async (req: Request, res: Response) => {
             firstName: data.first_name,
             lastName: data.last_name,
             imageUrl: data.image_url,
-            platformRole: data.public_metadata?.role || null,
+            platformRole:
+            data.public_metadata?.platform_role ||
+            data.public_metadata?.role ||
+            null,
             updatedAt: new Date(data.updated_at),
           })
           .where(eq(users.id, data.id));

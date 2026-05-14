@@ -6,7 +6,10 @@ import { adminAuditLog } from "../db/schema/admin-audit-log";
 import { ApiError } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
-import { inviteEmailToOrganization } from "../lib/invitations";
+import { inviteEmailToOrganization, invitePlatformAdmin } from "../lib/invitations";
+import { alias } from "drizzle-orm/pg-core";
+
+const accountManagers = alias(users, "account_managers");
 
 const router = Router();
 
@@ -161,6 +164,7 @@ router.get(
     const search = (req.query.search as string) || "";
     const planFilter = (req.query.plan as string) || "";
     const statusFilter = (req.query.planStatus as string) || "";
+    const accountManagerFilter = (req.query.accountManagerId as string) || "";
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     const offset = Number(req.query.offset) || 0;
 
@@ -175,6 +179,8 @@ router.get(
     }
     if (planFilter) conditions.push(eq(organizations.plan, planFilter));
     if (statusFilter) conditions.push(eq(organizations.planStatus, statusFilter));
+    if (accountManagerFilter)
+      conditions.push(eq(organizations.accountManagerId, accountManagerFilter));
 
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -191,19 +197,46 @@ router.get(
         currentPeriodEnd: organizations.currentPeriodEnd,
         createdAt: organizations.createdAt,
         updatedAt: organizations.updatedAt,
+        accountManagerId: organizations.accountManagerId,
+        accountManagerEmail: accountManagers.email,
+        accountManagerFirstName: accountManagers.firstName,
+        accountManagerLastName: accountManagers.lastName,
         userCount: sql<number>`(
           SELECT count(*)::int FROM users WHERE users.organization_id = ${organizations.id}
         )`,
       })
       .from(organizations)
+      .leftJoin(
+        accountManagers,
+        eq(organizations.accountManagerId, accountManagers.id),
+      )
       .where(where)
       .orderBy(desc(organizations.createdAt))
       .limit(limit)
       .offset(offset);
 
     const items = rows.map((r) => ({
-      ...r,
+      id: r.id,
+      name: r.name,
+      slug: r.slug,
+      imageUrl: r.imageUrl,
+      plan: r.plan,
+      planStatus: r.planStatus,
+      seatsIncluded: r.seatsIncluded,
+      trialEndsAt: r.trialEndsAt,
+      currentPeriodEnd: r.currentPeriodEnd,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      userCount: r.userCount,
       mrrPence: computeMrrPence(r.plan, r.seatsIncluded || 0),
+      accountManager: r.accountManagerId
+        ? {
+            id: r.accountManagerId,
+            email: r.accountManagerEmail!,
+            firstName: r.accountManagerFirstName,
+            lastName: r.accountManagerLastName,
+          }
+        : null,
     }));
 
     const [{ count: total }] = await db
@@ -227,7 +260,7 @@ router.get(
   asyncHandler<OrgParams>(async (req, res) => {
     const org = await db.query.organizations.findFirst({
       where: eq(organizations.id, req.params.id),
-      with: { users: true },
+      with: { users: true, accountManager: true },
     });
 
     if (!org) throw new ApiError(404, "Organization not found");
@@ -265,10 +298,79 @@ router.get(
         mrrPence,
         memberCount: org.users.length,
         members: org.users,
+        accountManagerId: org.accountManagerId,
+        accountManager: org.accountManager
+          ? {
+              id: org.accountManager.id,
+              email: org.accountManager.email,
+              firstName: org.accountManager.firstName,
+              lastName: org.accountManager.lastName,
+              imageUrl: org.accountManager.imageUrl,
+            }
+          : null,
         createdAt: org.createdAt.toISOString(),
         updatedAt: org.updatedAt.toISOString(),
       },
     });
+  }),
+);
+
+// ─── PATCH /organizations/:id/account-manager ────────────────────────────
+// Assign / unassign a platform admin to an org
+
+router.patch(
+  "/organizations/:id/account-manager",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const actor = getActorId(req);
+    const accountManagerId = req.body?.accountManagerId as
+      | string
+      | null
+      | undefined;
+
+    if (accountManagerId !== null && typeof accountManagerId !== "string") {
+      throw new ApiError(400, "accountManagerId must be a string or null");
+    }
+
+    // Verify the target user exists and is a platform admin (when not unassigning)
+    if (accountManagerId) {
+      const [target] = await db
+        .select({ id: users.id, platformRole: users.platformRole })
+        .from(users)
+        .where(eq(users.id, accountManagerId));
+      if (!target) throw new ApiError(404, "Account manager user not found");
+      if (target.platformRole !== "admin") {
+        throw new ApiError(
+          400,
+          "Only platform admins can be assigned as account managers",
+        );
+      }
+    }
+
+    const [before] = await db
+      .select({ accountManagerId: organizations.accountManagerId })
+      .from(organizations)
+      .where(eq(organizations.id, req.params.id));
+    if (!before) throw new ApiError(404, "Organization not found");
+
+    await db
+      .update(organizations)
+      .set({
+        accountManagerId: accountManagerId ?? null,
+        updatedAt: new Date(),
+      })
+      .where(eq(organizations.id, req.params.id));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.update",
+      targetType: "organization",
+      targetId: req.params.id,
+      before: { accountManagerId: before.accountManagerId },
+      after: { accountManagerId: accountManagerId ?? null },
+      metadata: { kind: "account_manager_assignment" },
+    });
+
+    res.json({ data: { accountManagerId: accountManagerId ?? null } });
   }),
 );
 
@@ -1328,6 +1430,110 @@ router.post(
         expiresAt: token?.expires_at,
       },
     });
+  }),
+);
+
+// ─── Platform admins ─────────────────────────────────────────────────────
+
+// GET /platform-admins — list all users with platform_role = 'admin'
+router.get(
+  "/platform-admins",
+  asyncHandler(async (_req, res) => {
+    const rows = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        imageUrl: users.imageUrl,
+        platformRole: users.platformRole,
+        suspendedAt: users.suspendedAt,
+        createdAt: users.createdAt,
+        updatedAt: users.updatedAt,
+        managedOrgCount: sql<number>`(
+          SELECT count(*)::int FROM organizations
+          WHERE organizations.account_manager_id = ${users.id}
+        )`,
+      })
+      .from(users)
+      .where(eq(users.platformRole, "admin"))
+      .orderBy(desc(users.createdAt));
+
+    res.json({ data: { items: rows, total: rows.length } });
+  }),
+);
+
+// POST /platform-admins — invite (or promote existing) a platform admin
+router.post(
+  "/platform-admins",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const email = (req.body?.email as string | undefined)?.trim();
+    if (!email) throw new ApiError(400, "Email is required");
+
+    const [actorRow] = await db
+      .select({
+        firstName: users.firstName,
+        lastName: users.lastName,
+        email: users.email,
+      })
+      .from(users)
+      .where(eq(users.id, actor));
+    const invitedBy = actorRow
+      ? [actorRow.firstName, actorRow.lastName].filter(Boolean).join(" ") ||
+        actorRow.email
+      : undefined;
+
+    const result = await invitePlatformAdmin({ email, invitedBy });
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "user.platform_role.change",
+      targetType: "user",
+      targetId: email,
+      after: { platformRole: "admin" },
+      metadata: {
+        email,
+        emailSent: result.emailSent,
+        directlyPromoted: result.directlyPromoted,
+      },
+    });
+
+    res.status(201).json({ data: result });
+  }),
+);
+
+// DELETE /platform-admins/:userId — revoke admin (sets platform_role to null)
+router.delete(
+  "/platform-admins/:userId",
+  asyncHandler<{ userId: string }>(async (req, res) => {
+    const actor = getActorId(req);
+
+    if (req.params.userId === actor) {
+      throw new ApiError(400, "You cannot revoke your own admin access");
+    }
+
+    const [before] = await db
+      .select({ platformRole: users.platformRole })
+      .from(users)
+      .where(eq(users.id, req.params.userId));
+    if (!before) throw new ApiError(404, "User not found");
+
+    await db
+      .update(users)
+      .set({ platformRole: null, updatedAt: new Date() })
+      .where(eq(users.id, req.params.userId));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "user.platform_role.change",
+      targetType: "user",
+      targetId: req.params.userId,
+      before: { platformRole: before.platformRole },
+      after: { platformRole: null },
+    });
+
+    res.json({ data: { revoked: true } });
   }),
 );
 

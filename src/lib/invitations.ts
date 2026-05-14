@@ -18,6 +18,10 @@ import { ApiError } from "./helpers";
 import { sendEmail } from "./email";
 import { renderOrgAdminWelcome } from "./email-templates/org-admin-welcome";
 import { renderMemberInvite } from "./email-templates/member-invite";
+import { renderPlatformAdminInvite } from "./email-templates/platform-admin-invite";
+import { db } from "../db/index";
+import { users } from "../db/schema/organizations";
+import { eq } from "drizzle-orm";
 
 const APP_URL = process.env.APP_URL || "https://app.leadey.ai";
 
@@ -178,4 +182,109 @@ export async function inviteEmailToOrganization(
   });
 
   return { emailSent: true, directlyAdded: true };
+}
+
+export interface InvitePlatformAdminInput {
+  email: string;
+  invitedBy?: string;
+}
+
+export interface InvitePlatformAdminResult {
+  invitationId?: string;
+  emailSent: boolean;
+  /** Whether the user already existed and was promoted directly */
+  directlyPromoted: boolean;
+}
+
+/**
+ * Invite a new platform admin (someone who can sign into admin.leadey.ai).
+ *
+ *  - New emails: creates a Clerk user-invitation with notify:false + public_metadata.platform_role = "admin".
+ *    Our user.created webhook reads that on signup and writes platform_role = "admin" to the DB row.
+ *  - Existing Clerk users: promotes them directly by updating users.platform_role = "admin" in our DB
+ *    (no Clerk-side change needed — admin gating happens in the DB).
+ */
+export async function invitePlatformAdmin(
+  input: InvitePlatformAdminInput,
+): Promise<InvitePlatformAdminResult> {
+  // Path 1: new user
+  try {
+    const invitation = await clerk("/invitations", {
+      method: "POST",
+      body: JSON.stringify({
+        email_address: input.email,
+        public_metadata: {
+          platform_role: "admin",
+        },
+        redirect_url: `${APP_URL.replace(/app\./, "admin.")}/dashboard`,
+        notify: false,
+        expires_in_days: 7,
+      }),
+    });
+
+    const inviteUrl: string = invitation.url;
+    if (!inviteUrl) {
+      throw new Error("Clerk invitation response did not include a url");
+    }
+
+    const rendered = renderPlatformAdminInvite({
+      inviteUrl,
+      invitedBy: input.invitedBy,
+    });
+
+    await sendEmail({
+      to: input.email,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+    });
+
+    return {
+      invitationId: invitation.id,
+      emailSent: true,
+      directlyPromoted: false,
+    };
+  } catch (err: any) {
+    const code = err?.clerkCode;
+    const isAlreadyExists =
+      code === "form_identifier_exists" ||
+      code === "duplicate_record" ||
+      (typeof err?.message === "string" &&
+        err.message.toLowerCase().includes("already"));
+
+    if (!isAlreadyExists) throw err;
+  }
+
+  // Path 2: existing user → promote in DB
+  const [existing] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.email, input.email));
+
+  if (!existing?.id) {
+    throw new ApiError(
+      500,
+      "Clerk says the user exists, but no matching row in our DB. The Clerk webhook may not have inserted them yet — wait a moment and retry.",
+    );
+  }
+
+  await db
+    .update(users)
+    .set({ platformRole: "admin", updatedAt: new Date() })
+    .where(eq(users.id, existing.id));
+
+  // Send a notification email so they know they have new powers
+  const adminUrl = APP_URL.replace(/app\./, "admin.");
+  const rendered = renderPlatformAdminInvite({
+    inviteUrl: `${adminUrl}/dashboard`,
+    invitedBy: input.invitedBy,
+  });
+  await sendEmail({
+    to: input.email,
+    subject: `You're now a Leadey platform admin`,
+    html: rendered.html,
+    text: rendered.text,
+  });
+
+  return { emailSent: true, directlyPromoted: true };
 }

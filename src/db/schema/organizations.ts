@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, AnyPgColumn } from "drizzle-orm/pg-core";
 
 export const organizations = pgTable("organizations", {
   id: text("id").primaryKey(),
@@ -16,6 +16,11 @@ export const organizations = pgTable("organizations", {
   seatsIncluded: integer("seats_included").notNull().default(5),
   creditsIncluded: integer("credits_included").notNull().default(10000),
   creditsUsed: integer("credits_used").notNull().default(0),
+  // Platform admin assigned to manage this account
+  accountManagerId: text("account_manager_id").references(
+    (): AnyPgColumn => users.id,
+    { onDelete: "set null" },
+  ),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

@@ -55,15 +55,21 @@ export const settingsRelations = relations(settings, () => ({}));
 
 export const linkedinRateLimitsRelations = relations(linkedinRateLimits, () => ({}));
 
-export const organizationsRelations = relations(organizations, ({ many }) => ({
+export const organizationsRelations = relations(organizations, ({ many, one }) => ({
   users: many(users),
+  accountManager: one(users, {
+    fields: [organizations.accountManagerId],
+    references: [users.id],
+    relationName: "accountManager",
+  }),
 }));
 
-export const usersRelations = relations(users, ({ one }) => ({
+export const usersRelations = relations(users, ({ one, many }) => ({
   organization: one(organizations, {
     fields: [users.organizationId],
     references: [organizations.id],
   }),
+  managedOrganizations: many(organizations, { relationName: "accountManager" }),
 }));
 
 export const phoneLinesRelations = relations(phoneLines, ({ many }) => ({
