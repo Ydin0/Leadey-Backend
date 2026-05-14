@@ -233,6 +233,150 @@ router.patch(
   }),
 );
 
+// POST /api/phone-lines/auto-allocate — pick a random available number and provision it
+//
+// Self-service flow: customer chooses country + type, we ask Twilio for an
+// available number, then buy it on their behalf. If the country requires a
+// regulatory bundle the bundle must already be twilio-approved.
+router.post(
+  "/phone-lines/auto-allocate",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const {
+      countryCode,
+      country,
+      type,
+      assignedTo,
+      assignedToName,
+    } = req.body as {
+      countryCode?: string;
+      country?: string;
+      type?: "local" | "mobile" | "national" | "toll-free";
+      assignedTo?: string;
+      assignedToName?: string;
+    };
+
+    if (!countryCode) throw new ApiError(400, "countryCode is required");
+    const numberType = type || "local";
+    const iso = countryCode.toUpperCase();
+
+    // ── 1. Resolve an approved bundle for this org+country (if any) ──
+    const [approvedBundle] = await db
+      .select()
+      .from(regulatoryBundles)
+      .where(
+        and(
+          eq(regulatoryBundles.organizationId, orgId),
+          eq(regulatoryBundles.countryCode, iso),
+          eq(regulatoryBundles.status, "twilio-approved"),
+        ),
+      )
+      .orderBy(desc(regulatoryBundles.updatedAt))
+      .limit(1);
+
+    // For countries that require a bundle, fail with an actionable error
+    // instead of letting Twilio reject the purchase.
+    const COUNTRIES_REQUIRING_BUNDLE = new Set([
+      "GB", "DE", "FR", "AU", "IE", "ES", "IT", "NL", "SE", "DK", "FI", "NO",
+      "BE", "PL", "PT", "CH", "AT",
+    ]);
+    if (COUNTRIES_REQUIRING_BUNDLE.has(iso) && !approvedBundle) {
+      throw new ApiError(
+        400,
+        `An approved regulatory bundle is required to provision a ${iso} number. Create one in Settings → Phone Lines → Regulatory Bundles.`,
+      );
+    }
+
+    // ── 2. Ask Twilio for an available number ───────────────────────
+    let availableNumbers: any[] = [];
+    try {
+      const ctx = (client.availablePhoneNumbers as any)(iso);
+      const collection =
+        numberType === "mobile"
+          ? ctx.mobile
+          : numberType === "national"
+            ? ctx.national
+            : numberType === "toll-free"
+              ? ctx.tollFree
+              : ctx.local;
+      availableNumbers = await collection.list({ limit: 1 });
+    } catch (err: any) {
+      throw new ApiError(
+        400,
+        `Twilio couldn't search ${numberType} numbers for ${iso}: ${err?.message || err}`,
+      );
+    }
+
+    if (!availableNumbers.length) {
+      throw new ApiError(
+        400,
+        `No ${numberType} numbers available in ${iso} right now. Try a different type or try again later.`,
+      );
+    }
+    const candidate = availableNumbers[0];
+
+    // ── 3. Buy it. Bundle SID is required for regulated countries ───
+    let bought: any;
+    try {
+      bought = await client.incomingPhoneNumbers.create({
+        phoneNumber: candidate.phoneNumber,
+        voiceApplicationSid: process.env.TWILIO_TWIML_APP_SID!,
+        ...(approvedBundle?.twilioBundleSid
+          ? { bundleSid: approvedBundle.twilioBundleSid }
+          : {}),
+      } as any);
+    } catch (err: any) {
+      throw new ApiError(
+        400,
+        `Twilio rejected the purchase: ${err?.message || err}`,
+      );
+    }
+
+    // ── 4. Store in our DB ─────────────────────────────────────────
+    const id = createId("pl");
+    const [line] = await db
+      .insert(phoneLines)
+      .values({
+        id,
+        organizationId: orgId,
+        twilioSid: bought.sid,
+        number: bought.phoneNumber,
+        friendlyName: bought.friendlyName || bought.phoneNumber,
+        country: country || iso,
+        countryCode: iso,
+        type: numberType,
+        status: "active",
+        assignedTo: assignedTo || null,
+        assignedToName: assignedToName || null,
+        monthlyCost: 1.15, // fallback; future: derive from Twilio pricing
+        bundleId: approvedBundle?.id || null,
+      })
+      .returning();
+
+    res.status(201).json({
+      data: {
+        id: line.id,
+        number: line.number,
+        friendlyName: line.friendlyName,
+        country: line.country,
+        countryCode: line.countryCode,
+        type: line.type,
+        status: line.status,
+        assignedTo: line.assignedTo,
+        assignedToName: line.assignedToName,
+        monthlyCost: line.monthlyCost,
+        config: {
+          voicemailGreeting: line.voicemailGreeting,
+          callForwardingNumber: line.callForwardingNumber,
+          callRecordingEnabled: line.callRecordingEnabled,
+        },
+        stats: { callsMade: 0, callsReceived: 0, totalMinutes: 0, costThisMonth: 0 },
+        createdAt: line.createdAt.toISOString(),
+      },
+    });
+  }),
+);
+
 // POST /api/phone-lines/provision — buy number via Twilio + insert into DB
 router.post(
   "/phone-lines/provision",
