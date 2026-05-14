@@ -1145,9 +1145,34 @@ router.post(
       });
       console.log(`[Bundle Submit] bundle=${twilioBundle.sid}`);
 
-      // ── 6. Attach items (end-user, address, every supporting doc) ──
+      // ── 5b. Create the dedicated "address" supporting document ─────
+      // Twilio's evaluation needs a Supporting Document of type=address
+      // whose `address_sids` attribute points to the Address resource —
+      // attaching the bare Address to the bundle isn't enough to satisfy
+      // the proof-of-business-address requirement. This is metadata-only;
+      // no file is uploaded.
+      let addressDocSid: string | null = null;
+      try {
+        const addressDoc = await client.numbers.v2.regulatoryCompliance.supportingDocuments.create({
+          friendlyName: `${bundle.businessName} - address record`.slice(0, 64),
+          type: "address",
+          attributes: { address_sids: [twilioAddress.sid] },
+        });
+        addressDocSid = addressDoc.sid;
+        console.log(`[Bundle Submit] address-supporting-doc=${addressDocSid}`);
+      } catch (err: any) {
+        console.error(
+          "[Bundle Submit] address-doc creation failed:",
+          err?.message || err,
+        );
+      }
+
+      // ── 6. Attach items (end-user, address-doc, address, every doc) ──
       const itemSids: Array<{ sid: string; label: string }> = [
         { sid: businessEndUser.sid, label: "business-end-user" },
+        ...(addressDocSid
+          ? [{ sid: addressDocSid, label: "address-doc" }]
+          : []),
         { sid: twilioAddress.sid, label: "address" },
         ...docs
           .filter((d) => d.twilioDocumentSid)
