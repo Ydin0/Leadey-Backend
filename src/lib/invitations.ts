@@ -75,29 +75,46 @@ async function findClerkUserByEmail(email: string): Promise<any | null> {
 }
 
 /**
- * Force-verify a user's primary email. Required because POST /v1/users
+ * Force-verify ALL of a user's emails. Required because POST /v1/users
  * creates emails as unverified by default, which causes Clerk's <SignIn>
  * component to reject typed-in email lookups with "Couldn't find your account."
+ *
+ * We re-fetch the user from /v1/users/{id} first to make sure we have
+ * fresh email_addresses (the user-creation response sometimes ships before
+ * the email subresource is fully populated).
  */
 async function ensurePrimaryEmailVerified(user: any): Promise<void> {
-  const primaryId = user?.primary_email_address_id;
-  const emails: any[] = user?.email_addresses || [];
-  const primary = primaryId
-    ? emails.find((e) => e.id === primaryId) || null
-    : emails[0] || null;
-  if (!primary?.id) return;
-  if (primary.verification?.status === "verified") return;
+  const fresh = user?.id ? await clerk(`/users/${user.id}`) : user;
+  const emails: any[] = fresh?.email_addresses || [];
+  if (emails.length === 0) {
+    console.warn(`[invitations] user ${user?.id} has no email addresses`);
+    return;
+  }
 
-  try {
-    await clerk(`/email_addresses/${primary.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ verified: true }),
-    });
-  } catch (err: any) {
-    console.warn(
-      `[invitations] Failed to mark ${primary.email_address} verified:`,
-      err?.message || err,
-    );
+  for (const emailObj of emails) {
+    if (!emailObj?.id) continue;
+    if (emailObj.verification?.status === "verified") {
+      console.log(
+        `[invitations] ${emailObj.email_address} already verified, skipping`,
+      );
+      continue;
+    }
+    try {
+      await clerk(`/email_addresses/${emailObj.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ verified: true }),
+      });
+      console.log(
+        `[invitations] PATCH-verified ${emailObj.email_address} (${emailObj.id})`,
+      );
+    } catch (err: any) {
+      console.error(
+        `[invitations] PATCH /email_addresses/${emailObj.id} failed for ${emailObj.email_address}:`,
+        err?.status,
+        err?.message || err,
+        err?.details || "",
+      );
+    }
   }
 }
 
