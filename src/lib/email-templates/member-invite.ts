@@ -24,18 +24,20 @@ export function renderMemberInvite(input: MemberInviteInput): RenderedEmail {
       on Leadey as ${roleLabel === "admin" ? "an" : "a"} <strong style="color: #0a0f1a;">${roleLabel}</strong>.
     </p>
     <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
-      Accept the invitation to set up your account and start collaborating.
+      Your account is ready — click below to sign in. No password required.
     </p>
 
-    ${renderCtaButton(input.inviteUrl, "Accept invitation")}
+    ${renderCtaButton(input.inviteUrl, "Sign in to Leadey")}
 
     <p style="margin: 0 0 18px; color: #64748b; font-size: 13px; line-height: 1.6;">
+      The button signs you in directly. You can set a password later from your
+      account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
       <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
 
     <p style="margin: 28px 0 0; color: #94a3b8; font-size: 12px; line-height: 1.6;">
-      This invitation will expire in 7 days. Reply to this email if you need a refresh.
+      Reply to this email if you need a fresh sign-in link.
     </p>
   `;
 
@@ -45,10 +47,10 @@ export function renderMemberInvite(input: MemberInviteInput): RenderedEmail {
     ``,
     `${input.invitedBy ? input.invitedBy + " added you to" : "You've been added to"} ${input.organizationName} on Leadey as ${roleLabel === "admin" ? "an" : "a"} ${roleLabel}.`,
     ``,
-    `Accept your invitation:`,
+    `Sign in to Leadey:`,
     input.inviteUrl,
     ``,
-    `This invitation will expire in 7 days.`,
+    `(No password required. Link expires in 7 days.)`,
     ``,
     `— The Leadey team`,
   ].join("\n");

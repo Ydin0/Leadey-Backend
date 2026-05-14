@@ -1,18 +1,17 @@
-// Custom invitation flow: bypasses Clerk's default email, sends our own
-// branded email via Resend with the Clerk-generated sign-up URL.
+// Direct user creation + magic-link sign-in.
 //
-// Strategy:
-//  - Use POST /v1/invitations (Clerk USER invitations), which:
-//      * supports notify: false (suppresses Clerk's email)
-//      * returns `url` with the embedded ticket
-//      * accepts public_metadata so we can carry the target organization_id +
-//        role through the sign-up flow
-//  - On user.created webhook, we read public_metadata.organization_id and add
-//    the new user to that org via /v1/organizations/:id/memberships.
-//  - If the invitee already exists in Clerk, the user-invitation API errors
-//    with 422 "already exists". We catch that and fall back to creating an
-//    organization membership directly (no email needed, they already have an
-//    account).
+// Flow:
+//  1. Look up the email in Clerk. If a user exists, reuse them; otherwise
+//     create a new Clerk user via POST /v1/users with no password
+//     (skip_password_requirement: true).
+//  2. Add them to the target org as a membership (idempotent — ignore
+//     "already a member" errors).
+//  3. Mint a one-shot sign_in_token via POST /v1/sign_in_tokens.
+//  4. Email them the resulting URL — clicking it signs them in immediately,
+//     no signup form, no password setup required at first.
+//
+// User experience: open email → click button → land in the app, signed in.
+// They can set a password later from account settings.
 
 import { ApiError } from "./helpers";
 import { sendEmail } from "./email";
@@ -24,6 +23,7 @@ import { users } from "../db/schema/organizations";
 import { eq } from "drizzle-orm";
 
 const APP_URL = process.env.APP_URL || "https://app.leadey.ai";
+const ADMIN_URL = APP_URL.replace(/^https:\/\/app\./, "https://admin.");
 
 async function clerk(path: string, init: RequestInit = {}): Promise<any> {
   const key = process.env.CLERK_SECRET_KEY;
@@ -47,142 +47,188 @@ async function clerk(path: string, init: RequestInit = {}): Promise<any> {
   return body;
 }
 
+function isClerkAlreadyError(err: any): boolean {
+  const code = err?.clerkCode;
+  return (
+    code === "form_identifier_exists" ||
+    code === "duplicate_record" ||
+    code === "form_identifier_exists_verification_required" ||
+    (typeof err?.message === "string" &&
+      (err.message.toLowerCase().includes("already") ||
+        err.message.toLowerCase().includes("exists")))
+  );
+}
+
+/**
+ * Look up a user by email and return their record, or null if not found.
+ */
+async function findClerkUserByEmail(email: string): Promise<any | null> {
+  try {
+    const lookup = await clerk(
+      `/users?email_address=${encodeURIComponent(email)}&limit=1`,
+    );
+    const arr = Array.isArray(lookup) ? lookup : [];
+    return arr[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a new Clerk user with no password. Sign-in is via magic-link
+ * (sign_in_token). The email is pre-verified so they can sign in immediately.
+ */
+async function createClerkUser(
+  email: string,
+  publicMetadata: Record<string, unknown>,
+): Promise<any> {
+  return clerk("/users", {
+    method: "POST",
+    body: JSON.stringify({
+      email_address: [email],
+      skip_password_requirement: true,
+      skip_password_checks: true,
+      public_metadata: publicMetadata,
+    }),
+  });
+}
+
+/**
+ * Merge new public_metadata fields into an existing Clerk user.
+ * Used when re-inviting someone who already has a Clerk account — we want
+ * the new org_id / platform_role to land on their user record so the
+ * downstream webhook + UI honors it.
+ */
+async function mergeClerkUserMetadata(
+  userId: string,
+  existing: Record<string, unknown> | undefined,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const merged = { ...(existing || {}), ...patch };
+  await clerk(`/users/${userId}/metadata`, {
+    method: "PATCH",
+    body: JSON.stringify({ public_metadata: merged }),
+  });
+}
+
+/**
+ * Mint a one-shot sign-in token. Clerk returns both the raw token and a
+ * sign-in URL; we use the URL when present, otherwise build one ourselves.
+ */
+async function createSignInUrl(
+  userId: string,
+  basePath: string = `${APP_URL}/sign-in`,
+): Promise<string> {
+  const token = await clerk("/sign_in_tokens", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: userId,
+      expires_in_seconds: 7 * 24 * 60 * 60, // 7 days
+    }),
+  });
+
+  if (typeof token?.url === "string" && token.url.length > 0) {
+    return token.url;
+  }
+  if (typeof token?.token !== "string") {
+    throw new Error("Clerk sign-in token response missing token field");
+  }
+  return `${basePath}?__clerk_ticket=${token.token}`;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Org membership invitations (the "Add Company" / "Invite member" flow)
+// ──────────────────────────────────────────────────────────────────────────
+
 export interface InviteToOrgInput {
   email: string;
   organizationId: string;
   organizationName: string;
   role: "org:admin" | "org:member";
-  /** Display name of the platform admin who triggered the invite. Used in email copy. */
   invitedBy?: string;
-  /** Template selector — "welcome" for new orgs, "member" for existing orgs. */
   template: "welcome" | "member";
 }
 
 export interface InviteToOrgResult {
-  /** Clerk invitation id (if a new invitation was created) */
-  invitationId?: string;
-  /** Whether a custom email was sent */
+  userId: string;
+  isNewUser: boolean;
   emailSent: boolean;
-  /** Whether the user already existed in Clerk and was added directly */
-  directlyAdded: boolean;
 }
 
-/**
- * Invite an email address to an organization with a fully custom branded email.
- *
- * Two paths:
- *   1. Invitee is NOT a Clerk user → create user-invitation with notify:false +
- *      public_metadata, send our email with the returned sign-up URL.
- *   2. Invitee IS a Clerk user → look them up, create org membership directly,
- *      send them a different email letting them know they've been added.
- */
 export async function inviteEmailToOrganization(
   input: InviteToOrgInput,
 ): Promise<InviteToOrgResult> {
-  // Path 1: try as a NEW user invitation. If Clerk says the email already
-  // belongs to a user, fall through to path 2.
-  try {
-    const invitation = await clerk("/invitations", {
-      method: "POST",
-      body: JSON.stringify({
-        email_address: input.email,
-        public_metadata: {
-          organization_id: input.organizationId,
-          organization_role: input.role,
-        },
-        redirect_url: `${APP_URL}/dashboard`,
-        notify: false,
-        expires_in_days: 7,
-      }),
-    });
+  // 1. Find or create the Clerk user
+  let user = await findClerkUserByEmail(input.email);
+  let isNewUser = false;
 
-    const inviteUrl: string = invitation.url;
-    if (!inviteUrl) {
-      throw new Error("Clerk invitation response did not include a url");
+  if (user) {
+    await mergeClerkUserMetadata(user.id, user.public_metadata, {
+      organization_id: input.organizationId,
+      organization_role: input.role,
+    });
+  } else {
+    try {
+      user = await createClerkUser(input.email, {
+        organization_id: input.organizationId,
+        organization_role: input.role,
+      });
+      isNewUser = true;
+    } catch (err: any) {
+      if (isClerkAlreadyError(err)) {
+        // Race: someone created them between our lookup and create
+        user = await findClerkUserByEmail(input.email);
+        if (!user) throw err;
+      } else {
+        throw err;
+      }
     }
-
-    const rendered =
-      input.template === "welcome"
-        ? renderOrgAdminWelcome({
-            organizationName: input.organizationName,
-            inviteUrl,
-            invitedBy: input.invitedBy,
-          })
-        : renderMemberInvite({
-            organizationName: input.organizationName,
-            inviteUrl,
-            role: input.role,
-            invitedBy: input.invitedBy,
-          });
-
-    await sendEmail({
-      to: input.email,
-      subject: rendered.subject,
-      html: rendered.html,
-      text: rendered.text,
-    });
-
-    return {
-      invitationId: invitation.id,
-      emailSent: true,
-      directlyAdded: false,
-    };
-  } catch (err: any) {
-    const code = err?.clerkCode;
-    const isAlreadyExists =
-      code === "form_identifier_exists" ||
-      code === "duplicate_record" ||
-      (typeof err?.message === "string" &&
-        err.message.toLowerCase().includes("already"));
-
-    if (!isAlreadyExists) throw err;
   }
 
-  // Path 2: invitee is already a Clerk user. Look them up and add to org directly.
-  const lookup = await clerk(
-    `/users?email_address=${encodeURIComponent(input.email)}&limit=1`,
-  );
-  const existing = Array.isArray(lookup) ? lookup[0] : lookup?.[0];
-  if (!existing?.id) {
-    throw new ApiError(
-      500,
-      "Clerk reported the user exists but lookup returned no record",
-    );
-  }
-
-  // Idempotent: if they're already in this org, this 422s, which we treat as success.
+  // 2. Add to the org (idempotent)
   try {
     await clerk(`/organizations/${input.organizationId}/memberships`, {
       method: "POST",
       body: JSON.stringify({
-        user_id: existing.id,
+        user_id: user.id,
         role: input.role,
       }),
     });
   } catch (err: any) {
-    const alreadyMember =
-      err?.clerkCode === "duplicate_record" ||
-      (typeof err?.message === "string" &&
-        err.message.toLowerCase().includes("already a member"));
-    if (!alreadyMember) throw err;
+    if (!isClerkAlreadyError(err)) throw err;
   }
 
-  // Existing users still get a notification — short email confirming the new workspace
-  const rendered = renderMemberInvite({
-    organizationName: input.organizationName,
-    inviteUrl: `${APP_URL}/dashboard`,
-    role: input.role,
-    invitedBy: input.invitedBy,
-  });
+  // 3. Mint a sign-in URL
+  const signInUrl = await createSignInUrl(user.id);
+
+  // 4. Email
+  const rendered =
+    input.template === "welcome"
+      ? renderOrgAdminWelcome({
+          organizationName: input.organizationName,
+          inviteUrl: signInUrl,
+          invitedBy: input.invitedBy,
+        })
+      : renderMemberInvite({
+          organizationName: input.organizationName,
+          inviteUrl: signInUrl,
+          role: input.role,
+          invitedBy: input.invitedBy,
+        });
+
   await sendEmail({
     to: input.email,
-    subject: `You've been added to ${input.organizationName} on Leadey`,
+    subject: rendered.subject,
     html: rendered.html,
     text: rendered.text,
   });
 
-  return { emailSent: true, directlyAdded: true };
+  return { userId: user.id, isNewUser, emailSent: true };
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Platform admin invitations
+// ──────────────────────────────────────────────────────────────────────────
 
 export interface InvitePlatformAdminInput {
   email: string;
@@ -190,101 +236,63 @@ export interface InvitePlatformAdminInput {
 }
 
 export interface InvitePlatformAdminResult {
-  invitationId?: string;
+  userId: string;
+  isNewUser: boolean;
   emailSent: boolean;
-  /** Whether the user already existed and was promoted directly */
-  directlyPromoted: boolean;
 }
 
-/**
- * Invite a new platform admin (someone who can sign into admin.leadey.ai).
- *
- *  - New emails: creates a Clerk user-invitation with notify:false + public_metadata.platform_role = "admin".
- *    Our user.created webhook reads that on signup and writes platform_role = "admin" to the DB row.
- *  - Existing Clerk users: promotes them directly by updating users.platform_role = "admin" in our DB
- *    (no Clerk-side change needed — admin gating happens in the DB).
- */
 export async function invitePlatformAdmin(
   input: InvitePlatformAdminInput,
 ): Promise<InvitePlatformAdminResult> {
-  // Path 1: new user
-  try {
-    const invitation = await clerk("/invitations", {
-      method: "POST",
-      body: JSON.stringify({
-        email_address: input.email,
-        public_metadata: {
-          platform_role: "admin",
-        },
-        redirect_url: `${APP_URL.replace(/app\./, "admin.")}/dashboard`,
-        notify: false,
-        expires_in_days: 7,
-      }),
-    });
+  // 1. Find or create the Clerk user with platform_role metadata
+  let user = await findClerkUserByEmail(input.email);
+  let isNewUser = false;
 
-    const inviteUrl: string = invitation.url;
-    if (!inviteUrl) {
-      throw new Error("Clerk invitation response did not include a url");
+  if (user) {
+    await mergeClerkUserMetadata(user.id, user.public_metadata, {
+      platform_role: "admin",
+    });
+  } else {
+    try {
+      user = await createClerkUser(input.email, {
+        platform_role: "admin",
+      });
+      isNewUser = true;
+    } catch (err: any) {
+      if (isClerkAlreadyError(err)) {
+        user = await findClerkUserByEmail(input.email);
+        if (!user) throw err;
+      } else {
+        throw err;
+      }
     }
-
-    const rendered = renderPlatformAdminInvite({
-      inviteUrl,
-      invitedBy: input.invitedBy,
-    });
-
-    await sendEmail({
-      to: input.email,
-      subject: rendered.subject,
-      html: rendered.html,
-      text: rendered.text,
-    });
-
-    return {
-      invitationId: invitation.id,
-      emailSent: true,
-      directlyPromoted: false,
-    };
-  } catch (err: any) {
-    const code = err?.clerkCode;
-    const isAlreadyExists =
-      code === "form_identifier_exists" ||
-      code === "duplicate_record" ||
-      (typeof err?.message === "string" &&
-        err.message.toLowerCase().includes("already"));
-
-    if (!isAlreadyExists) throw err;
   }
 
-  // Path 2: existing user → promote in DB
-  const [existing] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.email, input.email));
-
-  if (!existing?.id) {
-    throw new ApiError(
-      500,
-      "Clerk says the user exists, but no matching row in our DB. The Clerk webhook may not have inserted them yet — wait a moment and retry.",
-    );
-  }
-
+  // 2. Ensure platform_role = 'admin' in our DB even if the webhook hasn't
+  // landed yet (webhook also handles this from public_metadata, but DB-level
+  // gating is what requireAdmin checks).
   await db
     .update(users)
     .set({ platformRole: "admin", updatedAt: new Date() })
-    .where(eq(users.id, existing.id));
+    .where(eq(users.id, user.id))
+    .catch(() => {
+      // Row doesn't exist yet; user.created webhook will insert it shortly.
+    });
 
-  // Send a notification email so they know they have new powers
-  const adminUrl = APP_URL.replace(/app\./, "admin.");
+  // 3. Mint a sign-in URL targeting the admin panel
+  const signInUrl = await createSignInUrl(user.id, `${ADMIN_URL}/sign-in`);
+
+  // 4. Email
   const rendered = renderPlatformAdminInvite({
-    inviteUrl: `${adminUrl}/dashboard`,
+    inviteUrl: signInUrl,
     invitedBy: input.invitedBy,
   });
   await sendEmail({
     to: input.email,
-    subject: `You're now a Leadey platform admin`,
+    subject: rendered.subject,
     html: rendered.html,
     text: rendered.text,
   });
 
-  return { emailSent: true, directlyPromoted: true };
+  return { userId: user.id, isNewUser, emailSent: true };
 }

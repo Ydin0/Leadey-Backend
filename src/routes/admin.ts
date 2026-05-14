@@ -391,7 +391,7 @@ router.post(
       body: JSON.stringify({ name: name.trim() }),
     });
 
-    let inviteResult: { emailSent?: boolean; directlyAdded?: boolean } = {};
+    let inviteResult: { emailSent?: boolean; isNewUser?: boolean; userId?: string } = {};
     if (adminEmail?.trim()) {
       // Build a "Invited by <name>" string from the actor's DB row, if any
       const [actorRow] = await db
@@ -432,7 +432,7 @@ router.post(
         name: name.trim(),
         adminEmail: adminEmail?.trim() || null,
         emailSent: inviteResult.emailSent || false,
-        directlyAdded: inviteResult.directlyAdded || false,
+        isNewUser: inviteResult.isNewUser || false,
       },
     });
 
@@ -554,7 +554,8 @@ router.post(
       after: {
         email: email.trim(),
         role: finalRole,
-        directlyAdded: result.directlyAdded,
+        isNewUser: result.isNewUser,
+        userId: result.userId,
       },
     });
 
@@ -1495,7 +1496,8 @@ router.post(
       metadata: {
         email,
         emailSent: result.emailSent,
-        directlyPromoted: result.directlyPromoted,
+        isNewUser: result.isNewUser,
+        userId: result.userId,
       },
     });
 

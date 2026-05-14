@@ -26,7 +26,7 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
     </h1>
     <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
       ${input.invitedBy ? escapeHtml(input.invitedBy) + " has set up" : "We've set up"} a workspace for
-      <strong style="color: #0a0f1a;">${escapeHtml(input.organizationName)}</strong> on Leadey, and you're its first admin.
+      <strong style="color: #0a0f1a;">${escapeHtml(input.organizationName)}</strong> on Leadey, and your account is ready as its first admin.
     </p>
     <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
       Leadey is the outbound platform B2B teams use to find the right buyers, reach them on the
@@ -34,9 +34,11 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
       with no card on file.
     </p>
 
-    ${renderCtaButton(input.inviteUrl, "Accept invitation & sign in")}
+    ${renderCtaButton(input.inviteUrl, "Sign in to your workspace")}
 
     <p style="margin: 0 0 18px; color: #64748b; font-size: 13px; line-height: 1.6;">
+      The button signs you in directly — no password required. You can set one
+      later from your account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
       <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
@@ -87,8 +89,9 @@ function renderText(input: OrgAdminWelcomeInput, trialDays: number): string {
     ``,
     `Leadey is the outbound platform B2B teams use to find the right buyers, reach them on the right channel, and never let a warm signal slip through. You get ${trialDays} days to try it with no card on file.`,
     ``,
-    `Accept your invitation:`,
+    `Sign in to your workspace:`,
     input.inviteUrl,
+    `(Link expires in 7 days. No password needed.)`,
     ``,
     `What you'll do first:`,
     `01 — Define your ICP`,

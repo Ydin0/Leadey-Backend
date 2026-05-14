@@ -24,12 +24,14 @@ export function renderPlatformAdminInvite(
       for every customer workspace.
     </p>
     <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
-      Accept the invitation to set up your account and sign in.
+      Your account is ready — click below to sign in. No password required.
     </p>
 
-    ${renderCtaButton(input.inviteUrl, "Accept invitation")}
+    ${renderCtaButton(input.inviteUrl, "Sign in to admin panel")}
 
     <p style="margin: 0 0 24px; color: #64748b; font-size: 13px; line-height: 1.6;">
+      The button signs you in directly. You can set a password later from your
+      account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
       <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
@@ -58,8 +60,9 @@ export function renderPlatformAdminInvite(
     ``,
     `${input.invitedBy ? input.invitedBy + " has added you" : "You've been added"} as a platform admin on Leadey. That means you have full access to admin.leadey.ai — the control panel for every customer workspace.`,
     ``,
-    `Accept your invitation:`,
+    `Sign in to admin panel:`,
     input.inviteUrl,
+    `(No password required. Link expires in 7 days.)`,
     ``,
     `What you can do:`,
     `- Manage customer organizations`,
