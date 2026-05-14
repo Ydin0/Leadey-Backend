@@ -56,7 +56,7 @@ export const settingsRelations = relations(settings, () => ({}));
 export const linkedinRateLimitsRelations = relations(linkedinRateLimits, () => ({}));
 
 export const organizationsRelations = relations(organizations, ({ many, one }) => ({
-  users: many(users),
+  users: many(users, { relationName: "members" }),
   accountManager: one(users, {
     fields: [organizations.accountManagerId],
     references: [users.id],
@@ -68,6 +68,7 @@ export const usersRelations = relations(users, ({ one, many }) => ({
   organization: one(organizations, {
     fields: [users.organizationId],
     references: [organizations.id],
+    relationName: "members",
   }),
   managedOrganizations: many(organizations, { relationName: "accountManager" }),
 }));
