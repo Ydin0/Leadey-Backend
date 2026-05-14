@@ -745,6 +745,26 @@ router.post(
       .where(eq(bundleDocuments.bundleId, bundleId));
     if (docs.length === 0) throw new ApiError(400, "Upload at least one document before submitting");
 
+    // ── business_registration_authority is auto-derived from country ────
+    // The customer doesn't pick this — there's exactly one authority per
+    // jurisdiction, so deriving it server-side keeps the form short.
+    const AUTHORITY_BY_COUNTRY: Record<string, string> = {
+      GB: "UK:CRN",
+      US: "US:EIN",
+      AU: "AU:ABN",
+      CA: "CA:CBN",
+      DE: "DE:HRB",
+      FR: "FR:SIREN",
+      IE: "IE:CRO",
+      IN: "IN:CIN",
+      SG: "SG:UEN",
+      AE: "AE:TRN",
+    };
+    const derivedAuthority =
+      bundle.businessRegistrationAuthority ||
+      AUTHORITY_BY_COUNTRY[bundle.countryCode.toUpperCase()] ||
+      "";
+
     // Pre-flight validation: make sure required structured fields are filled
     const missing: string[] = [];
     if (!bundle.addressStreet1) missing.push("addressStreet1");
@@ -754,7 +774,6 @@ router.post(
     if (!bundle.representativeLastName) missing.push("representativeLastName");
     if (!bundle.representativeEmail) missing.push("representativeEmail");
     if (!bundle.representativePhone) missing.push("representativePhone");
-    if (!bundle.businessRegistrationAuthority) missing.push("businessRegistrationAuthority");
     if (!bundle.businessRegistrationNumber) missing.push("businessRegistrationNumber");
     if (missing.length > 0) {
       throw new ApiError(
@@ -799,15 +818,24 @@ router.post(
       console.log(`[Bundle Submit] Address created: ${twilioAddress.sid}`);
 
       // ── 3. Create the Business End-User ────────────────────────────
+      // Persist the derived authority back to the DB so it's visible to the
+      // customer / admin panel even though it wasn't a form field.
+      if (!bundle.businessRegistrationAuthority && derivedAuthority) {
+        await db
+          .update(regulatoryBundles)
+          .set({ businessRegistrationAuthority: derivedAuthority, updatedAt: new Date() })
+          .where(eq(regulatoryBundles.id, bundleId));
+      }
+
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
         attributes: {
           business_name: bundle.businessName,
-          business_registration_authority: bundle.businessRegistrationAuthority,
+          business_registration_authority: derivedAuthority,
           business_registration_number: bundle.businessRegistrationNumber,
           business_identity: bundle.businessClassification,
-          website_url: bundle.businessWebsite || `https://${bundle.businessName.toLowerCase().replace(/\s+/g, "")}.com`,
+          ...(bundle.businessWebsite ? { website_url: bundle.businessWebsite } : {}),
           // Twilio uses this to know if the number is for the end customer or the platform
           is_number_assigned_to_the_end_customer: "false",
         },
