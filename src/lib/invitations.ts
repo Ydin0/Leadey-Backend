@@ -75,14 +75,43 @@ async function findClerkUserByEmail(email: string): Promise<any | null> {
 }
 
 /**
+ * Force-verify a user's primary email. Required because POST /v1/users
+ * creates emails as unverified by default, which causes Clerk's <SignIn>
+ * component to reject typed-in email lookups with "Couldn't find your account."
+ */
+async function ensurePrimaryEmailVerified(user: any): Promise<void> {
+  const primaryId = user?.primary_email_address_id;
+  const emails: any[] = user?.email_addresses || [];
+  const primary = primaryId
+    ? emails.find((e) => e.id === primaryId) || null
+    : emails[0] || null;
+  if (!primary?.id) return;
+  if (primary.verification?.status === "verified") return;
+
+  try {
+    await clerk(`/email_addresses/${primary.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ verified: true }),
+    });
+  } catch (err: any) {
+    console.warn(
+      `[invitations] Failed to mark ${primary.email_address} verified:`,
+      err?.message || err,
+    );
+  }
+}
+
+/**
  * Create a new Clerk user with no password. Sign-in is via magic-link
- * (sign_in_token). The email is pre-verified so they can sign in immediately.
+ * (sign_in_token). The email is force-verified post-creation so they can
+ * sign in immediately via any strategy (magic-link, email-code, or password
+ * if they later set one).
  */
 async function createClerkUser(
   email: string,
   publicMetadata: Record<string, unknown>,
 ): Promise<any> {
-  return clerk("/users", {
+  const user = await clerk("/users", {
     method: "POST",
     body: JSON.stringify({
       email_address: [email],
@@ -91,6 +120,8 @@ async function createClerkUser(
       public_metadata: publicMetadata,
     }),
   });
+  await ensurePrimaryEmailVerified(user);
+  return user;
 }
 
 /**
@@ -167,6 +198,8 @@ export async function inviteEmailToOrganization(
       organization_id: input.organizationId,
       organization_role: input.role,
     });
+    // Heal users that were created before email-verification was enforced.
+    await ensurePrimaryEmailVerified(user);
   } else {
     try {
       user = await createClerkUser(input.email, {
@@ -179,6 +212,7 @@ export async function inviteEmailToOrganization(
         // Race: someone created them between our lookup and create
         user = await findClerkUserByEmail(input.email);
         if (!user) throw err;
+        await ensurePrimaryEmailVerified(user);
       } else {
         throw err;
       }
@@ -252,6 +286,7 @@ export async function invitePlatformAdmin(
     await mergeClerkUserMetadata(user.id, user.public_metadata, {
       platform_role: "admin",
     });
+    await ensurePrimaryEmailVerified(user);
   } else {
     try {
       user = await createClerkUser(input.email, {
@@ -262,6 +297,7 @@ export async function invitePlatformAdmin(
       if (isClerkAlreadyError(err)) {
         user = await findClerkUserByEmail(input.email);
         if (!user) throw err;
+        await ensurePrimaryEmailVerified(user);
       } else {
         throw err;
       }
