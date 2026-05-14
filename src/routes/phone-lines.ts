@@ -776,6 +776,41 @@ router.patch(
   }),
 );
 
+// DELETE /api/phone-lines/bundles/:id — delete a draft bundle
+// Only drafts can be deleted. Once submitted, the bundle exists in Twilio
+// and must be revoked through their console.
+router.delete(
+  "/phone-lines/bundles/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const bundleId = req.params.id;
+
+    const [bundle] = await db
+      .select()
+      .from(regulatoryBundles)
+      .where(
+        and(
+          eq(regulatoryBundles.id, bundleId),
+          eq(regulatoryBundles.organizationId, orgId),
+        ),
+      );
+    if (!bundle) throw new ApiError(404, "Bundle not found");
+    if (bundle.status !== "draft") {
+      throw new ApiError(
+        400,
+        `Only draft bundles can be deleted. This bundle is "${bundle.status}".`,
+      );
+    }
+
+    // Cascade-removes bundle_documents rows via FK
+    await db
+      .delete(regulatoryBundles)
+      .where(eq(regulatoryBundles.id, bundleId));
+
+    res.json({ data: { id: bundleId, deleted: true } });
+  }),
+);
+
 // GET /api/phone-lines/bundles/:id/documents — list documents for a bundle
 router.get(
   "/phone-lines/bundles/:id/documents",
@@ -983,17 +1018,31 @@ router.post(
 
       // ── 1. Find the right Regulation for this country + business ───
       // A Regulation is unique per (IsoCountry, NumberType, EndUserType).
-      const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
+      // Calling .list() without numberType returns multiple regulations
+      // (Local, National, Mobile, Toll-Free) and Twilio rejects with
+      // "ambiguous regulation parameters". Default to local — most
+      // self-service customers want local numbers.
+      const desiredNumberType: "local" | "national" | "mobile" | "toll-free" =
+        "local";
+
+      let regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
         isoCountry: countryCode,
         endUserType: "business",
-        limit: 20,
+        numberType: desiredNumberType,
+        limit: 5,
       });
 
-      const regulation =
-        regulations.find((r: any) => r.numberType === "local") ||
-        regulations.find((r: any) => r.numberType === "national") ||
-        regulations[0];
+      // Fall back to national if no local regulation exists for this country
+      if (regulations.length === 0) {
+        regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
+          isoCountry: countryCode,
+          endUserType: "business",
+          numberType: "national",
+          limit: 5,
+        });
+      }
 
+      const regulation = regulations[0];
       if (!regulation) {
         throw new ApiError(
           400,
