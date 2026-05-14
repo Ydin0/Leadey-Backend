@@ -1004,27 +1004,26 @@ router.post(
       console.log(`[Bundle Submit] address=${twilioAddress.sid}`);
 
       // ── 3. Create the Business End-User ────────────────────────────
-      // Twilio docs show the business end-user's attributes carry BOTH the
-      // business info AND the authorized representative's name (first_name,
-      // last_name). There is no separate "Individual" end-user for business
-      // regulations — the rep is part of the business record.
+      // Twilio's generic `business` end-user type accepts a tightly-scoped
+      // set of attributes — anything else returns:
+      //   "Attribute(s) (...) not mapped to object (business)"
+      // Documented + evaluation-confirmed attributes for the `business`
+      // type are: business_name, business_registration_number, first_name,
+      // last_name. Richer fields (website_url, business_classification,
+      // is_number_assigned_to_the_end_customer, business_registration_authority)
+      // belong to specialized end-user types Twilio uses for certain
+      // regulations (e.g. business_4) — they're not valid here.
+      //
+      // The rep's first_name/last_name go on the business end-user; there's
+      // no separate Individual end-user for business regulations.
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
         attributes: {
           business_name: bundle.businessName,
           business_registration_number: bundle.businessRegistrationNumber,
-          business_registration_authority: derivedAuthority,
-          business_identity: bundle.businessClassification,
-          ...(bundle.businessWebsite ? { website_url: bundle.businessWebsite } : {}),
           first_name: bundle.representativeFirstName,
           last_name: bundle.representativeLastName,
-          email: bundle.representativeEmail,
-          phone_number: bundle.representativePhone,
-          // The number is NOT being resold to the end customer (the customer
-          // IS the end-user). Twilio expects this flag for hosted-platform
-          // accounts.
-          is_number_assigned_to_the_end_customer: "false",
         },
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
