@@ -1132,14 +1132,15 @@ router.post(
           ? `${process.env.PUBLIC_API_BASE_URL.replace(/\/$/, "")}/webhooks/twilio/bundle-status`
           : undefined;
 
+      // Per Twilio docs: "specify EITHER the three parameters (IsoCountry,
+      // NumberType, EndUserType) OR the RegulationSid." Passing both yields
+      // "ambiguous regulation parameters". We already looked up the
+      // regulation so we just pass its SID.
       const bundleFriendlyName = `${bundle.businessName} · ${bundle.country} ${regulation.numberType || "local"} (${bundle.id})`.slice(0, 64);
       const twilioBundle = await client.numbers.v2.regulatoryCompliance.bundles.create({
         friendlyName: bundleFriendlyName,
         email: bundle.representativeEmail,
         regulationSid: regulation.sid,
-        isoCountry: countryCode,
-        numberType: regulation.numberType || "local",
-        endUserType: "business",
         ...(statusCallback ? { statusCallback } : {}),
       });
       console.log(`[Bundle Submit] bundle=${twilioBundle.sid}`);
