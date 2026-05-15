@@ -1079,22 +1079,22 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Field names confirmed by Twilio's evaluator output:
-      //   business_name, business_registration_identifier (NOT _number),
-      //   business_website, business_identity, phone_number, email,
-      //   first_name, last_name, is_subassigned
-      // All values must be strings — Twilio's attributes dictionary won't
-      // serialise booleans, and empty strings can be rejected, so we omit
-      // optional fields when blank.
-      const businessAttrs: Record<string, string> = {
+      // Field names from Twilio's evaluator. The evaluator distinguishes
+      // business_registration_identifier and business_registration_number
+      // as two separate fields (not a rename), and is_subassigned needs
+      // to be a native boolean — sending it as the string "false" wasn't
+      // being recognised. Booleans go through Twilio's SDK as JSON true/
+      // false, not strings.
+      const businessAttrs: Record<string, string | boolean> = {
         business_name: bundle.businessName,
+        business_registration_number: bundle.businessRegistrationNumber,
         business_registration_identifier: bundle.businessRegistrationNumber,
         business_identity: bundle.businessClassification,
         phone_number: bundle.representativePhone,
         email: bundle.representativeEmail,
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: "false",
+        is_subassigned: false,
       };
       if (bundle.businessWebsite) {
         businessAttrs.business_website = bundle.businessWebsite;
@@ -1103,7 +1103,7 @@ router.post(
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
-        attributes: businessAttrs,
+        attributes: businessAttrs as any,
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
 
