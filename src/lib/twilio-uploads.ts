@@ -106,3 +106,59 @@ export async function updateSupportingDocumentAttributes(
     throw new Error(body?.message || `Twilio doc-update failed (${res.status})`);
   }
 }
+
+/**
+ * Create a business end-user via raw fetch so attribute values keep their
+ * native JSON types. The Twilio Node SDK stringifies values inside the
+ * Attributes payload — that's a problem for is_subassigned, which the
+ * evaluator only recognises as a JSON boolean. Sending a bare false here
+ * preserves it through the wire.
+ */
+export interface CreateBusinessEndUserInput {
+  friendlyName: string;
+  attributes: Record<string, unknown>;
+}
+
+export interface TwilioEndUser {
+  sid: string;
+  account_sid: string;
+  friendly_name: string;
+  type: string;
+  attributes: Record<string, unknown>;
+}
+
+export async function createBusinessEndUserRaw(
+  input: CreateBusinessEndUserInput,
+): Promise<TwilioEndUser> {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !authToken) {
+    throw new Error("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set");
+  }
+
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const params = new URLSearchParams({
+    FriendlyName: input.friendlyName,
+    Type: "business",
+    Attributes: JSON.stringify(input.attributes),
+  });
+  const res = await fetch(
+    `https://numbers.twilio.com/v2/RegulatoryCompliance/EndUsers`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: params.toString(),
+    },
+  );
+
+  const body: any = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = body?.message || `Twilio EndUser create failed (${res.status})`;
+    const code = body?.code ? ` [${body.code}]` : "";
+    throw new Error(`${message}${code}`);
+  }
+  return body as TwilioEndUser;
+}

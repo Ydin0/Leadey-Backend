@@ -14,6 +14,7 @@ import { createId, ApiError } from "../lib/helpers";
 import {
   uploadSupportingDocumentWithFile,
   updateSupportingDocumentAttributes,
+  createBusinessEndUserRaw,
 } from "../lib/twilio-uploads";
 
 const client = twilioSdk(
@@ -1083,7 +1084,11 @@ router.post(
       //   business_registration_number  = numeric identifier ("14516092")
       //   business_registration_identifier = authority code ("UK:CRN")  ← Registration Authority
       // These are two separate fields with DIFFERENT values, not duplicates.
-      const businessAttrs: Record<string, string> = {
+      //
+      // is_subassigned needs to be a JSON boolean (not the string "false").
+      // The Twilio SDK stringifies attribute values, so we bypass it via
+      // raw fetch and hand-build the Attributes JSON to preserve the bool.
+      const businessAttrsObj: Record<string, unknown> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
         business_registration_identifier: derivedAuthority,
@@ -1092,16 +1097,15 @@ router.post(
         email: bundle.representativeEmail,
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: "false",
+        is_subassigned: false,
       };
       if (bundle.businessWebsite) {
-        businessAttrs.business_website = bundle.businessWebsite;
+        businessAttrsObj.business_website = bundle.businessWebsite;
       }
 
-      const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
+      const businessEndUser = await createBusinessEndUserRaw({
         friendlyName: bundle.businessName,
-        type: "business",
-        attributes: businessAttrs,
+        attributes: businessAttrsObj,
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
 
