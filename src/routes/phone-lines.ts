@@ -969,25 +969,18 @@ router.post(
       .where(eq(bundleDocuments.bundleId, bundleId));
     if (docs.length === 0) throw new ApiError(400, "Upload at least one document before submitting");
 
-    // ── business_registration_authority is auto-derived from country ────
-    // The customer doesn't pick this — there's exactly one authority per
-    // jurisdiction, so deriving it server-side keeps the form short.
+    // ── business_registration_identifier is auto-derived from country ────
+    // Twilio constraint (from regulation): the value must match
+    //   ^(UK:CRN|US:EIN|CA:CBN|AU:ACN|OTHER)$
+    // Everything else collapses to "OTHER".
     const AUTHORITY_BY_COUNTRY: Record<string, string> = {
       GB: "UK:CRN",
       US: "US:EIN",
-      AU: "AU:ABN",
       CA: "CA:CBN",
-      DE: "DE:HRB",
-      FR: "FR:SIREN",
-      IE: "IE:CRO",
-      IN: "IN:CIN",
-      SG: "SG:UEN",
-      AE: "AE:TRN",
+      AU: "AU:ACN",
     };
     const derivedAuthority =
-      bundle.businessRegistrationAuthority ||
-      AUTHORITY_BY_COUNTRY[bundle.countryCode.toUpperCase()] ||
-      "";
+      AUTHORITY_BY_COUNTRY[bundle.countryCode.toUpperCase()] || "OTHER";
 
     // Pre-flight validation: make sure required structured fields are filled
     const missing: string[] = [];
@@ -1052,26 +1045,6 @@ router.post(
       }
       console.log(`[Bundle Submit] regulation=${regulation.sid} (${regulation.friendlyName})`);
 
-      // DEBUG: pull the regulation's constraint details so we can see the
-      // exact valid attribute set and value constraints for the business
-      // end-user type. Logs once per submit to Railway.
-      try {
-        const accountSid = process.env.TWILIO_ACCOUNT_SID;
-        const authToken = process.env.TWILIO_AUTH_TOKEN;
-        const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
-        const constraintsRes = await fetch(
-          `https://numbers.twilio.com/v2/RegulatoryCompliance/Regulations/${regulation.sid}?IncludeConstraints=true`,
-          { headers: { Authorization: `Basic ${auth}` } },
-        );
-        const constraintsJson: any = await constraintsRes.json();
-        console.log(
-          "[Bundle Submit] regulation constraints:",
-          JSON.stringify(constraintsJson?.requirements || constraintsJson, null, 2),
-        );
-      } catch (debugErr: any) {
-        console.warn("[Bundle Submit] constraints fetch failed:", debugErr?.message);
-      }
-
       // ── 2. Create the Address resource (separate API) ──────────────
       // Used as the Bundle's proof-of-address + linked from utility_bill
       // supporting docs via address_sids.
@@ -1100,22 +1073,29 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Critical mapping from the evaluator output:
-      //   business_registration_number  = numeric identifier ("14516092")
-      //   business_registration_identifier = authority code ("UK:CRN")  ← Registration Authority
-      // is_subassigned: native bool causes 20500, string "false" / "no"
-      // gets accepted but evaluator says "Please specify". The constraint
-      // dump above will tell us the exact valid format.
+      // Authoritative constraints (from the regulation):
+      //   business_identity ∈ {DIRECT_CUSTOMER, INDEPENDENT_SOFTWARE_VENDOR}
+      //   is_subassigned    ∈ {"YES", "NO"}  (uppercase strings, not booleans)
+      //   phone_number      matches ^\+[1-9]\d{1,14}$  (E.164, no spaces)
+      //   email             matches ^\S+@\S+\.\S+$
+      const ALLOWED_IDENTITIES = new Set(["DIRECT_CUSTOMER", "INDEPENDENT_SOFTWARE_VENDOR"]);
+      const businessIdentity = ALLOWED_IDENTITIES.has(bundle.businessClassification)
+        ? bundle.businessClassification
+        : "INDEPENDENT_SOFTWARE_VENDOR";
+
+      // Strip whitespace from phone — Twilio's regex rejects "+44 20 1234 ..."
+      const phoneE164 = (bundle.representativePhone || "").replace(/\s+/g, "");
+
       const businessAttrsObj: Record<string, unknown> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
         business_registration_identifier: derivedAuthority,
-        business_identity: bundle.businessClassification,
-        phone_number: bundle.representativePhone,
-        email: bundle.representativeEmail,
+        business_identity: businessIdentity,
+        phone_number: phoneE164,
+        email: bundle.representativeEmail.trim(),
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: "false",
+        is_subassigned: "NO",
       };
       if (bundle.businessWebsite) {
         businessAttrsObj.business_website = bundle.businessWebsite;
