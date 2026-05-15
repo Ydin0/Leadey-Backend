@@ -1079,17 +1079,25 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Generic `business` end-user type only maps these four attributes;
-      // address_sids belongs on a type=address supporting document, not
-      // here. Adding it caused Twilio to 500 on creation.
+      // Field names confirmed by Twilio's evaluator output:
+      //   business_name, business_registration_identifier (NOT _number),
+      //   business_website, business_identity, phone_number, email,
+      //   first_name, last_name, is_subassigned
+      // is_subassigned=false means the number is being used by the customer
+      // themselves (not resold to a downstream end-customer).
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
         attributes: {
           business_name: bundle.businessName,
-          business_registration_number: bundle.businessRegistrationNumber,
+          business_registration_identifier: bundle.businessRegistrationNumber,
+          business_website: bundle.businessWebsite || "",
+          business_identity: bundle.businessClassification,
+          phone_number: bundle.representativePhone,
+          email: bundle.representativeEmail,
           first_name: bundle.representativeFirstName,
           last_name: bundle.representativeLastName,
+          is_subassigned: false,
         },
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
@@ -1148,24 +1156,23 @@ router.post(
       });
       console.log(`[Bundle Submit] bundle=${twilioBundle.sid}`);
 
-      // ── 5b. Create the dedicated "address" supporting document ─────
-      // Twilio's evaluation needs a Supporting Document of type=address
-      // whose `address_sids` attribute points to the Address resource —
-      // attaching the bare Address to the bundle isn't enough to satisfy
-      // the proof-of-business-address requirement. This is metadata-only;
-      // no file is uploaded.
+      // ── 5b. Create the "business_address" supporting document ──────
+      // Twilio's evaluator looks for object_type=business_address with
+      // `address_sids` pointing at the Address resource to satisfy the
+      // "Business Address (Proof of Address)" requirement. Metadata only;
+      // no file uploaded.
       let addressDocSid: string | null = null;
       try {
         const addressDoc = await client.numbers.v2.regulatoryCompliance.supportingDocuments.create({
-          friendlyName: `${bundle.businessName} - address record`.slice(0, 64),
-          type: "address",
+          friendlyName: `${bundle.businessName} - business address`.slice(0, 64),
+          type: "business_address",
           attributes: { address_sids: [twilioAddress.sid] },
         });
         addressDocSid = addressDoc.sid;
-        console.log(`[Bundle Submit] address-supporting-doc=${addressDocSid}`);
+        console.log(`[Bundle Submit] business-address-doc=${addressDocSid}`);
       } catch (err: any) {
         console.error(
-          "[Bundle Submit] address-doc creation failed:",
+          "[Bundle Submit] business-address-doc creation failed:",
           err?.message || err,
         );
       }
