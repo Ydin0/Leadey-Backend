@@ -1079,9 +1079,9 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Also link the Address SID directly via business end-user attributes.
-      // Twilio's evaluator pattern-matches "business_address" requirements
-      // against this in addition to a type=address supporting document.
+      // Generic `business` end-user type only maps these four attributes;
+      // address_sids belongs on a type=address supporting document, not
+      // here. Adding it caused Twilio to 500 on creation.
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
@@ -1090,7 +1090,6 @@ router.post(
           business_registration_number: bundle.businessRegistrationNumber,
           first_name: bundle.representativeFirstName,
           last_name: bundle.representativeLastName,
-          address_sids: [twilioAddress.sid],
         },
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
