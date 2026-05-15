@@ -1052,6 +1052,26 @@ router.post(
       }
       console.log(`[Bundle Submit] regulation=${regulation.sid} (${regulation.friendlyName})`);
 
+      // DEBUG: pull the regulation's constraint details so we can see the
+      // exact valid attribute set and value constraints for the business
+      // end-user type. Logs once per submit to Railway.
+      try {
+        const accountSid = process.env.TWILIO_ACCOUNT_SID;
+        const authToken = process.env.TWILIO_AUTH_TOKEN;
+        const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+        const constraintsRes = await fetch(
+          `https://numbers.twilio.com/v2/RegulatoryCompliance/Regulations/${regulation.sid}?IncludeConstraints=true`,
+          { headers: { Authorization: `Basic ${auth}` } },
+        );
+        const constraintsJson: any = await constraintsRes.json();
+        console.log(
+          "[Bundle Submit] regulation constraints:",
+          JSON.stringify(constraintsJson?.requirements || constraintsJson, null, 2),
+        );
+      } catch (debugErr: any) {
+        console.warn("[Bundle Submit] constraints fetch failed:", debugErr?.message);
+      }
+
       // ── 2. Create the Address resource (separate API) ──────────────
       // Used as the Bundle's proof-of-address + linked from utility_bill
       // supporting docs via address_sids.
@@ -1083,11 +1103,9 @@ router.post(
       // Critical mapping from the evaluator output:
       //   business_registration_number  = numeric identifier ("14516092")
       //   business_registration_identifier = authority code ("UK:CRN")  ← Registration Authority
-      // These are two separate fields with DIFFERENT values, not duplicates.
-      //
-      // is_subassigned needs to be a JSON boolean (not the string "false").
-      // The Twilio SDK stringifies attribute values, so we bypass it via
-      // raw fetch and hand-build the Attributes JSON to preserve the bool.
+      // is_subassigned: native bool causes 20500, string "false" / "no"
+      // gets accepted but evaluator says "Please specify". The constraint
+      // dump above will tell us the exact valid format.
       const businessAttrsObj: Record<string, unknown> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
@@ -1097,14 +1115,15 @@ router.post(
         email: bundle.representativeEmail,
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: false,
+        is_subassigned: "false",
       };
       if (bundle.businessWebsite) {
         businessAttrsObj.business_website = bundle.businessWebsite;
       }
 
-      const businessEndUser = await createBusinessEndUserRaw({
+      const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
+        type: "business",
         attributes: businessAttrsObj,
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
