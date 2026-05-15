@@ -1079,17 +1079,14 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Final attribute set per Twilio's evaluator (UK Business Local):
-      //   business_name, business_registration_number,
-      //   business_registration_authority (the "UK:CRN"-style code),
-      //   business_website, business_identity, phone_number, email,
-      //   first_name, last_name, is_subassigned
-      // is_subassigned expects the string "yes" or "no", not "true"/"false".
-      // All values are strings; booleans cause 20500 on create.
+      // business_registration_authority returned 70002 "Attribute not mapped
+      // to object (business)" — the friendly name "Registration Authority"
+      // in the evaluator output maps to the shorter API field name
+      // `registration_authority`. is_subassigned takes "no"/"yes" strings.
       const businessAttrs: Record<string, string> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
-        business_registration_authority: derivedAuthority,
+        registration_authority: derivedAuthority,
         business_identity: bundle.businessClassification,
         phone_number: bundle.representativePhone,
         email: bundle.representativeEmail,
