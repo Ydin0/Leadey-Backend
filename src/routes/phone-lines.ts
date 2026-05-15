@@ -1079,20 +1079,23 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Twilio's attributes dict only accepts string values; native booleans
-      // cause 20500. is_subassigned as the string "false" makes create()
-      // succeed (the evaluator may still flag it as "missing" but that's
-      // an evaluator quirk — the real Twilio review accepts the value).
+      // Final attribute set per Twilio's evaluator (UK Business Local):
+      //   business_name, business_registration_number,
+      //   business_registration_authority (the "UK:CRN"-style code),
+      //   business_website, business_identity, phone_number, email,
+      //   first_name, last_name, is_subassigned
+      // is_subassigned expects the string "yes" or "no", not "true"/"false".
+      // All values are strings; booleans cause 20500 on create.
       const businessAttrs: Record<string, string> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
-        business_registration_identifier: bundle.businessRegistrationNumber,
+        business_registration_authority: derivedAuthority,
         business_identity: bundle.businessClassification,
         phone_number: bundle.representativePhone,
         email: bundle.representativeEmail,
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: "false",
+        is_subassigned: "no",
       };
       if (bundle.businessWebsite) {
         businessAttrs.business_website = bundle.businessWebsite;
@@ -1180,13 +1183,15 @@ router.post(
         );
       }
 
-      // ── 6. Attach items (end-user, address-doc, address, every doc) ──
+      // ── 6. Attach items to the bundle ───────────────────────────────
+      // Note: raw Address SID can't be attached directly ("attempting to
+      // add invalid object type to bundle"). It's referenced via the
+      // type=business_address supporting document we just created.
       const itemSids: Array<{ sid: string; label: string }> = [
         { sid: businessEndUser.sid, label: "business-end-user" },
         ...(addressDocSid
-          ? [{ sid: addressDocSid, label: "address-doc" }]
+          ? [{ sid: addressDocSid, label: "business-address-doc" }]
           : []),
-        { sid: twilioAddress.sid, label: "address" },
         ...docs
           .filter((d) => d.twilioDocumentSid)
           .map((d) => ({ sid: d.twilioDocumentSid as string, label: `doc:${d.documentType}` })),
