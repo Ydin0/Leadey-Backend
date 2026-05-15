@@ -1083,22 +1083,27 @@ router.post(
       //   business_name, business_registration_identifier (NOT _number),
       //   business_website, business_identity, phone_number, email,
       //   first_name, last_name, is_subassigned
-      // is_subassigned=false means the number is being used by the customer
-      // themselves (not resold to a downstream end-customer).
+      // All values must be strings — Twilio's attributes dictionary won't
+      // serialise booleans, and empty strings can be rejected, so we omit
+      // optional fields when blank.
+      const businessAttrs: Record<string, string> = {
+        business_name: bundle.businessName,
+        business_registration_identifier: bundle.businessRegistrationNumber,
+        business_identity: bundle.businessClassification,
+        phone_number: bundle.representativePhone,
+        email: bundle.representativeEmail,
+        first_name: bundle.representativeFirstName,
+        last_name: bundle.representativeLastName,
+        is_subassigned: "false",
+      };
+      if (bundle.businessWebsite) {
+        businessAttrs.business_website = bundle.businessWebsite;
+      }
+
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
-        attributes: {
-          business_name: bundle.businessName,
-          business_registration_identifier: bundle.businessRegistrationNumber,
-          business_website: bundle.businessWebsite || "",
-          business_identity: bundle.businessClassification,
-          phone_number: bundle.representativePhone,
-          email: bundle.representativeEmail,
-          first_name: bundle.representativeFirstName,
-          last_name: bundle.representativeLastName,
-          is_subassigned: false,
-        },
+        attributes: businessAttrs,
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
 
