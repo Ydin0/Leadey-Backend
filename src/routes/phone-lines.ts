@@ -1079,20 +1079,20 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // Both business_registration_authority and registration_authority
-      // returned 70002 "not mapped to object (business)" — the field
-      // doesn't live on the business end-user. The Registration Authority
-      // value ("UK:CRN", etc.) is attached to the business_registration
-      // *supporting document* instead (see step 4 below).
+      // Critical mapping from the evaluator output:
+      //   business_registration_number  = numeric identifier ("14516092")
+      //   business_registration_identifier = authority code ("UK:CRN")  ← Registration Authority
+      // These are two separate fields with DIFFERENT values, not duplicates.
       const businessAttrs: Record<string, string> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
+        business_registration_identifier: derivedAuthority,
         business_identity: bundle.businessClassification,
         phone_number: bundle.representativePhone,
         email: bundle.representativeEmail,
         first_name: bundle.representativeFirstName,
         last_name: bundle.representativeLastName,
-        is_subassigned: "no",
+        is_subassigned: "false",
       };
       if (bundle.businessWebsite) {
         businessAttrs.business_website = bundle.businessWebsite;
@@ -1111,20 +1111,19 @@ router.post(
         if (!doc.twilioDocumentSid) continue;
         try {
           if (doc.documentType === "utility_bill") {
+            // utility_bill schema only accepts address_sids — business_name
+            // returned 70002 "not mapped to object (utility_bill)".
             await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
               address_sids: [twilioAddress.sid],
-              business_name: bundle.businessName,
             });
             console.log(`[Bundle Submit] linked address to utility_bill ${doc.twilioDocumentSid}`);
           } else if (doc.documentType === "business_registration") {
+            // business_registration accepts: business_name, document_number.
+            // registration_authority lives on the business end-user as
+            // business_registration_identifier — not here.
             await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
               business_name: bundle.businessName,
               document_number: bundle.businessRegistrationNumber,
-              // "Registration Authority" lives on the business_registration
-              // supporting document, not the business end-user. The value is
-              // an enum like "UK:CRN", "US:EIN", etc. derived from country.
-              business_registration_authority: derivedAuthority,
-              registration_authority: derivedAuthority,
             });
           } else if (
             doc.documentType === "government_id" ||
