@@ -1079,6 +1079,9 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
+      // Also link the Address SID directly via business end-user attributes.
+      // Twilio's evaluator pattern-matches "business_address" requirements
+      // against this in addition to a type=address supporting document.
       const businessEndUser = await client.numbers.v2.regulatoryCompliance.endUsers.create({
         friendlyName: bundle.businessName,
         type: "business",
@@ -1087,6 +1090,7 @@ router.post(
           business_registration_number: bundle.businessRegistrationNumber,
           first_name: bundle.representativeFirstName,
           last_name: bundle.representativeLastName,
+          address_sids: [twilioAddress.sid],
         },
       });
       console.log(`[Bundle Submit] business-end-user=${businessEndUser.sid}`);
@@ -1198,14 +1202,34 @@ router.post(
           .bundles(twilioBundle.sid)
           .evaluations.create();
         if (evaluation?.status === "noncompliant") {
-          const failures = (evaluation.results || [])
-            .filter((r: any) => r.passed === false)
-            .map((r: any) => r.failure_reason)
-            .filter(Boolean)
-            .join(" | ");
+          // Log the full evaluation to Railway logs so we can debug
+          console.error(
+            "[Bundle Submit] evaluation noncompliant:",
+            JSON.stringify(evaluation.results, null, 2),
+          );
+
+          // Build a granular message: per-requirement, with the specific
+          // fields that failed and on which object type. Lets us see if
+          // it's a business-info gap, a doc attribute gap, an address gap,
+          // etc.
+          const failures: string[] = [];
+          for (const r of evaluation.results || []) {
+            if (r.passed) continue;
+            const reqLabel = r.requirement_friendly_name || r.requirement_name || r.object_type;
+            const invalidFields = (r.invalid || [])
+              .map((i: any) => i.object_field || i.friendly_name)
+              .filter(Boolean)
+              .join(", ");
+            const base = `${reqLabel} (${r.object_type})`;
+            failures.push(
+              invalidFields
+                ? `${base}: missing ${invalidFields}`
+                : `${base}: ${r.failure_reason || "no detail"}`,
+            );
+          }
           throw new ApiError(
             400,
-            `Twilio evaluation rejected the bundle. ${failures || "See Twilio console for details."}`,
+            `Twilio rejected the bundle. ${failures.join(" • ") || "See Twilio console."}`,
           );
         }
       } catch (evalErr: any) {
