@@ -1079,14 +1079,14 @@ router.post(
       //
       // The rep's first_name/last_name go on the business end-user; there's
       // no separate Individual end-user for business regulations.
-      // business_registration_authority returned 70002 "Attribute not mapped
-      // to object (business)" — the friendly name "Registration Authority"
-      // in the evaluator output maps to the shorter API field name
-      // `registration_authority`. is_subassigned takes "no"/"yes" strings.
+      // Both business_registration_authority and registration_authority
+      // returned 70002 "not mapped to object (business)" — the field
+      // doesn't live on the business end-user. The Registration Authority
+      // value ("UK:CRN", etc.) is attached to the business_registration
+      // *supporting document* instead (see step 4 below).
       const businessAttrs: Record<string, string> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
-        registration_authority: derivedAuthority,
         business_identity: bundle.businessClassification,
         phone_number: bundle.representativePhone,
         email: bundle.representativeEmail,
@@ -1120,6 +1120,11 @@ router.post(
             await updateSupportingDocumentAttributes(doc.twilioDocumentSid, {
               business_name: bundle.businessName,
               document_number: bundle.businessRegistrationNumber,
+              // "Registration Authority" lives on the business_registration
+              // supporting document, not the business end-user. The value is
+              // an enum like "UK:CRN", "US:EIN", etc. derived from country.
+              business_registration_authority: derivedAuthority,
+              registration_authority: derivedAuthority,
             });
           } else if (
             doc.documentType === "government_id" ||
