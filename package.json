@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx src/migrate.ts && tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/migrate.js && node dist/server.js",
     "typecheck": "tsc --noEmit",
