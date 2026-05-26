@@ -435,18 +435,24 @@ router.post("/bettercontact", async (req: Request, res: Response) => {
     let updated = 0;
     if (Array.isArray(data) && data.length > 0) {
       for (const item of data) {
-        // Normalize field names — support both webhook and polling formats
+        // Normalize field names — support both webhook and polling formats.
+        // The webhook uses prefixed names (contact_*); the polling API uses
+        // bare names (email, phone). LinkedIn URL in the webhook is
+        // `contact_linkedin_profile_url` — NOT `linkedin_url` (that field
+        // doesn't exist in the webhook payload at all). Earlier code only
+        // checked `linkedin_url`, so the LinkedIn match never fired for
+        // webhooks and we silently fell back to name matching.
         const email = item.contact_email_address || item.email || null;
         const emailStatus = item.contact_email_address_status || item.email_status || null;
         const phone = item.contact_phone_number || item.phone || null;
         const phoneStatus = item.contact_phone_number_status || item.phone_status || null;
         const firstName = item.contact_first_name || item.first_name || "";
         const lastName = item.contact_last_name || item.last_name || "";
-        const linkedinUrl = item.linkedin_url || null;
+        const linkedinUrl = item.contact_linkedin_profile_url || item.linkedin_url || null;
 
         const hasContactData = !!(email || phone);
 
-        // Match by linkedin_url if available, otherwise by first_name + last_name
+        // 1. Strict match by linkedin_url scoped to this request.
         let matchResult: { id: string }[] | undefined;
         if (linkedinUrl) {
           matchResult = await db
@@ -469,7 +475,7 @@ router.post("/bettercontact", async (req: Request, res: Response) => {
             .returning({ id: scraperContacts.id });
         }
 
-        // Fallback: match by first_name + last_name if LinkedIn URL match failed or wasn't available
+        // 2. Strict match by first_name + last_name scoped to this request.
         if (!matchResult?.length && firstName && lastName) {
           matchResult = await db
             .update(scraperContacts)
@@ -490,6 +496,40 @@ router.post("/bettercontact", async (req: Request, res: Response) => {
               ),
             )
             .returning({ id: scraperContacts.id });
+        }
+
+        // 3. Last-resort match for re-sent webhooks where the original
+        //    bettercontact_request_id was cleared (e.g. by /contacts/reset-
+        //    stuck). Match by name on un-enriched contacts only, so we
+        //    never overwrite real enriched data. The status filter is the
+        //    safety rail — a "John Smith" in another org who hasn't been
+        //    enriched gets the data, which is fine; an enriched one is
+        //    skipped. We also re-attach the requestId so future webhooks
+        //    for this batch land via the strict path above.
+        if (!matchResult?.length && firstName && lastName && hasContactData) {
+          matchResult = await db
+            .update(scraperContacts)
+            .set({
+              email,
+              emailStatus,
+              phone,
+              phoneStatus,
+              bettercontactRequestId: requestId,
+              enrichmentStatus: "enriched",
+              enrichedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                sql`lower(${scraperContacts.firstName}) = lower(${firstName})`,
+                sql`lower(${scraperContacts.lastName}) = lower(${lastName})`,
+                eq(scraperContacts.enrichmentStatus, "none"),
+              ),
+            )
+            .returning({ id: scraperContacts.id });
+          if (matchResult?.length) {
+            console.log(`[BetterContact Webhook] name-only fallback matched ${firstName} ${lastName} → ${matchResult.length} row(s)`);
+          }
         }
 
         if (matchResult?.length) {

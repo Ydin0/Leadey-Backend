@@ -703,7 +703,7 @@ router.post(
           const emailStatus = (item as any).contact_email_address_status || item.email_status || null;
           const phone = (item as any).contact_phone_number || item.phone || null;
           const phoneStatus = (item as any).contact_phone_number_status || item.phone_status || null;
-          const linkedinUrl = item.linkedin_url || null;
+          const linkedinUrl = (item as any).contact_linkedin_profile_url || item.linkedin_url || null;
           const firstName = (item as any).contact_first_name || (item as any).first_name || "";
           const lastName = (item as any).contact_last_name || (item as any).last_name || "";
 
