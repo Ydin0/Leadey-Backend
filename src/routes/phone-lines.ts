@@ -338,6 +338,9 @@ router.post(
         ...(approvedBundle?.twilioBundleSid
           ? { bundleSid: approvedBundle.twilioBundleSid }
           : {}),
+        ...(approvedBundle?.twilioAddressSid
+          ? { addressSid: approvedBundle.twilioAddressSid }
+          : {}),
       } as any);
     } catch (err: any) {
       throw new ApiError(
