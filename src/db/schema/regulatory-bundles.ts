@@ -11,6 +11,11 @@ export const regulatoryBundles = pgTable("regulatory_bundles", {
   countryCode: text("country_code").notNull(),
   status: text("status").notNull().default("draft"),
 
+  /** Twilio number type the bundle applies to: local | mobile | national | toll-free. */
+  numberType: text("number_type").notNull().default("local"),
+  /** Twilio end-user type: business | individual. UI only exposes "business" for now. */
+  endUserType: text("end_user_type").notNull().default("business"),
+
   // ─── Business information ───────────────────────────────────────────
   businessName: text("business_name").notNull(),
   businessType: text("business_type").notNull().default("limited_company"),

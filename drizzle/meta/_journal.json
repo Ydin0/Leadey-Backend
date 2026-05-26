@@ -127,6 +127,13 @@
       "when": 1778775605531,
       "tag": "0017_strange_kylun",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1779810115689,
+      "tag": "0018_bundle_number_type",
+      "breakpoints": true
     }
   ]
 }

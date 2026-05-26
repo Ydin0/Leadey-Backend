@@ -1,0 +1,2 @@
+ALTER TABLE "regulatory_bundles" ADD COLUMN "number_type" text DEFAULT 'local' NOT NULL;--> statement-breakpoint
+ALTER TABLE "regulatory_bundles" ADD COLUMN "end_user_type" text DEFAULT 'business' NOT NULL;

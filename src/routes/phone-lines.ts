@@ -274,7 +274,10 @@ router.post(
     const numberType = type || "local";
     const iso = countryCode.toUpperCase();
 
-    // ── 1. Resolve an approved bundle for this org+country (if any) ──
+    // ── 1. Resolve an approved bundle for this org+country+type ──
+    // Twilio keys bundles by (country, numberType, endUserType), so a UK
+    // Local bundle can't be used to provision a UK Mobile number. Match
+    // on numberType too — otherwise Twilio rejects the purchase.
     const [approvedBundle] = await db
       .select()
       .from(regulatoryBundles)
@@ -282,6 +285,7 @@ router.post(
         and(
           eq(regulatoryBundles.organizationId, orgId),
           eq(regulatoryBundles.countryCode, iso),
+          eq(regulatoryBundles.numberType, numberType),
           eq(regulatoryBundles.status, "twilio-approved"),
         ),
       )
@@ -297,7 +301,7 @@ router.post(
     if (COUNTRIES_REQUIRING_BUNDLE.has(iso) && !approvedBundle) {
       throw new ApiError(
         400,
-        `An approved regulatory bundle is required to provision a ${iso} number. Create one in Settings → Phone Lines → Regulatory Bundles.`,
+        `An approved ${numberType} regulatory bundle is required to provision a ${iso} ${numberType} number. Create one in Settings → Phone Lines → Regulatory Bundles.`,
       );
     }
 
@@ -642,6 +646,9 @@ function serializeBundle(b: typeof regulatoryBundles.$inferSelect) {
     countryCode: b.countryCode,
     status: b.status,
 
+    numberType: b.numberType,
+    endUserType: b.endUserType,
+
     businessName: b.businessName,
     businessType: b.businessType,
     businessRegistrationAuthority: b.businessRegistrationAuthority,
@@ -694,6 +701,7 @@ router.post(
     const orgId = getOrgId(req);
     const {
       name, country, countryCode,
+      numberType, endUserType,
       businessName, businessType,
       businessRegistrationAuthority, businessRegistrationNumber,
       businessWebsite, businessClassification,
@@ -708,13 +716,20 @@ router.post(
       throw new ApiError(400, "country, countryCode, and businessName are required");
     }
 
+    const ALLOWED_NUMBER_TYPES = new Set(["local", "mobile", "national", "toll-free"]);
+    const ALLOWED_END_USER_TYPES = new Set(["business", "individual"]);
+    const resolvedNumberType = ALLOWED_NUMBER_TYPES.has(numberType) ? numberType : "local";
+    const resolvedEndUserType = ALLOWED_END_USER_TYPES.has(endUserType) ? endUserType : "business";
+
     const id = createId("bun");
     const [bundle] = await db.insert(regulatoryBundles).values({
       id,
       organizationId: orgId,
-      name: name || `${country} Business Bundle`,
+      name: name || `${country} ${resolvedNumberType} ${resolvedEndUserType} Bundle`,
       country,
       countryCode,
+      numberType: resolvedNumberType,
+      endUserType: resolvedEndUserType,
       businessName,
       businessType: businessType || "limited_company",
       businessRegistrationAuthority: businessRegistrationAuthority || "",
@@ -756,7 +771,8 @@ router.patch(
     }
 
     const allowed: Array<keyof typeof regulatoryBundles.$inferInsert> = [
-      "name", "businessName", "businessType",
+      "name", "numberType", "endUserType",
+      "businessName", "businessType",
       "businessRegistrationAuthority", "businessRegistrationNumber",
       "businessWebsite", "businessClassification",
       "addressStreet1", "addressStreet2", "addressCity",
@@ -1017,33 +1033,27 @@ router.post(
       // A Regulation is unique per (IsoCountry, NumberType, EndUserType).
       // Calling .list() without numberType returns multiple regulations
       // (Local, National, Mobile, Toll-Free) and Twilio rejects with
-      // "ambiguous regulation parameters". Default to local — most
-      // self-service customers want local numbers.
-      const desiredNumberType: "local" | "national" | "mobile" | "toll-free" =
+      // "ambiguous regulation parameters". Read both off the bundle row;
+      // the UI picks numberType at creation time, endUserType is "business"
+      // for now (we only support business bundles).
+      const desiredNumberType =
+        (bundle.numberType as "local" | "national" | "mobile" | "toll-free") ||
         "local";
+      const desiredEndUserType =
+        (bundle.endUserType as "business" | "individual") || "business";
 
-      let regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
+      const regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
         isoCountry: countryCode,
-        endUserType: "business",
+        endUserType: desiredEndUserType,
         numberType: desiredNumberType,
         limit: 5,
       });
-
-      // Fall back to national if no local regulation exists for this country
-      if (regulations.length === 0) {
-        regulations = await client.numbers.v2.regulatoryCompliance.regulations.list({
-          isoCountry: countryCode,
-          endUserType: "business",
-          numberType: "national",
-          limit: 5,
-        });
-      }
 
       const regulation = regulations[0];
       if (!regulation) {
         throw new ApiError(
           400,
-          `No Twilio business regulation found for ${bundle.country}. Phone number compliance may not be available for this country.`,
+          `No Twilio ${desiredEndUserType} regulation found for ${bundle.country} ${desiredNumberType} numbers. Phone number compliance may not be available for this combination.`,
         );
       }
       console.log(`[Bundle Submit] regulation=${regulation.sid} (${regulation.friendlyName})`);
