@@ -155,18 +155,60 @@ webhookRouter.post(
 
     const webhookBase = process.env.WEBHOOK_BASE_URL;
     const recordingCallback = webhookBase ? `${webhookBase}/webhooks/twilio/recording` : undefined;
+    const amdCallback = webhookBase ? `${webhookBase}/webhooks/twilio/amd` : undefined;
+
+    // Answering Machine Detection: Twilio runs detection on the dialed leg.
+    // When it concludes (machine_end_beep / human / etc.) it posts to
+    // amdStatusCallback. The dialer uses that to auto-drop a voicemail.
+    // "DetectMessageEnd" waits for the beep before firing — slightly slower
+    // than "Enable" but lets us play the VM at the right moment.
+    const dialOptions: Record<string, unknown> = {
+      callerId: callerId || from || undefined,
+      record: "record-from-answer-dual",
+      recordingStatusCallback: recordingCallback,
+      recordingStatusCallbackEvent: "completed",
+    };
+    if (amdCallback) {
+      dialOptions.machineDetection = "DetectMessageEnd";
+      dialOptions.amdStatusCallback = amdCallback;
+      dialOptions.amdStatusCallbackMethod = "POST";
+    }
 
     if (to && /^[\d+\-() ]+$/.test(to)) {
+      // DNC backstop: if the destination matches a master_contact in this
+      // call's org with doNotCall=true, refuse to dial. The dialer's queue
+      // creation already excludes DNC contacts, so this catches ad-hoc
+      // dials from elsewhere in the app (lead row click, dial-pad type-in).
+      // We can't easily know the org from the TwiML webhook (Twilio carries
+      // no auth), so we check globally — any DNC row matching this number
+      // blocks. False-positive risk is low (DNC is sticky and rare).
+      try {
+        const { db } = await import("../db");
+        const { masterContacts } = await import("../db/schema/master");
+        const { and: a, eq: e } = await import("drizzle-orm");
+        const normalized = to.replace(/[^\d+]/g, "");
+        const [dnc] = await db
+          .select({ id: masterContacts.id })
+          .from(masterContacts)
+          .where(a(e(masterContacts.doNotCall, true), e(masterContacts.phone, normalized)))
+          .limit(1);
+        if (dnc) {
+          response.say(
+            "This number is on the do not call list. The call cannot be completed.",
+          );
+          response.hangup();
+          res.type("text/xml").send(response.toString());
+          return;
+        }
+      } catch (err) {
+        console.warn("[Twilio Voice] DNC check failed (allowing call):", err);
+      }
       // Outbound call to a phone number
-      const dial = response.dial({
-        callerId: callerId || from || undefined,
-        record: "record-from-answer-dual" as any,
-        recordingStatusCallback: recordingCallback,
-        recordingStatusCallbackEvent: "completed" as any,
-      });
+      const dial = response.dial(dialOptions as any);
       dial.number(to);
     } else if (to) {
-      // Outbound call to a Twilio client identity (browser-to-browser)
+      // Outbound call to a Twilio client identity (browser-to-browser).
+      // AMD doesn't make sense for client-to-client calls; omit it.
       const dial = response.dial({
         callerId: callerId || from || undefined,
         record: "record-from-answer-dual" as any,

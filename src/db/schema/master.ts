@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, timestamp, unique } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, unique, boolean } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 export const masterCompanies = pgTable("master_companies", {
@@ -45,6 +45,19 @@ export const masterContacts = pgTable("master_contacts", {
   phone: text("phone"),
   phoneStatus: text("phone_status"),
   enrichmentStatus: text("enrichment_status").notNull().default("none"),
+
+  /** Dialer / compliance fields. Stored at the master-contact level (not
+   *  per-funnel-lead) so flipping DNC once propagates everywhere the same
+   *  person appears. */
+  doNotCall: boolean("do_not_call").notNull().default(false),
+  /** IANA tz string e.g. "America/Chicago". Used to gate calls to
+   *  business hours when the dialer's respectTimezone filter is on. */
+  timezone: text("timezone"),
+  lastCalledAt: timestamp("last_called_at", { withTimezone: true }),
+  callAttempts: integer("call_attempts").notNull().default(0),
+  bestTimeStart: text("best_time_start"),
+  bestTimeEnd: text("best_time_end"),
+
   lastDiscoveredAt: timestamp("last_discovered_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -17,7 +17,9 @@ import templatesRouter from "./routes/templates";
 import billingRouter from "./routes/billing";
 import masterRouter from "./routes/master";
 import teamRouter from "./routes/team";
+import dialerRouter from "./routes/dialer";
 import adminRouter, { adminMeRouter } from "./routes/admin";
+import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
 import { requireApiAuth, requireAdmin } from "./lib/admin-auth";
 
@@ -65,10 +67,30 @@ app.use("/api", requireAuth(), masterRouter);
 app.use("/api", requireAuth(), teamRouter);
 app.use("/api", requireAuth(), planGuard(), contactsRouter);
 app.use("/api", requireAuth(), planGuard(), templatesRouter);
+app.use("/api", requireAuth(), dialerRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
 app.use("/webhooks", twilioWebhookRouter);
+
+// Public voicemail file serve — fetched by Twilio's <Play> verb. NOT
+// authenticated because Twilio can't carry a Clerk session token.
+// The filename is opaque (random id + ext) so there's no enumeration risk
+// for files the requester doesn't already have a URL for.
+app.get("/voicemails/:filename", async (req, res, next) => {
+  try {
+    const result = await readVoicemailFile(req.params.filename);
+    if (!result) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader("Content-Type", result.mimeType);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(result.buffer);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // 404 handler
 app.use((_req, _res, next) => {

@@ -134,6 +134,13 @@
       "when": 1779810115689,
       "tag": "0018_bundle_number_type",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1780326210342,
+      "tag": "0019_power_dialer",
+      "breakpoints": true
     }
   ]
 }

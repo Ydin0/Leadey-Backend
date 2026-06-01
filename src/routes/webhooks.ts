@@ -146,6 +146,14 @@ router.post("/clerk", async (req: Request, res: Response) => {
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
+        // Seed dialer system dispositions so the power-dialer is usable from
+        // day one without manual setup.
+        try {
+          const { seedSystemDispositions } = await import("../lib/dialer-seed");
+          await seedSystemDispositions(data.id);
+        } catch (err) {
+          console.error("[org.created] disposition seed failed:", err);
+        }
         break;
       }
       case "organization.updated": {
@@ -397,6 +405,17 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
         })
         .where(eq(callRecords.id, record.id));
       console.log(`[Twilio Recording] Updated call record ${record.id} with recording URL`);
+
+      // Fan out to anyone listening for this call (e.g. the dialer SSE
+      // channel) so the UI can show the recording link without polling.
+      try {
+        const { publishToCall } = await import("../lib/dialer-event-bus");
+        publishToCall(callSid, {
+          type: "recording-complete",
+          callRecordId: record.id,
+          recordingUrl: `${recordingUrl}.mp3`,
+        });
+      } catch {}
     } else {
       console.log(`[Twilio Recording] No call record found for CallSid=${callSid}`);
     }
@@ -404,6 +423,111 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
     res.status(200).send("OK");
   } catch (err) {
     console.error("[Twilio Recording] Error:", err);
+    res.status(200).send("OK");
+  }
+});
+
+// ─── POST /webhooks/twilio/amd ───────────────────────────────────────────
+// Twilio's Answering Machine Detection result. AnsweredBy values:
+//   "human"             — a person picked up
+//   "machine_end_beep"  — voicemail with detectable beep (best for VM drop)
+//   "machine_start"     — voicemail greeting just started
+//   "machine_end_silence" / "machine_end_other" — VM end without clear beep
+//   "fax" / "unknown"
+//
+// On machine_end_beep, we look up the user's default voicemail and inject
+// the VM into the live call via twilio.calls(sid).update({ twiml }). The
+// frontend learns about this via the SSE channel and auto-dispositions.
+
+router.post("/twilio/amd", async (req: Request, res: Response) => {
+  try {
+    const callSid = req.body?.CallSid as string | undefined;
+    const answeredBy = req.body?.AnsweredBy as string | undefined;
+    console.log(`[Twilio AMD] CallSid=${callSid} AnsweredBy=${answeredBy}`);
+    if (!callSid || !answeredBy) {
+      res.status(200).send("OK");
+      return;
+    }
+
+    // Fan out the detection result regardless of outcome — UI badges this.
+    try {
+      const { publishToCall } = await import("../lib/dialer-event-bus");
+      publishToCall(callSid, { type: "amd-detected", callSid, answeredBy });
+    } catch {}
+
+    // Only auto-drop on machine_end_beep. machine_start would talk over the
+    // greeting; machine_end_silence is unreliable.
+    if (answeredBy !== "machine_end_beep") {
+      res.status(200).send("OK");
+      return;
+    }
+
+    // Look up the call record to find the rep + org.
+    const record = await db.query.callRecords.findFirst({
+      where: eq(callRecords.twilioCallSid, callSid),
+    });
+    if (!record?.userId || !record.organizationId) {
+      console.log(`[Twilio AMD] No matching call record for ${callSid} — cannot resolve VM`);
+      res.status(200).send("OK");
+      return;
+    }
+
+    // Find the user's default VM, then fall back to any default org-wide VM.
+    const { voicemailDrops } = await import("../db/schema/dialer");
+    const userVm = await db.query.voicemailDrops?.findFirst?.({
+      where: (vm: any, { and: a, eq: e }: any) =>
+        a(
+          e(vm.organizationId, record.organizationId),
+          e(vm.userId, record.userId),
+          e(vm.isDefault, true),
+        ),
+    });
+    let vm = userVm;
+    if (!vm) {
+      // direct query — schema may not be wired in db.query yet
+      const [orgVm] = await db
+        .select()
+        .from(voicemailDrops)
+        .where(
+          and(
+            eq(voicemailDrops.organizationId, record.organizationId),
+            eq(voicemailDrops.isDefault, true),
+          ),
+        )
+        .limit(1);
+      vm = orgVm;
+    }
+    if (!vm) {
+      console.log(`[Twilio AMD] No default VM configured for org=${record.organizationId}`);
+      res.status(200).send("OK");
+      return;
+    }
+
+    // Inject the VM into the live call.
+    const escaped = vm.recordingUrl
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    const twiml = `<Response><Play>${escaped}</Play><Hangup/></Response>`;
+    try {
+      const twilioSdk = (await import("twilio")).default;
+      const client = twilioSdk(
+        process.env.TWILIO_ACCOUNT_SID!,
+        process.env.TWILIO_AUTH_TOKEN!,
+      );
+      await client.calls(callSid).update({ twiml });
+      console.log(`[Twilio AMD] Dropped VM ${vm.id} into call ${callSid}`);
+
+      // Publish the drop event so the frontend auto-dispositions.
+      const { publishToCall } = await import("../lib/dialer-event-bus");
+      publishToCall(callSid, { type: "vm-dropped", callSid, voicemailId: vm.id });
+    } catch (err) {
+      console.error("[Twilio AMD] Failed to inject VM:", err);
+    }
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("[Twilio AMD] Error:", err);
     res.status(200).send("OK");
   }
 });
