@@ -26,6 +26,10 @@ export const leads = pgTable("leads", {
   companyLocation: text("company_location"),
   smartleadLeadId: text("smartlead_lead_id"),
   unipileProviderId: text("unipile_provider_id"),
+  /** Set once the lead is converted to an Opportunity. The lead stays
+   *  active in the campaign — this is just a link. ON DELETE SET NULL
+   *  so removing an opp doesn't cascade-kill the lead history. */
+  opportunityId: text("opportunity_id"),
   notes: jsonb("notes").$type<Record<string, string>>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -18,6 +18,13 @@ export {
   dialerSessions,
   dialerQueueItems,
 } from "./dialer";
+export {
+  pipelines,
+  pipelineStages,
+  opportunities,
+  opportunityContacts,
+  opportunityEvents,
+} from "./opportunities";
 export { adminAuditLog } from "./admin-audit-log";
 export {
   funnelsRelations,

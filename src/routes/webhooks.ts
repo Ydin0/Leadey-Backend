@@ -154,6 +154,14 @@ router.post("/clerk", async (req: Request, res: Response) => {
         } catch (err) {
           console.error("[org.created] disposition seed failed:", err);
         }
+        // Seed default Sales pipeline + stages so opportunities work
+        // out of the box.
+        try {
+          const { seedDefaultPipeline } = await import("../lib/opportunities-seed");
+          await seedDefaultPipeline(data.id);
+        } catch (err) {
+          console.error("[org.created] pipeline seed failed:", err);
+        }
         break;
       }
       case "organization.updated": {

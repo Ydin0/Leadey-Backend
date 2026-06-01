@@ -141,6 +141,13 @@
       "when": 1780326210342,
       "tag": "0019_power_dialer",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1780335999156,
+      "tag": "0020_opportunities_crm",
+      "breakpoints": true
     }
   ]
 }
