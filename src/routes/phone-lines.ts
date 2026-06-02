@@ -7,6 +7,7 @@ import { db } from "../db";
 import { phoneLines } from "../db/schema/phone-lines";
 import { regulatoryBundles, bundleDocuments } from "../db/schema/regulatory-bundles";
 import { callRecords } from "../db/schema/call-records";
+import { users } from "../db/schema/organizations";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
@@ -591,12 +592,29 @@ router.post(
       companyName,
       duration,
       disposition,
-      userId,
-      userName,
+      userName: bodyUserName,
     } = req.body;
 
     if (!direction || !fromNumber || !toNumber) {
       throw new ApiError(400, "direction, fromNumber, and toNumber are required");
+    }
+
+    // Always attribute the call to the authenticated user — never trust the
+    // client for this. We look up the display name from the users table so the
+    // recordings page can filter by member reliably.
+    const auth = getAuth(req);
+    const userId = auth?.userId || null;
+    let userName: string | null = bodyUserName || null;
+    if (userId) {
+      const [u] = await db
+        .select({ firstName: users.firstName, lastName: users.lastName, email: users.email })
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
+      if (u) {
+        const full = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
+        userName = full || u.email || userName;
+      }
     }
 
     const id = createId("cr");
@@ -614,8 +632,8 @@ router.post(
         companyName: companyName || null,
         duration: duration ?? 0,
         disposition: disposition || "completed",
-        userId: userId || null,
-        userName: userName || null,
+        userId,
+        userName,
       })
       .returning();
 
@@ -630,6 +648,8 @@ router.post(
         lineId: record.lineId,
         duration: record.duration,
         disposition: record.disposition,
+        userId: record.userId,
+        userName: record.userName,
         timestamp: record.calledAt.toISOString(),
       },
     });

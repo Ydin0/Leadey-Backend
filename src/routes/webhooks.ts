@@ -424,6 +424,21 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
           recordingUrl: `${recordingUrl}.mp3`,
         });
       } catch {}
+
+      // Auto-transcribe & summarize in the background so the recordings page
+      // shows the transcript without the rep having to click "Summarize".
+      // Fire-and-forget — failures are logged inside the service and must not
+      // block the webhook ACK to Twilio.
+      void (async () => {
+        try {
+          const { transcribeAndSummarize } = await import(
+            "../lib/transcription-service"
+          );
+          await transcribeAndSummarize(record.id, `${recordingUrl}.mp3`);
+        } catch (e) {
+          console.error("[Twilio Recording] Auto-transcribe failed:", e);
+        }
+      })();
     } else {
       console.log(`[Twilio Recording] No call record found for CallSid=${callSid}`);
     }
