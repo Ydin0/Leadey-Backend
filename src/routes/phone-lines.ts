@@ -8,6 +8,18 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { regulatoryBundles, bundleDocuments } from "../db/schema/regulatory-bundles";
 import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
+import { leads } from "../db/schema/leads";
+import { funnels } from "../db/schema/funnels";
+
+/** Normalised phone key for fuzzy matching across formats (+44…, 07…, etc.).
+ *  Uses the last 9 significant digits so a leading country code / trunk-0
+ *  difference doesn't prevent a match. */
+function phoneKey(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length < 7) return null;
+  return digits.slice(-9);
+}
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
@@ -553,13 +565,43 @@ router.get(
       .limit(limit)
       .offset(offset);
 
-    const data = rows.map((r) => ({
+    // Resolve a contact name/company for any record that doesn't already have
+    // one by matching the dialed number against the org's leads. If the number
+    // isn't linked to a lead we leave it blank and the UI shows the raw number.
+    const needsLookup = rows.some((r) => !r.contactName);
+    const leadByPhone = new Map<string, { name: string; company: string }>();
+    if (needsLookup) {
+      const orgLeads = await db
+        .select({ name: leads.name, company: leads.company, phone: leads.phone })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(eq(funnels.organizationId, orgId));
+      for (const l of orgLeads) {
+        const key = phoneKey(l.phone);
+        if (key && !leadByPhone.has(key)) {
+          leadByPhone.set(key, { name: l.name, company: l.company });
+        }
+      }
+    }
+
+    const data = rows.map((r) => {
+      let contactName = r.contactName;
+      let companyName = r.companyName;
+      if (!contactName) {
+        const counterpart = r.direction === "outbound" ? r.toNumber : r.fromNumber;
+        const match = phoneKey(counterpart) ? leadByPhone.get(phoneKey(counterpart)!) : undefined;
+        if (match) {
+          contactName = match.name;
+          companyName = companyName || match.company;
+        }
+      }
+      return {
       id: r.id,
       direction: r.direction,
       from: r.fromNumber,
       to: r.toNumber,
-      contactName: r.contactName,
-      companyName: r.companyName,
+      contactName,
+      companyName,
       lineId: r.lineId,
       duration: r.duration,
       disposition: r.disposition,
@@ -571,7 +613,8 @@ router.get(
       userId: r.userId,
       userName: r.userName,
       timestamp: r.calledAt.toISOString(),
-    }));
+      };
+    });
 
     res.json({ data, meta: { page, pageSize: limit, totalCount, totalPages: Math.ceil(totalCount / limit) } });
   }),
@@ -1327,6 +1370,57 @@ router.post(
       .returning();
 
     res.json({ data: { id: updated.id, status: updated.status, twilioBundleSid: updated.twilioBundleSid } });
+  }),
+);
+
+// GET /api/phone-lines/call-records/:id/recording — stream the call audio.
+// Twilio recording media URLs require HTTP Basic Auth (Account SID + Auth
+// Token), so a browser <audio> tag can't load them directly. We proxy the
+// bytes through our authenticated backend instead. Supports Range requests so
+// the player can seek.
+router.get(
+  "/phone-lines/call-records/:id/recording",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = req.params.id as string;
+
+    const [record] = await db
+      .select()
+      .from(callRecords)
+      .where(and(eq(callRecords.id, id), eq(callRecords.organizationId, orgId)));
+
+    if (!record) throw new ApiError(404, "Call record not found");
+    if (!record.recordingUrl) throw new ApiError(404, "No recording available for this call");
+
+    const accountSid = process.env.TWILIO_ACCOUNT_SID!;
+    const authToken = process.env.TWILIO_AUTH_TOKEN!;
+    const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+
+    const upstreamHeaders: Record<string, string> = {
+      Authorization: `Basic ${basic}`,
+    };
+    // Forward Range so seeking works without downloading the whole file.
+    if (req.headers.range) upstreamHeaders["Range"] = req.headers.range as string;
+
+    const upstream = await fetch(record.recordingUrl, { headers: upstreamHeaders });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      console.error(`[Recording proxy] Twilio returned ${upstream.status} for ${record.id}`);
+      throw new ApiError(502, "Failed to fetch recording from Twilio");
+    }
+
+    res.status(upstream.status);
+    res.setHeader("Content-Type", upstream.headers.get("content-type") || "audio/mpeg");
+    res.setHeader("Accept-Ranges", "bytes");
+    const len = upstream.headers.get("content-length");
+    if (len) res.setHeader("Content-Length", len);
+    const range = upstream.headers.get("content-range");
+    if (range) res.setHeader("Content-Range", range);
+    // Allow the browser to cache the audio for the session.
+    res.setHeader("Cache-Control", "private, max-age=3600");
+
+    const arrayBuf = await upstream.arrayBuffer();
+    res.end(Buffer.from(arrayBuf));
   }),
 );
 
