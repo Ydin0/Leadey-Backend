@@ -19,6 +19,8 @@ import masterRouter from "./routes/master";
 import teamRouter from "./routes/team";
 import dialerRouter from "./routes/dialer";
 import opportunitiesRouter from "./routes/opportunities";
+import companiesRouter from "./routes/companies";
+import searchRouter from "./routes/search";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -70,6 +72,8 @@ app.use("/api", requireAuth(), planGuard(), contactsRouter);
 app.use("/api", requireAuth(), planGuard(), templatesRouter);
 app.use("/api", requireAuth(), dialerRouter);
 app.use("/api", requireAuth(), opportunitiesRouter);
+app.use("/api", requireAuth(), companiesRouter);
+app.use("/api", requireAuth(), searchRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
