@@ -493,15 +493,16 @@ router.post(
 );
 
 // ─── GET /contacts/company-counts ────────────────────────────────────
-// Get per-company contact counts for a given assignment
+// Per-company contact counts. Scoped to an assignment when assignmentId is
+// provided, otherwise org-wide (used by the org Leads page).
 router.get(
   "/contacts/company-counts",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const assignmentId = req.query.assignmentId as string | undefined;
-    if (!assignmentId) {
-      throw new ApiError(400, "assignmentId is required");
-    }
+
+    const conditions = [eq(scraperContacts.organizationId, orgId)];
+    if (assignmentId) conditions.push(eq(scraperContacts.assignmentId, assignmentId));
 
     const rows = await db
       .select({
@@ -510,12 +511,7 @@ router.get(
         count: count(),
       })
       .from(scraperContacts)
-      .where(
-        and(
-          eq(scraperContacts.organizationId, orgId),
-          eq(scraperContacts.assignmentId, assignmentId),
-        ),
-      )
+      .where(and(...conditions))
       .groupBy(scraperContacts.companyLinkedinUrl, scraperContacts.companyName);
 
     res.json({
