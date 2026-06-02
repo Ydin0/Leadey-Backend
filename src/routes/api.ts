@@ -5,7 +5,27 @@ import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
 import { leads, leadEvents } from "../db/schema/leads";
 import { scraperSignals } from "../db/schema/scrapers";
+import { masterCompanies } from "../db/schema/master";
 import { imports } from "../db/schema/imports";
+
+/** Free email providers — never used as a company domain. */
+const FREE_EMAIL_DOMAINS = new Set([
+  "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
+  "aol.com", "proton.me", "protonmail.com", "gmx.com", "live.com", "msn.com",
+  "me.com", "mac.com", "yandex.com", "zoho.com",
+]);
+
+function normalizeDomain(value: string): string {
+  let d = (value || "").trim().toLowerCase();
+  if (!d) return "";
+  d = d.replace(/^https?:\/\//, "").replace(/^www\./, "");
+  d = d.split("/")[0].split("?")[0].split("@").pop() || "";
+  return d;
+}
+function domainFromEmail(email: string): string {
+  const d = (email.split("@")[1] || "").toLowerCase();
+  return d && !FREE_EMAIL_DOMAINS.has(d) ? d : "";
+}
 import {
   ApiError,
   createId,
@@ -553,18 +573,17 @@ router.post(
   "/funnels/:funnelId/imports/csv",
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
-    const { fileName, mappings, rows } = req.body || {};
-    const normalizedFileName =
-      normalizeString(fileName) || "uploaded.csv";
+    const { fileName, mappings, rows, groupBy: groupByRaw, dryRun } = req.body || {};
+    const normalizedFileName = normalizeString(fileName) || "uploaded.csv";
+    const groupBy: "domain" | "name" | "linkedin" =
+      groupByRaw === "name" || groupByRaw === "linkedin" ? groupByRaw : "domain";
 
     if (!Array.isArray(mappings) || mappings.length === 0) {
       throw new ApiError(400, "CSV mappings are required");
     }
-
     if (!Array.isArray(rows) || rows.length === 0) {
       throw new ApiError(400, "CSV rows are required");
     }
-
     if (rows.length > 10000) {
       throw new ApiError(400, "CSV import limit is 10,000 rows per upload");
     }
@@ -574,17 +593,11 @@ router.post(
         csvColumn: normalizeString(entry.csvColumn),
         mappedField: normalizeString(entry.mappedField),
       }))
-      .filter(
-        (entry: MappingEntry) =>
-          entry.csvColumn &&
-          entry.mappedField &&
-          entry.mappedField !== "--- Skip ---",
-      );
+      .filter((e: MappingEntry) => e.csvColumn && e.mappedField && e.mappedField !== "--- Skip ---");
 
-    const validMappings = allMappings.filter((e) => e.mappedField !== "Notes");
+    const fieldMappings = allMappings.filter((e) => e.mappedField !== "Notes");
     const notesMappings = allMappings.filter((e) => e.mappedField === "Notes");
-
-    if (validMappings.length === 0 && notesMappings.length === 0) {
+    if (fieldMappings.length === 0 && notesMappings.length === 0) {
       throw new ApiError(400, "At least one valid field mapping is required");
     }
 
@@ -592,66 +605,134 @@ router.post(
       await loadFunnel(orgId, req.params.funnelId),
       req.params.funnelId,
     );
-
     if (!funnel.steps || funnel.steps.length === 0) {
       throw new ApiError(400, "Funnel has no steps configured");
     }
 
-    const existingKeys = new Set(
-      funnel.leads.map((l) => dedupeKey(l.name, l.company, l.email)),
-    );
+    // Resolve a value by any of the accepted field labels (back-compat aware).
+    const getField = (row: Record<string, unknown>, labels: string[]): string => {
+      for (const m of fieldMappings) {
+        if (labels.includes(m.mappedField)) {
+          const v = normalizeString(row[m.csvColumn]);
+          if (v) return v;
+        }
+      }
+      return "";
+    };
+    const LBL = {
+      name: ["Lead Name", "Name", "Full Name"],
+      email: ["Lead Email", "Email", "Work Email"],
+      title: ["Lead Title", "Title", "Job Title"],
+      phone: ["Lead Phone", "Phone", "Mobile"],
+      linkedin: ["Lead LinkedIn", "LinkedIn URL", "LinkedIn"],
+      cName: ["Company Name", "Company"],
+      cDomain: ["Company Domain", "Domain", "Website"],
+      cLinkedin: ["Company LinkedIn"],
+      cIndustry: ["Company Industry", "Industry"],
+      cLocation: ["Company Location", "Location"],
+      cSize: ["Company Size", "Employees", "Employee Count"],
+    };
+
+    // Existing funnel leads → dedupe.
+    const existingKeys = new Set(funnel.leads.map((l) => dedupeKey(l.name, l.company, l.email)));
+
+    // Preload org master companies for "already exists" detection.
+    const masterRows = await db
+      .select()
+      .from(masterCompanies)
+      .where(eq(masterCompanies.organizationId, orgId));
+    const masterByDomain = new Map<string, (typeof masterRows)[number]>();
+    const masterByName = new Map<string, (typeof masterRows)[number]>();
+    const masterByLinkedin = new Map<string, (typeof masterRows)[number]>();
+    for (const mc of masterRows) {
+      if (mc.domain) masterByDomain.set(mc.domain.toLowerCase(), mc);
+      masterByName.set(mc.name.toLowerCase(), mc);
+      if (mc.linkedinUrl) masterByLinkedin.set(mc.linkedinUrl.toLowerCase(), mc);
+    }
+
+    interface CompanyAgg {
+      key: string; name: string; domain: string; linkedin: string;
+      industry: string; location: string; size: number | null;
+      existing: (typeof masterRows)[number] | null; leadCount: number;
+    }
+    const companyMap = new Map<string, CompanyAgg>();
 
     const now = Date.now();
     const importId = createId("import");
     const errors: Array<{ row: number; reason: string }> = [];
-    let importedRows = 0;
-    let skippedRows = 0;
-
+    let importedRows = 0, skippedRows = 0, duplicateLeads = 0, invalidRows = 0;
     const addedLeadIds: string[] = [];
     const newLeads: Array<typeof leads.$inferInsert> = [];
     const newEvents: Array<typeof leadEvents.$inferInsert> = [];
+    const firstStep = funnel.steps[0];
 
     rows.forEach((rawRow: unknown, index: number) => {
-      const row =
-        rawRow && typeof rawRow === "object"
-          ? (rawRow as Record<string, unknown>)
-          : {};
+      const row = rawRow && typeof rawRow === "object" ? (rawRow as Record<string, unknown>) : {};
 
-      const name = mappedValue(row, validMappings, "Name");
-      const company = mappedValue(row, validMappings, "Company");
-      const email = mappedValue(row, validMappings, "Email").toLowerCase();
-      const title = mappedValue(row, validMappings, "Title");
-      const phone = mappedValue(row, validMappings, "Phone");
-      const linkedinUrl = mappedValue(row, validMappings, "LinkedIn URL");
+      const name = getField(row, LBL.name);
+      const cName = getField(row, LBL.cName);
+      const email = getField(row, LBL.email).toLowerCase();
+      const cDomainRaw = normalizeDomain(getField(row, LBL.cDomain)) || domainFromEmail(email);
+      const cLinkedin = getField(row, LBL.cLinkedin);
+      const cIndustry = getField(row, LBL.cIndustry);
+      const cLocation = getField(row, LBL.cLocation);
+      const cSizeStr = getField(row, LBL.cSize);
+      const cSize = cSizeStr ? parseInt(cSizeStr.replace(/[^0-9]/g, ""), 10) || null : null;
 
-      if (!name || !company) {
-        skippedRows += 1;
-        errors.push({
-          row: index + 2,
-          reason: "Missing required Name or Company",
-        });
+      if (!name || !cName) {
+        skippedRows += 1; invalidRows += 1;
+        errors.push({ row: index + 2, reason: "Missing required Lead Name or Company Name" });
         return;
       }
-
       if (email && !/^\S+@\S+\.\S+$/.test(email)) {
-        skippedRows += 1;
+        skippedRows += 1; invalidRows += 1;
         errors.push({ row: index + 2, reason: "Invalid email format" });
         return;
       }
 
-      const key = dedupeKey(name, company, email);
+      // Group key for the company.
+      const groupVal =
+        groupBy === "domain" ? (cDomainRaw || cName.toLowerCase())
+        : groupBy === "linkedin" ? (cLinkedin.toLowerCase() || cDomainRaw || cName.toLowerCase())
+        : cName.toLowerCase();
+
+      let agg = companyMap.get(groupVal);
+      if (!agg) {
+        const existing =
+          (cDomainRaw && masterByDomain.get(cDomainRaw)) ||
+          masterByName.get(cName.toLowerCase()) ||
+          (cLinkedin && masterByLinkedin.get(cLinkedin.toLowerCase())) ||
+          null;
+        agg = {
+          key: groupVal,
+          name: existing?.name || cName,
+          domain: cDomainRaw || existing?.domain || "",
+          linkedin: cLinkedin || existing?.linkedinUrl || "",
+          industry: cIndustry || existing?.industry || "",
+          location: cLocation || [existing?.city, existing?.country].filter(Boolean).join(", "),
+          size: cSize ?? existing?.employeeCount ?? null,
+          existing,
+          leadCount: 0,
+        };
+        companyMap.set(groupVal, agg);
+      } else {
+        if (!agg.domain && cDomainRaw) agg.domain = cDomainRaw;
+        if (!agg.linkedin && cLinkedin) agg.linkedin = cLinkedin;
+        if (!agg.industry && cIndustry) agg.industry = cIndustry;
+        if (!agg.location && cLocation) agg.location = cLocation;
+        if (agg.size == null && cSize != null) agg.size = cSize;
+      }
+      const canonicalCompany = agg.name; // nest under existing company name when matched
+
+      const key = dedupeKey(name, canonicalCompany, email);
       if (existingKeys.has(key)) {
-        skippedRows += 1;
-        errors.push({
-          row: index + 2,
-          reason: "Duplicate lead already exists in this funnel",
-        });
+        skippedRows += 1; duplicateLeads += 1;
+        errors.push({ row: index + 2, reason: "Duplicate lead already in this campaign" });
         return;
       }
-
       existingKeys.add(key);
+      agg.leadCount += 1;
 
-      // Build notes from notesMappings
       let notes: Record<string, string> | null = null;
       if (notesMappings.length > 0) {
         const built: Record<string, string> = {};
@@ -662,67 +743,69 @@ router.post(
         if (Object.keys(built).length > 0) notes = built;
       }
 
-      const firstStep = funnel.steps[0];
-      const initialDue = new Date(now + firstStep.dayOffset * DAY_MS);
+      const title = getField(row, LBL.title);
+      const phone = getField(row, LBL.phone);
+      const linkedinUrl = getField(row, LBL.linkedin);
       const leadId = createId("lead");
-      const eventId = createId("event");
-
       newLeads.push({
-        id: leadId,
-        funnelId: funnel.id,
-        name,
-        title,
-        company,
-        email,
-        phone,
-        linkedinUrl,
-        currentStep: 1,
-        totalSteps: funnel.steps.length,
-        status: "pending",
-        nextAction: firstStep.label,
-        nextDate: initialDue,
-        source: "CSV Import",
-        sourceType: "csv",
-        score: scoreLead({ name, title, company, email, phone, linkedinUrl }),
-        notes,
-        createdAt: new Date(now),
-        updatedAt: new Date(now),
+        id: leadId, funnelId: funnel.id, name, title, company: canonicalCompany, email, phone, linkedinUrl,
+        currentStep: 1, totalSteps: funnel.steps.length, status: "pending",
+        nextAction: firstStep.label, nextDate: new Date(now + firstStep.dayOffset * DAY_MS),
+        source: "CSV Import", sourceType: "csv",
+        score: scoreLead({ name, title, company: canonicalCompany, email, phone, linkedinUrl }),
+        companyDomain: agg.domain || null,
+        companyIndustry: agg.industry || null,
+        companyEmployeeCount: agg.size,
+        companyLocation: agg.location || null,
+        notes, createdAt: new Date(now), updatedAt: new Date(now),
       });
-
-      newEvents.push({
-        id: eventId,
-        leadId,
-        type: "imported",
-        outcome: null,
-        stepIndex: 0,
-        meta: { importId },
-        timestamp: new Date(now),
-      });
-
+      newEvents.push({ id: createId("event"), leadId, type: "imported", outcome: null, stepIndex: 0, meta: { importId }, timestamp: new Date(now) });
       importedRows += 1;
       addedLeadIds.push(leadId);
     });
 
+    const companies = [...companyMap.values()].filter((c) => c.leadCount > 0);
+    const existingCompanies = companies.filter((c) => c.existing).length;
+    const newCompanies = companies.length - existingCompanies;
+    const summary = {
+      totalRows: rows.length, importedRows, skippedRows, duplicateLeads, invalidRows,
+      companiesTotal: companies.length, existingCompanies, newCompanies, groupBy,
+    };
+
+    // Dry run → return the review preview without writing anything.
+    if (dryRun) {
+      res.json({ data: { dryRun: true, ...summary, errors: errors.slice(0, 20) } });
+      return;
+    }
+
     await db.transaction(async (tx) => {
-      // Batch insert leads (postgres.js supports large batch inserts)
-      if (newLeads.length > 0) {
-        await tx.insert(leads).values(newLeads);
+      // Upsert master companies so "company already exists" works across imports.
+      for (const c of companies) {
+        if (c.existing) {
+          await tx.update(masterCompanies)
+            .set({
+              lastSeenAt: new Date(now), updatedAt: new Date(now),
+              domain: c.existing.domain || c.domain || null,
+              linkedinUrl: c.existing.linkedinUrl || c.linkedin || null,
+              industry: c.existing.industry || c.industry || null,
+              employeeCount: c.existing.employeeCount ?? c.size,
+            })
+            .where(eq(masterCompanies.id, c.existing.id));
+        } else {
+          await tx.insert(masterCompanies).values({
+            id: createId("company"), organizationId: orgId, name: c.name,
+            domain: c.domain || null, linkedinUrl: c.linkedin || null,
+            industry: c.industry || null, employeeCount: c.size,
+            lastSeenAt: new Date(now), createdAt: new Date(now), updatedAt: new Date(now),
+          }).onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
+        }
       }
-
-      if (newEvents.length > 0) {
-        await tx.insert(leadEvents).values(newEvents);
-      }
-
+      if (newLeads.length > 0) await tx.insert(leads).values(newLeads);
+      if (newEvents.length > 0) await tx.insert(leadEvents).values(newEvents);
       await tx.insert(imports).values({
-        id: importId,
-        funnelId: funnel.id,
-        fileName: normalizedFileName,
-        totalRows: rows.length,
-        importedRows,
-        skippedRows,
-        mappings: validMappings,
-        errors: errors.slice(0, 100),
-        createdAt: new Date(now),
+        id: importId, funnelId: funnel.id, fileName: normalizedFileName,
+        totalRows: rows.length, importedRows, skippedRows,
+        mappings: fieldMappings, errors: errors.slice(0, 100), createdAt: new Date(now),
       });
     });
 
@@ -781,9 +864,7 @@ router.post(
         importId,
         funnelId: funnel.id,
         fileName: normalizedFileName,
-        totalRows: rows.length,
-        importedRows,
-        skippedRows,
+        ...summary,
         errors: errors.slice(0, 20),
         addedLeadIds,
       },
