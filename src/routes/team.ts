@@ -7,6 +7,20 @@ import { getOrgId } from "../lib/auth";
 import { ApiError } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
+import { getSetting, upsertSetting } from "../lib/settings-service";
+
+const KPI_CONFIG_KEY = "team_kpi_config";
+
+async function loadKpiConfig(orgId: string): Promise<Record<string, unknown>> {
+  const raw = await getSetting(orgId, KPI_CONFIG_KEY);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 const router = Router();
 
@@ -84,6 +98,40 @@ router.get(
         },
       },
     });
+  }),
+);
+
+// ─── GET /team/kpi-config ───────────────────────────────────────────
+// Per-member sales role / pod / daily KPI targets, keyed by lowercased email
+// so config survives the invite → accept transition. Stored in org settings.
+router.get(
+  "/team/kpi-config",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    res.json({ data: await loadKpiConfig(orgId) });
+  }),
+);
+
+// ─── PUT /team/kpi-config ───────────────────────────────────────────
+// Upsert one member's KPI config entry.
+router.put(
+  "/team/kpi-config",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const { key, role, pod, targets } = req.body || {};
+    if (!key || typeof key !== "string") throw new ApiError(400, "key is required");
+
+    const config = await loadKpiConfig(orgId);
+    const k = key.toLowerCase();
+    const prev = (config[k] as Record<string, unknown>) || {};
+    config[k] = {
+      ...prev,
+      ...(role !== undefined ? { role } : {}),
+      ...(pod !== undefined ? { pod } : {}),
+      ...(targets !== undefined ? { targets } : {}),
+    };
+    await upsertSetting(orgId, KPI_CONFIG_KEY, JSON.stringify(config));
+    res.json({ data: config });
   }),
 );
 
