@@ -371,4 +371,115 @@ router.get(
   }),
 );
 
+/**
+ * GET /api/companies/list
+ *
+ * Flat, filterable company list for the org Leads page "Companies" table.
+ * Lead counts come from scraperContacts (consistent with the Leads view and
+ * company-counts); company metadata (industry, size, location, funding) is
+ * pulled from scraperSignals, which carry the richest company fields.
+ */
+router.get(
+  "/companies/list",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+
+    const [contactRows, signalRows] = await Promise.all([
+      db
+        .select({
+          company: scraperContacts.currentCompany,
+          companyName: scraperContacts.companyName,
+          domain: scraperContacts.companyDomain,
+          linkedinUrl: scraperContacts.companyLinkedinUrl,
+          email: scraperContacts.email,
+          enrichmentStatus: scraperContacts.enrichmentStatus,
+          status: scraperContacts.status,
+        })
+        .from(scraperContacts)
+        .where(eq(scraperContacts.organizationId, orgId))
+        .limit(20000),
+      db
+        .select({
+          company: scraperSignals.company,
+          domain: scraperSignals.companyDomain,
+          linkedinUrl: scraperSignals.companyLinkedinUrl,
+          industry: scraperSignals.companyIndustry,
+          employeeCount: scraperSignals.companyEmployeeCount,
+          fundingStage: scraperSignals.companyFundingStage,
+          country: scraperSignals.companyCountry,
+          city: scraperSignals.companyCity,
+          logo: scraperSignals.companyLogo,
+        })
+        .from(scraperSignals)
+        .where(eq(scraperSignals.organizationId, orgId))
+        .limit(20000),
+    ]);
+
+    // Company metadata keyed by normalised name (first non-null wins).
+    const meta = new Map<string, Record<string, unknown>>();
+    for (const s of signalRows) {
+      const key = norm(s.company);
+      if (!key) continue;
+      const e = meta.get(key) || {};
+      meta.set(key, {
+        domain: e.domain || s.domain || null,
+        linkedinUrl: e.linkedinUrl || s.linkedinUrl || null,
+        industry: e.industry || s.industry || null,
+        employeeCount: e.employeeCount || s.employeeCount || null,
+        fundingStage: e.fundingStage || s.fundingStage || null,
+        country: e.country || s.country || null,
+        city: e.city || s.city || null,
+        logo: e.logo || s.logo || null,
+      });
+    }
+
+    type Agg = {
+      name: string;
+      leadCount: number;
+      enrichedCount: number;
+      inCampaignCount: number;
+      domain: string | null;
+      linkedinUrl: string | null;
+    };
+    const map = new Map<string, Agg>();
+    for (const c of contactRows) {
+      const display = (c.company || c.companyName || "").trim();
+      if (!display) continue;
+      const key = norm(display);
+      let row = map.get(key);
+      if (!row) {
+        row = { name: display, leadCount: 0, enrichedCount: 0, inCampaignCount: 0, domain: c.domain || null, linkedinUrl: c.linkedinUrl || null };
+        map.set(key, row);
+      }
+      row.leadCount++;
+      if (c.email || c.enrichmentStatus === "enriched") row.enrichedCount++;
+      if (c.status === "in_funnel") row.inCampaignCount++;
+      if (!row.domain && c.domain) row.domain = c.domain;
+      if (!row.linkedinUrl && c.linkedinUrl) row.linkedinUrl = c.linkedinUrl;
+    }
+
+    const list = Array.from(map.entries())
+      .map(([key, row]) => {
+        const m = meta.get(key) || {};
+        return {
+          name: row.name,
+          domain: row.domain || (m.domain as string | null) || null,
+          linkedinUrl: row.linkedinUrl || (m.linkedinUrl as string | null) || null,
+          industry: (m.industry as string | null) || null,
+          employeeCount: (m.employeeCount as number | null) || null,
+          fundingStage: (m.fundingStage as string | null) || null,
+          country: (m.country as string | null) || null,
+          city: (m.city as string | null) || null,
+          logo: (m.logo as string | null) || null,
+          leadCount: row.leadCount,
+          enrichedCount: row.enrichedCount,
+          inCampaignCount: row.inCampaignCount,
+        };
+      })
+      .sort((a, b) => b.leadCount - a.leadCount);
+
+    res.json({ data: list });
+  }),
+);
+
 export default router;
