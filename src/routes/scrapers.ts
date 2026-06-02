@@ -624,6 +624,9 @@ router.get(
       orderBy: sortOrder === "asc" ? sortColumn : desc(sortColumn),
       limit: pageSize,
       offset: (page - 1) * pageSize,
+      // Exclude the heavy raw provider payload — it's never used by the
+      // client and dominates the response size (10s+ loads on big results).
+      columns: { rawData: false },
     });
 
     res.json({

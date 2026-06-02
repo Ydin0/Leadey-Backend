@@ -27,6 +27,43 @@ function asyncHandler(handler: AsyncHandler) {
   };
 }
 
+/** Filter params shared by the contacts list and bulk actions. */
+interface ContactFilterQuery {
+  assignmentId?: string;
+  status?: string;
+  enrichmentStatus?: string;
+  company?: string;
+  title?: string;
+  location?: string;
+  hasEmail?: string;
+  hasPhone?: string;
+}
+
+/** Builds the WHERE conditions for scraper contacts from a filter set —
+ *  the single source of truth for both `GET /contacts` and the
+ *  "all matching" bulk actions, so the two never drift apart. */
+function buildContactConditions(orgId: string, q: ContactFilterQuery) {
+  const conditions = [eq(scraperContacts.organizationId, orgId)];
+  if (q.assignmentId) conditions.push(eq(scraperContacts.assignmentId, q.assignmentId));
+  if (q.status) conditions.push(eq(scraperContacts.status, q.status));
+  if (q.enrichmentStatus) conditions.push(eq(scraperContacts.enrichmentStatus, q.enrichmentStatus));
+  if (q.company) {
+    const companies = q.company.split(",").map((c) => c.trim()).filter(Boolean);
+    if (companies.length === 1) {
+      conditions.push(ilike(scraperContacts.companyName, `%${companies[0]}%`));
+    } else if (companies.length > 1) {
+      conditions.push(or(...companies.map((c) => ilike(scraperContacts.companyName, `%${c}%`)))!);
+    }
+  }
+  if (q.title) conditions.push(ilike(scraperContacts.currentTitle, `%${q.title}%`));
+  if (q.location) conditions.push(ilike(scraperContacts.location, `%${q.location}%`));
+  if (q.hasEmail === "true") conditions.push(isNotNull(scraperContacts.email));
+  else if (q.hasEmail === "false") conditions.push(isNull(scraperContacts.email));
+  if (q.hasPhone === "true") conditions.push(isNotNull(scraperContacts.phone));
+  else if (q.hasPhone === "false") conditions.push(isNull(scraperContacts.phone));
+  return conditions;
+}
+
 function getApifyClient(): ApifyClient {
   const token = process.env.APIFY_API_TOKEN;
   if (!token) {
@@ -508,35 +545,16 @@ router.get(
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize as string) || 25));
 
-    const conditions = [eq(scraperContacts.organizationId, orgId)];
-    if (assignmentId) conditions.push(eq(scraperContacts.assignmentId, assignmentId));
-    if (status) conditions.push(eq(scraperContacts.status, status));
-    if (enrichmentStatus) conditions.push(eq(scraperContacts.enrichmentStatus, enrichmentStatus));
-    if (company) {
-      // Support comma-separated company names for multi-select
-      const companies = company.split(",").map((c) => c.trim()).filter(Boolean);
-      if (companies.length === 1) {
-        conditions.push(ilike(scraperContacts.companyName, `%${companies[0]}%`));
-      } else if (companies.length > 1) {
-        conditions.push(or(...companies.map((c) => ilike(scraperContacts.companyName, `%${c}%`)))!);
-      }
-    }
-    if (title) {
-      conditions.push(ilike(scraperContacts.currentTitle, `%${title}%`));
-    }
-    if (location) {
-      conditions.push(ilike(scraperContacts.location, `%${location}%`));
-    }
-    if (hasEmail === "true") {
-      conditions.push(isNotNull(scraperContacts.email));
-    } else if (hasEmail === "false") {
-      conditions.push(isNull(scraperContacts.email));
-    }
-    if (hasPhone === "true") {
-      conditions.push(isNotNull(scraperContacts.phone));
-    } else if (hasPhone === "false") {
-      conditions.push(isNull(scraperContacts.phone));
-    }
+    const conditions = buildContactConditions(orgId, {
+      assignmentId,
+      status,
+      enrichmentStatus,
+      company,
+      title,
+      location,
+      hasEmail,
+      hasPhone,
+    });
 
     const whereClause = and(...conditions);
 
@@ -813,10 +831,17 @@ router.post(
   "/contacts/send-to-funnel",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { contactIds, funnelId } = req.body as { contactIds: string[]; funnelId: string };
+    const { contactIds, funnelId, allMatching, filters } = req.body as {
+      contactIds?: string[];
+      funnelId: string;
+      allMatching?: boolean;
+      filters?: ContactFilterQuery;
+    };
 
-    if (!contactIds?.length) throw new ApiError(400, "contactIds is required");
     if (!funnelId) throw new ApiError(400, "funnelId is required");
+    if (!allMatching && !contactIds?.length) {
+      throw new ApiError(400, "contactIds or allMatching is required");
+    }
 
     // Load funnel with steps
     const [funnel] = await db
@@ -833,16 +858,19 @@ router.post(
       .orderBy(funnelSteps.sortOrder);
     if (steps.length === 0) throw new ApiError(400, "Funnel has no steps configured");
 
-    // Fetch contacts
+    // Resolve the contacts: either the explicit selection, or every contact
+    // matching the current filter set ("Select all matching").
+    const contactWhere = allMatching
+      ? and(...buildContactConditions(orgId, filters || {}))
+      : and(
+          eq(scraperContacts.organizationId, orgId),
+          inArray(scraperContacts.id, contactIds!),
+        );
+
     const contacts = await db
       .select()
       .from(scraperContacts)
-      .where(
-        and(
-          eq(scraperContacts.organizationId, orgId),
-          inArray(scraperContacts.id, contactIds),
-        ),
-      );
+      .where(contactWhere);
     if (contacts.length === 0) throw new ApiError(404, "No contacts found");
 
     // Load existing leads for dedup
