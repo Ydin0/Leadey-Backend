@@ -20,6 +20,7 @@ import teamRouter from "./routes/team";
 import dialerRouter from "./routes/dialer";
 import opportunitiesRouter from "./routes/opportunities";
 import companiesRouter from "./routes/companies";
+import leadStatusesRouter from "./routes/lead-statuses";
 import searchRouter from "./routes/search";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
@@ -73,6 +74,7 @@ app.use("/api", requireAuth(), planGuard(), templatesRouter);
 app.use("/api", requireAuth(), dialerRouter);
 app.use("/api", requireAuth(), opportunitiesRouter);
 app.use("/api", requireAuth(), companiesRouter);
+app.use("/api", requireAuth(), leadStatusesRouter);
 app.use("/api", requireAuth(), searchRouter);
 
 // Unauthenticated webhook routes

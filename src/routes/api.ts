@@ -33,6 +33,7 @@ import {
 } from "../lib/funnel-service";
 import { SmartleadClient, type SmartleadSequence, type SmartleadLeadInput } from "../lib/smartlead-client";
 import { getSetting } from "../lib/settings-service";
+import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getOrgId } from "../lib/auth";
 
 const router = Router();
@@ -787,6 +788,49 @@ router.post(
         addedLeadIds,
       },
     });
+  }),
+);
+
+// ─── PATCH /funnels/:funnelId/leads/:leadId/status ───────────────────────
+// Manually set a lead's status (built-in or custom) and record the change.
+
+router.patch(
+  "/funnels/:funnelId/leads/:leadId/status",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const status = normalizeString(req.body && req.body.status).toLowerCase();
+
+    const statuses = await getMergedLeadStatuses(orgId);
+    if (!status || !statuses.some((s) => s.key === status)) {
+      throw new ApiError(400, "Invalid lead status");
+    }
+
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) {
+      throw new ApiError(404, "Lead not found in funnel");
+    }
+
+    const now = Date.now();
+    await db.insert(leadEvents).values({
+      id: createId("event"),
+      leadId: lead.id,
+      type: "status_change",
+      outcome: status,
+      stepIndex: Math.max((lead.currentStep || 1) - 1, 0),
+      meta: { manual: true },
+      timestamp: new Date(now),
+    });
+
+    await db
+      .update(leads)
+      .set({ status, updatedAt: new Date(now) })
+      .where(eq(leads.id, lead.id));
+
+    res.json({ data: { id: lead.id, status } });
   }),
 );
 
