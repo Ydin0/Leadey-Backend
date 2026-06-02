@@ -595,9 +595,15 @@ router.post(
       userName: bodyUserName,
     } = req.body;
 
-    if (!direction || !fromNumber || !toNumber) {
-      throw new ApiError(400, "direction, fromNumber, and toNumber are required");
+    if (!direction) {
+      throw new ApiError(400, "direction is required");
     }
+    // Be lenient on the numbers: a call record should NEVER be silently
+    // dropped just because a number came through empty (e.g. the Twilio Voice
+    // SDK not populating call.parameters for outbound legs). Storing the call
+    // with a placeholder is far better than losing it from the activity log.
+    const safeFrom = (fromNumber && String(fromNumber).trim()) || "Unknown";
+    const safeTo = (toNumber && String(toNumber).trim()) || "Unknown";
 
     // Always attribute the call to the authenticated user — never trust the
     // client for this. We look up the display name from the users table so the
@@ -626,8 +632,8 @@ router.post(
         lineId: lineId || null,
         twilioCallSid: twilioCallSid || null,
         direction,
-        fromNumber,
-        toNumber,
+        fromNumber: safeFrom,
+        toNumber: safeTo,
         contactName: contactName || null,
         companyName: companyName || null,
         duration: duration ?? 0,
