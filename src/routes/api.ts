@@ -510,17 +510,113 @@ router.patch(
   "/funnels/:funnelId",
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
-    const { status } = req.body || {};
-    const normalizedStatus = normalizeString(status).toLowerCase();
-
-    if (!normalizedStatus || !ALLOWED_STATUSES.has(normalizedStatus)) {
-      throw new ApiError(400, "Invalid funnel status");
-    }
+    const body = req.body || {};
+    const hasStatus = body.status !== undefined;
+    const hasName = body.name !== undefined;
+    const hasDescription = body.description !== undefined;
+    const hasSteps = Array.isArray(body.steps);
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
       req.params.funnelId,
     );
+
+    // ── Editing name / description / steps ──────────────────────────────
+    if (hasName || hasDescription || hasSteps) {
+      const funnelUpdates: Record<string, unknown> = {};
+
+      if (hasName) {
+        const name = normalizeString(body.name);
+        if (!name) throw new ApiError(400, "Funnel name cannot be empty");
+        funnelUpdates.name = name;
+      }
+      if (hasDescription) {
+        funnelUpdates.description = normalizeString(body.description);
+      }
+
+      let normalizedSteps: Array<{
+        id: string;
+        channel: string;
+        label: string;
+        dayOffset: number;
+        subject: string | null;
+        emailBody: string | null;
+        action: string;
+      }> | null = null;
+
+      if (hasSteps) {
+        if (body.steps.length === 0) {
+          throw new ApiError(400, "At least one funnel step is required");
+        }
+        normalizedSteps = body.steps
+          .map(
+            (
+              step: { channel?: string; label?: string; dayOffset?: number; subject?: string; emailBody?: string; action?: string },
+              index: number,
+            ) => {
+              const channel = normalizeString(step.channel).toLowerCase();
+              const label = normalizeString(step.label) || `Step ${index + 1}`;
+              const dayOffset = Number(step.dayOffset);
+              const subject = normalizeString(step.subject) || null;
+              const emailBody = normalizeString(step.emailBody) || null;
+              const action = resolveAction(channel, step.action || null);
+              if (!ALLOWED_CHANNELS.has(channel)) {
+                throw new ApiError(400, `Invalid channel for step ${index + 1}`);
+              }
+              if (!Number.isFinite(dayOffset) || dayOffset < 0) {
+                throw new ApiError(400, `Invalid dayOffset for step ${index + 1}`);
+              }
+              return { id: createId("step"), channel, label, dayOffset, subject, emailBody, action };
+            },
+          )
+          .sort((a: { dayOffset: number }, b: { dayOffset: number }) => a.dayOffset - b.dayOffset);
+      }
+
+      await db.transaction(async (tx) => {
+        if (Object.keys(funnelUpdates).length > 0) {
+          await tx.update(funnels).set(funnelUpdates).where(eq(funnels.id, funnel.id));
+        }
+
+        if (normalizedSteps) {
+          // Replace the step set, then clamp every lead's progress to the new
+          // length so currentStep can't point past the end of the sequence.
+          await tx.delete(funnelSteps).where(eq(funnelSteps.funnelId, funnel.id));
+          await tx.insert(funnelSteps).values(
+            normalizedSteps.map((step, index) => ({
+              id: step.id,
+              funnelId: funnel.id,
+              channel: step.channel,
+              label: step.label,
+              dayOffset: step.dayOffset,
+              sortOrder: index,
+              subject: step.subject,
+              emailBody: step.emailBody,
+              action: step.action,
+            })),
+          );
+          const newLen = normalizedSteps.length;
+          await tx
+            .update(leads)
+            .set({
+              totalSteps: newLen,
+              currentStep: sql`LEAST(${leads.currentStep}, ${newLen})`,
+              updatedAt: new Date(),
+            })
+            .where(eq(leads.funnelId, funnel.id));
+        }
+      });
+
+      const reloaded = await loadFunnel(orgId, req.params.funnelId);
+      res.json({ data: buildFunnelPayload(reloaded!, { includeLeads: true }) });
+      return;
+    }
+
+    // ── Status change (existing behavior) ───────────────────────────────
+    const normalizedStatus = normalizeString(body.status).toLowerCase();
+
+    if (!hasStatus || !normalizedStatus || !ALLOWED_STATUSES.has(normalizedStatus)) {
+      throw new ApiError(400, "Invalid funnel status");
+    }
 
     await db
       .update(funnels)
@@ -1026,6 +1122,123 @@ router.post(
     const updatedLead = updatedFunnel!.leads.find(
       (l) => l.id === req.params.leadId,
     );
+
+    res.json({
+      data: {
+        lead: updatedLead
+          ? {
+              id: updatedLead.id,
+              name: updatedLead.name,
+              title: updatedLead.title,
+              company: updatedLead.company,
+              email: updatedLead.email,
+              phone: updatedLead.phone,
+              linkedinUrl: updatedLead.linkedinUrl,
+              currentStep: updatedLead.currentStep,
+              totalSteps: updatedLead.totalSteps,
+              status: updatedLead.status,
+              nextAction: updatedLead.nextAction,
+              nextDate: updatedLead.nextDate?.toISOString() ?? null,
+              source: updatedLead.source,
+              sourceType: updatedLead.sourceType,
+              score: updatedLead.score,
+              notes: updatedLead.notes,
+              createdAt: updatedLead.createdAt.toISOString(),
+              updatedAt: updatedLead.updatedAt.toISOString(),
+              events: updatedLead.events.map((e) => ({
+                id: e.id,
+                type: e.type,
+                outcome: e.outcome,
+                stepIndex: e.stepIndex,
+                meta: e.meta,
+                timestamp: e.timestamp.toISOString(),
+              })),
+            }
+          : null,
+        funnel: buildFunnelPayload(updatedFunnel!, { includeLeads: true }),
+      },
+    });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/leads/:leadId/log-call ──────────────────────
+// Records a real phone call against a lead. Always logs a call touch (so the
+// call counter increments), and ticks the step forward ONLY when the lead's
+// current step is a call-channel step — so repeat calls on a later step don't
+// over-advance the sequence.
+router.post(
+  "/funnels/:funnelId/leads/:leadId/log-call",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const outcome =
+      normalizeString(req.body && req.body.outcome).toLowerCase() || "completed";
+
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) {
+      throw new ApiError(404, "Lead not found in funnel");
+    }
+
+    const now = Date.now();
+    const currentStepIndex = clamp(
+      (lead.currentStep || 1) - 1,
+      0,
+      Math.max(funnel.steps.length - 1, 0),
+    );
+    const step = funnel.steps[currentStepIndex];
+    const isCallStep = (step?.channel ?? "").toLowerCase() === "call";
+
+    // Always log the call as a call-channel touch so it counts toward the
+    // lead's call activity, regardless of which step they're on.
+    await db.insert(leadEvents).values({
+      id: createId("event"),
+      leadId: lead.id,
+      type: "step_outcome",
+      outcome,
+      stepIndex: currentStepIndex,
+      meta: { channel: "call", action: step?.action ?? "call" },
+      timestamp: new Date(now),
+    });
+
+    // Tick the step forward only when the current step is a call step and the
+    // lead isn't already in a terminal state.
+    let newCurrentStep = lead.currentStep;
+    let newStatus = lead.status;
+    let newNextAction = lead.nextAction;
+    let newNextDate = lead.nextDate ?? new Date(now);
+
+    if (isCallStep && !TERMINAL_STATUSES.has(lead.status)) {
+      const schedule = computeNextStepSchedule(funnel.steps, currentStepIndex, now);
+      if (schedule.completed) {
+        newStatus = "completed";
+        newNextAction = schedule.nextAction;
+        newNextDate = new Date(schedule.nextDate);
+        newCurrentStep = funnel.steps.length;
+      } else {
+        newCurrentStep = clamp((lead.currentStep || 1) + 1, 1, funnel.steps.length);
+        newStatus = "pending";
+        newNextAction = schedule.nextAction;
+        newNextDate = new Date(schedule.nextDate);
+      }
+    }
+
+    await db
+      .update(leads)
+      .set({
+        status: newStatus,
+        nextAction: newNextAction,
+        nextDate: newNextDate,
+        currentStep: newCurrentStep,
+        updatedAt: new Date(now),
+      })
+      .where(eq(leads.id, lead.id));
+
+    const updatedFunnel = await loadFunnel(orgId, req.params.funnelId);
+    const updatedLead = updatedFunnel!.leads.find((l) => l.id === req.params.leadId);
 
     res.json({
       data: {
