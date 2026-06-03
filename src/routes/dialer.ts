@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc, asc, inArray, isNull, sql } from "drizzle-orm";
+import { eq, and, or, desc, asc, inArray, isNull, sql } from "drizzle-orm";
 import multer from "multer";
 import twilioSdk from "twilio";
 import { getAuth } from "@clerk/express";
@@ -560,18 +560,28 @@ router.post(
     // Resolve master contacts by linkedinUrl (preferred) then email.
     const linkedinUrls = candidateLeads.map((l) => l.linkedinUrl).filter(Boolean) as string[];
     const emails = candidateLeads.map((l) => l.email).filter(Boolean) as string[];
-    const masterRows =
-      linkedinUrls.length || emails.length
-        ? await db
-            .select()
-            .from(masterContacts)
-            .where(
-              and(
-                eq(masterContacts.organizationId, orgId),
-                sql`(${masterContacts.linkedinUrl} = ANY(${linkedinUrls}) OR LOWER(${masterContacts.email}) = ANY(${emails.map((e) => e.toLowerCase())}))`,
-              ),
-            )
-        : [];
+
+    // Build the OR match conditions, skipping any empty side — passing an empty
+    // array to `= ANY()` makes Postgres throw "op ANY/ALL (array) requires array
+    // on right side", which is what blocked the dialer from starting.
+    const matchConds = [];
+    if (linkedinUrls.length) {
+      matchConds.push(inArray(masterContacts.linkedinUrl, linkedinUrls));
+    }
+    if (emails.length) {
+      matchConds.push(
+        inArray(
+          sql`LOWER(${masterContacts.email})`,
+          emails.map((e) => e.toLowerCase()),
+        ),
+      );
+    }
+    const masterRows = matchConds.length
+      ? await db
+          .select()
+          .from(masterContacts)
+          .where(and(eq(masterContacts.organizationId, orgId), or(...matchConds)))
+      : [];
     const masterByUrl = new Map<string, typeof masterContacts.$inferSelect>();
     const masterByEmail = new Map<string, typeof masterContacts.$inferSelect>();
     for (const m of masterRows) {
