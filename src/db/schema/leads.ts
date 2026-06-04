@@ -1,4 +1,4 @@
-import { pgTable, text, integer, jsonb, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, jsonb, timestamp, boolean } from "drizzle-orm/pg-core";
 import { funnels } from "./funnels";
 
 export const leads = pgTable("leads", {
@@ -29,6 +29,10 @@ export const leads = pgTable("leads", {
   companyAnnualRevenue: text("company_annual_revenue"),
   /** Roles the company is actively hiring for (job-scraper signal). */
   companyHiringRoles: jsonb("company_hiring_roles").$type<string[]>(),
+  /** Per-PERSON Do-Not-Contact flag (compliance). Non-destructive: the lead
+   *  stays in the campaign but is shown in red and calls are confirmed first.
+   *  Mirrored onto master_contacts.doNotCall so it follows the person. */
+  doNotCall: boolean("do_not_call").notNull().default(false),
   smartleadLeadId: text("smartlead_lead_id"),
   unipileProviderId: text("unipile_provider_id"),
   /** Set once the lead is converted to an Opportunity. The lead stays

@@ -53,6 +53,7 @@ export interface Lead {
   companyLinkedin?: string | null;
   companyAnnualRevenue?: string | null;
   companyHiringRoles?: string[] | null;
+  doNotCall?: boolean;
   notes: Record<string, string> | null;
   createdAt: Date;
   updatedAt: Date;
@@ -97,6 +98,7 @@ function serializeLead(lead: Lead) {
     companyLinkedin: lead.companyLinkedin,
     companyAnnualRevenue: lead.companyAnnualRevenue,
     companyHiringRoles: lead.companyHiringRoles,
+    doNotCall: lead.doNotCall ?? false,
     notes: lead.notes,
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),

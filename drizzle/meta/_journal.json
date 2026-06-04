@@ -155,6 +155,13 @@
       "when": 1780577062824,
       "tag": "0021_premium_war_machine",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1780586348556,
+      "tag": "0022_small_wolfpack",
+      "breakpoints": true
     }
   ]
 }

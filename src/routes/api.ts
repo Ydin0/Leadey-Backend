@@ -55,6 +55,7 @@ import { SmartleadClient, type SmartleadSequence, type SmartleadLeadInput } from
 import { getSetting } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getOrgId } from "../lib/auth";
+import { flagDoNotCall } from "../lib/dnc";
 
 const router = Router();
 
@@ -137,6 +138,7 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
       companyLinkedin: l.companyLinkedin,
       companyAnnualRevenue: l.companyAnnualRevenue,
       companyHiringRoles: l.companyHiringRoles,
+      doNotCall: l.doNotCall,
       opportunityId: l.opportunityId,
       notes: l.notes,
       createdAt: l.createdAt,
@@ -208,6 +210,7 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
       companyLinkedin: l.companyLinkedin,
       companyAnnualRevenue: l.companyAnnualRevenue,
       companyHiringRoles: l.companyHiringRoles,
+      doNotCall: l.doNotCall,
       opportunityId: l.opportunityId,
       notes: l.notes,
       createdAt: l.createdAt,
@@ -1052,12 +1055,19 @@ router.patch(
       timestamp: new Date(now),
     });
 
+    // Status is company-level: apply to EVERY contact at this company in the
+    // funnel so the company reads as one status.
     await db
       .update(leads)
       .set({ status, updatedAt: new Date(now) })
-      .where(eq(leads.id, lead.id));
+      .where(
+        and(
+          eq(leads.funnelId, funnel.id),
+          sql`lower(${leads.company}) = lower(${lead.company})`,
+        ),
+      );
 
-    res.json({ data: { id: lead.id, status } });
+    res.json({ data: { id: lead.id, status, company: lead.company } });
   }),
 );
 
@@ -1329,15 +1339,16 @@ router.post(
 );
 
 // ─── POST /funnels/:funnelId/leads/:leadId/dnc ───────────────────────────
-// Marks a single PERSON as Do-Not-Call (legal/compliance) and removes them
-// from EVERY campaign in the org — without touching the rest of their company.
-// Identity is matched by email / linkedin / phone so the same person is pulled
-// from all funnels they appear in. The DNC flag lives on the master contact so
-// it persists and is honoured by the dialer + future imports.
+// Toggles a single PERSON's Do-Not-Contact flag (compliance). NON-DESTRUCTIVE:
+// the person STAYS in every campaign — their lead rows just get flagged (shown
+// in red, with a confirm before any call). Matched by email/linkedin/phone so
+// the flag follows the person everywhere; mirrored onto the master contact.
+// Body: { value?: boolean } (default true).
 router.post(
   "/funnels/:funnelId/leads/:leadId/dnc",
   asyncHandler<LeadAdvanceParams>(async (req, res) => {
     const orgId = getOrgId(req);
+    const value = req.body?.value === undefined ? true : !!req.body.value;
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
@@ -1346,85 +1357,16 @@ router.post(
     const lead = funnel.leads.find((l) => l.id === req.params.leadId);
     if (!lead) throw new ApiError(404, "Lead not found in funnel");
 
-    const email = normalizeString(lead.email).toLowerCase();
-    const linkedinUrl = normalizeString(lead.linkedinUrl);
-    const phoneDigits = normalizeString(lead.phone).replace(/\D/g, "");
-
-    // Build the person-identity match used both to flag the master contact and
-    // to delete leads. Each non-empty identifier contributes an OR clause.
-    const leadIdConds = [];
-    if (email) leadIdConds.push(sql`LOWER(${leads.email}) = ${email}`);
-    if (linkedinUrl) leadIdConds.push(eq(leads.linkedinUrl, linkedinUrl));
-    if (phoneDigits.length >= 7) {
-      leadIdConds.push(
-        sql`regexp_replace(${leads.phone}, '[^0-9]', '', 'g') = ${phoneDigits}`,
-      );
-    }
-    // Fallback: if we somehow have no identifier, scope to just this lead row.
-    if (leadIdConds.length === 0) leadIdConds.push(eq(leads.id, lead.id));
-
-    // 1) Flag the master contact(s) for this person as Do-Not-Call.
-    const masterConds = [];
-    if (linkedinUrl) masterConds.push(eq(masterContacts.linkedinUrl, linkedinUrl));
-    if (email) masterConds.push(sql`LOWER(${masterContacts.email}) = ${email}`);
-    if (phoneDigits.length >= 7) {
-      masterConds.push(
-        sql`regexp_replace(${masterContacts.phone}, '[^0-9]', '', 'g') = ${phoneDigits}`,
-      );
-    }
-    let flaggedMaster = 0;
-    if (masterConds.length) {
-      const updated = await db
-        .update(masterContacts)
-        .set({ doNotCall: true, updatedAt: new Date() })
-        .where(and(eq(masterContacts.organizationId, orgId), or(...masterConds)))
-        .returning({ id: masterContacts.id });
-      flaggedMaster = updated.length;
-    }
-    // If no master row exists yet, create one so the DNC flag persists and
-    // future imports/dialer runs skip this person.
-    if (flaggedMaster === 0) {
-      const [first = "", ...rest] = normalizeString(lead.name).split(/\s+/);
-      await db
-        .insert(masterContacts)
-        .values({
-          id: createId("mc"),
-          organizationId: orgId,
-          linkedinUrl: linkedinUrl || null,
-          firstName: first || null,
-          lastName: rest.join(" ") || null,
-          fullName: normalizeString(lead.name) || null,
-          currentTitle: normalizeString(lead.title) || null,
-          currentCompany: normalizeString(lead.company) || null,
-          email: email || null,
-          phone: normalizeString(lead.phone) || null,
-          doNotCall: true,
-        })
-        .onConflictDoUpdate({
-          target: [masterContacts.organizationId, masterContacts.linkedinUrl],
-          set: { doNotCall: true, updatedAt: new Date() },
-        });
-    }
-
-    // 2) Remove the person from EVERY campaign in this org.
-    const orgFunnelIds = (
-      await db.select({ id: funnels.id }).from(funnels).where(eq(funnels.organizationId, orgId))
-    ).map((f) => f.id);
-
-    let removed = 0;
-    if (orgFunnelIds.length) {
-      const deleted = await db
-        .delete(leads)
-        .where(and(inArray(leads.funnelId, orgFunnelIds), or(...leadIdConds)))
-        .returning({ id: leads.id });
-      removed = deleted.length;
-    }
+    const result = await db.transaction((tx) =>
+      flagDoNotCall(tx, orgId, lead, value),
+    );
 
     const refreshed = await loadFunnel(orgId, req.params.funnelId);
     res.json({
       data: {
         name: lead.name,
-        removedFromCampaigns: removed,
+        doNotCall: value,
+        flaggedLeads: result.flaggedLeads,
         funnel: buildFunnelPayload(refreshed!, { includeLeads: true }),
       },
     });

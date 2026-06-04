@@ -18,6 +18,7 @@ import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { seedSystemDispositions } from "../lib/dialer-seed";
+import { flagDoNotCall } from "../lib/dnc";
 import {
   saveVoicemailFile,
   deleteVoicemailFile,
@@ -458,6 +459,7 @@ function serializeQueueItem(
           status: lead.status,
           currentStep: lead.currentStep,
           totalSteps: lead.totalSteps,
+          doNotCall: lead.doNotCall,
         }
       : undefined,
     masterContact: master
@@ -917,6 +919,9 @@ router.post(
       // Apply funnel action to the lead
       const [lead] = await tx.select().from(leads).where(eq(leads.id, current.leadId));
       if (lead) {
+        const leadStatus = disposition.leadStatus ?? null;
+
+        // 1) Step / schedule movement for the dialed contact.
         if (action === "advance") {
           await tx
             .update(leads)
@@ -926,58 +931,43 @@ router.post(
               updatedAt: new Date(),
             })
             .where(eq(leads.id, lead.id));
-          await tx.insert(leadEvents).values({
-            id: createId("le"),
-            leadId: lead.id,
-            type: "call",
-            outcome: dispositionSlug,
-            stepIndex: lead.currentStep,
-            meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action },
-          });
         } else if (action === "retry") {
           const nextDate = retryDays ? new Date(Date.now() + retryDays * 86400000) : new Date();
           await tx
             .update(leads)
             .set({ nextDate, updatedAt: new Date() })
             .where(eq(leads.id, lead.id));
-          await tx.insert(leadEvents).values({
-            id: createId("le"),
-            leadId: lead.id,
-            type: "call",
-            outcome: dispositionSlug,
-            stepIndex: lead.currentStep,
-            meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action, retryDays },
-          });
-        } else if (action === "drop") {
+        }
+
+        // 2) Company-shared status — apply to EVERY contact at this company in
+        //    the funnel so status reads as a company-level state.
+        if (leadStatus) {
           await tx
             .update(leads)
-            .set({ status: "lost", updatedAt: new Date() })
-            .where(eq(leads.id, lead.id));
-          await tx.insert(leadEvents).values({
-            id: createId("le"),
-            leadId: lead.id,
-            type: "call",
-            outcome: dispositionSlug,
-            stepIndex: lead.currentStep,
-            meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action },
-          });
-          // DNC disposition → also flip master_contact
-          if (dispositionSlug === "do-not-call" && current.masterContactId) {
-            await tx
-              .update(masterContacts)
-              .set({ doNotCall: true, updatedAt: new Date() })
-              .where(eq(masterContacts.id, current.masterContactId));
-          }
-        } else {
-          await tx.insert(leadEvents).values({
-            id: createId("le"),
-            leadId: lead.id,
-            type: "call",
-            outcome: dispositionSlug,
-            stepIndex: lead.currentStep,
-            meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action: "none" },
-          });
+            .set({ status: leadStatus, updatedAt: new Date() })
+            .where(
+              and(
+                eq(leads.funnelId, lead.funnelId),
+                sql`lower(${leads.company}) = lower(${lead.company})`,
+              ),
+            );
         }
+
+        // 3) Do-Not-Contact — flag the PERSON (non-destructive). They stay in
+        //    the campaign; the UI shows them red + confirms before calling.
+        if (action === "dnc" || dispositionSlug === "do-not-call") {
+          await flagDoNotCall(tx, s.organizationId, lead, true);
+        }
+
+        // 4) Log the call touch (counts toward the campaign call counter).
+        await tx.insert(leadEvents).values({
+          id: createId("le"),
+          leadId: lead.id,
+          type: "call",
+          outcome: dispositionSlug,
+          stepIndex: lead.currentStep,
+          meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action, leadStatus, retryDays },
+        });
       }
 
       // Find next pending item; promote to in_progress.

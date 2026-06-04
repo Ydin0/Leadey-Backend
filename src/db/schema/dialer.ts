@@ -32,7 +32,11 @@ export const callDispositions = pgTable(
     outcomeBucket: text("outcome_bucket").notNull(),
     /** Default funnel action when this disposition is chosen. Step-specific
      *  overrides live in `funnel_disposition_rules`. */
-    funnelAction: text("funnel_action").notNull().default("none"), // advance|retry|drop|none
+    funnelAction: text("funnel_action").notNull().default("none"), // advance|retry|drop|none|dnc
+    /** Campaign lead status to apply (company-shared) when this disposition is
+     *  chosen, e.g. "contacted", "callback", "not_interested". null = leave the
+     *  status untouched (e.g. the do-not-call flag). */
+    leadStatus: text("lead_status"),
     retryAfterDays: integer("retry_after_days"),
     sortOrder: integer("sort_order").notNull().default(0),
     /** "1".."9" — keyboard shortcut in the dialer UI */
