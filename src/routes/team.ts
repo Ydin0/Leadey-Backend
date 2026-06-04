@@ -1,8 +1,10 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, count } from "drizzle-orm";
+import { eq, and, count, gte, sql } from "drizzle-orm";
 import { clerkClient } from "@clerk/express";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
+import { callRecords } from "../db/schema/call-records";
+import { opportunities } from "../db/schema/opportunities";
 import { getOrgId } from "../lib/auth";
 import { ApiError } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
@@ -305,6 +307,93 @@ router.delete(
     } catch (err: any) {
       throw new ApiError(400, err?.errors?.[0]?.message || "Failed to remove member");
     }
+  }),
+);
+
+// ─── GET /team/analytics ────────────────────────────────────────────
+// Real 90-day daily activity series per org member. Calls come from
+// call_records (per rep), meetings from opportunities created (per owner).
+// Email/SMS/LinkedIn/replies are 0 until those integrations land — the shape
+// is kept stable so the UI's 4-channel layout works unchanged.
+const ANALYTICS_DAYS = 90;
+
+router.get(
+  "/team/analytics",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+
+    // Members (same roster as /team).
+    const memberRows = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.organizationId, orgId));
+
+    // Window start = midnight UTC, (DAYS-1) days ago.
+    const now = new Date();
+    const startUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    startUtc.setUTCDate(startUtc.getUTCDate() - (ANALYTICS_DAYS - 1));
+
+    // Per-rep calls by UTC day.
+    const callRows = await db
+      .select({
+        userId: callRecords.userId,
+        day: sql<string>`to_char(date_trunc('day', ${callRecords.calledAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        c: count(),
+      })
+      .from(callRecords)
+      .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, startUtc)))
+      .groupBy(callRecords.userId, sql`date_trunc('day', ${callRecords.calledAt} AT TIME ZONE 'UTC')`);
+
+    // Per-rep meetings (opportunities created) by UTC day.
+    const meetingRows = await db
+      .select({
+        ownerId: opportunities.ownerId,
+        day: sql<string>`to_char(date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        c: count(),
+      })
+      .from(opportunities)
+      .where(and(eq(opportunities.organizationId, orgId), gte(opportunities.createdAt, startUtc)))
+      .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
+
+    const callMap = new Map<string, Map<string, number>>();
+    for (const r of callRows) {
+      if (!r.userId) continue;
+      if (!callMap.has(r.userId)) callMap.set(r.userId, new Map());
+      callMap.get(r.userId)!.set(r.day, Number(r.c));
+    }
+    const meetMap = new Map<string, Map<string, number>>();
+    for (const r of meetingRows) {
+      if (!r.ownerId) continue;
+      if (!meetMap.has(r.ownerId)) meetMap.set(r.ownerId, new Map());
+      meetMap.get(r.ownerId)!.set(r.day, Number(r.c));
+    }
+
+    // Dense list of UTC day strings for the window.
+    const days: string[] = [];
+    for (let i = 0; i < ANALYTICS_DAYS; i++) {
+      const d = new Date(startUtc);
+      d.setUTCDate(d.getUTCDate() + i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+
+    const members = memberRows.map((m) => {
+      const calls = callMap.get(m.id);
+      const meets = meetMap.get(m.id);
+      return {
+        id: m.id,
+        series: days.map((day) => ({
+          date: `${day}T00:00:00.000Z`,
+          calls: calls?.get(day) ?? 0,
+          emails: 0,
+          sms: 0,
+          linkedin: 0,
+          meetings: meets?.get(day) ?? 0,
+          replies: 0,
+        })),
+      };
+    });
+
+    res.json({ data: { members } });
   }),
 );
 
