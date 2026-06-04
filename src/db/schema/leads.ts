@@ -24,6 +24,11 @@ export const leads = pgTable("leads", {
   companyIndustry: text("company_industry"),
   companyEmployeeCount: integer("company_employee_count"),
   companyLocation: text("company_location"),
+  companyDescription: text("company_description"),
+  companyLinkedin: text("company_linkedin"),
+  companyAnnualRevenue: text("company_annual_revenue"),
+  /** Roles the company is actively hiring for (job-scraper signal). */
+  companyHiringRoles: jsonb("company_hiring_roles").$type<string[]>(),
   smartleadLeadId: text("smartlead_lead_id"),
   unipileProviderId: text("unipile_provider_id"),
   /** Set once the lead is converted to an Opportunity. The lead stays

@@ -49,6 +49,10 @@ export interface Lead {
   companyIndustry?: string | null;
   companyEmployeeCount?: number | null;
   companyLocation?: string | null;
+  companyDescription?: string | null;
+  companyLinkedin?: string | null;
+  companyAnnualRevenue?: string | null;
+  companyHiringRoles?: string[] | null;
   notes: Record<string, string> | null;
   createdAt: Date;
   updatedAt: Date;
@@ -89,6 +93,10 @@ function serializeLead(lead: Lead) {
     companyIndustry: lead.companyIndustry,
     companyEmployeeCount: lead.companyEmployeeCount,
     companyLocation: lead.companyLocation,
+    companyDescription: lead.companyDescription,
+    companyLinkedin: lead.companyLinkedin,
+    companyAnnualRevenue: lead.companyAnnualRevenue,
+    companyHiringRoles: lead.companyHiringRoles,
     notes: lead.notes,
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),

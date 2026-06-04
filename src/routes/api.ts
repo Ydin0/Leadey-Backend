@@ -133,6 +133,10 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
       companyIndustry: l.companyIndustry,
       companyEmployeeCount: l.companyEmployeeCount,
       companyLocation: l.companyLocation,
+      companyDescription: l.companyDescription,
+      companyLinkedin: l.companyLinkedin,
+      companyAnnualRevenue: l.companyAnnualRevenue,
+      companyHiringRoles: l.companyHiringRoles,
       opportunityId: l.opportunityId,
       notes: l.notes,
       createdAt: l.createdAt,
@@ -200,6 +204,10 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
       companyIndustry: l.companyIndustry,
       companyEmployeeCount: l.companyEmployeeCount,
       companyLocation: l.companyLocation,
+      companyDescription: l.companyDescription,
+      companyLinkedin: l.companyLinkedin,
+      companyAnnualRevenue: l.companyAnnualRevenue,
+      companyHiringRoles: l.companyHiringRoles,
       opportunityId: l.opportunityId,
       notes: l.notes,
       createdAt: l.createdAt,
@@ -727,7 +735,18 @@ router.post(
       cIndustry: ["Company Industry", "Industry"],
       cLocation: ["Company Location", "Location"],
       cSize: ["Company Size", "Employees", "Employee Count"],
+      cDescription: ["Company Description", "Description", "About"],
+      cRevenue: ["Company Annual Revenue", "Annual Revenue", "Revenue"],
+      cHiring: ["Company Hiring Roles", "Hiring Roles", "Hiring For", "Open Roles", "Job Titles"],
     };
+
+    // Hiring roles arrive as one delimited cell ("CTO; VP Sales, Account Exec").
+    const parseRoles = (raw: string): string[] =>
+      raw
+        .split(/[;|\n]|,(?![^(]*\))/)
+        .map((r) => r.trim())
+        .filter(Boolean)
+        .slice(0, 50);
 
     // Existing funnel leads → dedupe.
     const existingKeys = new Set(funnel.leads.map((l) => dedupeKey(l.name, l.company, l.email)));
@@ -749,6 +768,7 @@ router.post(
     interface CompanyAgg {
       key: string; name: string; domain: string; linkedin: string;
       industry: string; location: string; size: number | null;
+      description: string; revenue: string; hiringRoles: string[];
       existing: (typeof masterRows)[number] | null; leadCount: number;
     }
     const companyMap = new Map<string, CompanyAgg>();
@@ -759,6 +779,10 @@ router.post(
     let importedRows = 0, skippedRows = 0, duplicateLeads = 0, invalidRows = 0;
     const addedLeadIds: string[] = [];
     const newLeads: Array<typeof leads.$inferInsert> = [];
+    // Each new lead's company aggregate, aligned by index — used to backfill
+    // company fields AFTER all rows are processed so every lead in a company
+    // gets the full, unioned company data (e.g. all hiring roles).
+    const newLeadAggs: CompanyAgg[] = [];
     const newEvents: Array<typeof leadEvents.$inferInsert> = [];
     const firstStep = funnel.steps[0];
 
@@ -774,6 +798,9 @@ router.post(
       const cLocation = getField(row, LBL.cLocation);
       const cSizeStr = getField(row, LBL.cSize);
       const cSize = cSizeStr ? parseInt(cSizeStr.replace(/[^0-9]/g, ""), 10) || null : null;
+      const cDescription = getField(row, LBL.cDescription);
+      const cRevenue = getField(row, LBL.cRevenue);
+      const cHiringRoles = parseRoles(getField(row, LBL.cHiring));
 
       if (!name || !cName) {
         skippedRows += 1; invalidRows += 1;
@@ -807,6 +834,9 @@ router.post(
           industry: cIndustry || existing?.industry || "",
           location: cLocation || [existing?.city, existing?.country].filter(Boolean).join(", "),
           size: cSize ?? existing?.employeeCount ?? null,
+          description: cDescription,
+          revenue: cRevenue,
+          hiringRoles: [...cHiringRoles],
           existing,
           leadCount: 0,
         };
@@ -817,6 +847,14 @@ router.post(
         if (!agg.industry && cIndustry) agg.industry = cIndustry;
         if (!agg.location && cLocation) agg.location = cLocation;
         if (agg.size == null && cSize != null) agg.size = cSize;
+        if (!agg.description && cDescription) agg.description = cDescription;
+        if (!agg.revenue && cRevenue) agg.revenue = cRevenue;
+        // Union the hiring roles seen across this company's rows.
+        for (const role of cHiringRoles) {
+          if (!agg.hiringRoles.some((r) => r.toLowerCase() === role.toLowerCase())) {
+            agg.hiringRoles.push(role);
+          }
+        }
       }
       const canonicalCompany = agg.name; // nest under existing company name when matched
 
@@ -849,15 +887,27 @@ router.post(
         nextAction: firstStep.label, nextDate: new Date(now + firstStep.dayOffset * DAY_MS),
         source: "CSV Import", sourceType: "csv",
         score: scoreLead({ name, title, company: canonicalCompany, email, phone, linkedinUrl }),
-        companyDomain: agg.domain || null,
-        companyIndustry: agg.industry || null,
-        companyEmployeeCount: agg.size,
-        companyLocation: agg.location || null,
+        // Company fields backfilled after the loop from the final aggregate.
         notes, createdAt: new Date(now), updatedAt: new Date(now),
       });
+      newLeadAggs.push(agg);
       newEvents.push({ id: createId("event"), leadId, type: "imported", outcome: null, stepIndex: 0, meta: { importId }, timestamp: new Date(now) });
       importedRows += 1;
       addedLeadIds.push(leadId);
+    });
+
+    // Backfill company fields onto each new lead from its (now-complete)
+    // company aggregate so leads at the same company share consistent data.
+    newLeads.forEach((lead, i) => {
+      const agg = newLeadAggs[i];
+      lead.companyDomain = agg.domain || null;
+      lead.companyIndustry = agg.industry || null;
+      lead.companyEmployeeCount = agg.size;
+      lead.companyLocation = agg.location || null;
+      lead.companyDescription = agg.description || null;
+      lead.companyLinkedin = agg.linkedin || null;
+      lead.companyAnnualRevenue = agg.revenue || null;
+      lead.companyHiringRoles = agg.hiringRoles.length ? agg.hiringRoles : null;
     });
 
     const companies = [...companyMap.values()].filter((c) => c.leadCount > 0);
