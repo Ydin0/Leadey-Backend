@@ -10,6 +10,22 @@ import { regulatoryBundles } from "./regulatory-bundles";
 import { callRecords } from "./call-records";
 import { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
 import { discoveryRuns, scraperContacts } from "./contacts";
+import { kbOffers, kbModules, kbLessons } from "./knowledge-base";
+
+export const kbOffersRelations = relations(kbOffers, ({ many }) => ({
+  modules: many(kbModules),
+  lessons: many(kbLessons),
+}));
+
+export const kbModulesRelations = relations(kbModules, ({ one, many }) => ({
+  offer: one(kbOffers, { fields: [kbModules.offerId], references: [kbOffers.id] }),
+  lessons: many(kbLessons),
+}));
+
+export const kbLessonsRelations = relations(kbLessons, ({ one }) => ({
+  module: one(kbModules, { fields: [kbLessons.moduleId], references: [kbModules.id] }),
+  offer: one(kbOffers, { fields: [kbLessons.offerId], references: [kbOffers.id] }),
+}));
 
 export const funnelsRelations = relations(funnels, ({ many }) => ({
   steps: many(funnelSteps),

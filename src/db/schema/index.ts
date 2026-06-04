@@ -26,8 +26,12 @@ export {
   opportunityEvents,
 } from "./opportunities";
 export { adminAuditLog } from "./admin-audit-log";
+export { kbOffers, kbModules, kbLessons, kbAssignments, kbProgress } from "./knowledge-base";
 export {
   funnelsRelations,
+  kbOffersRelations,
+  kbModulesRelations,
+  kbLessonsRelations,
   funnelStepsRelations,
   funnelMembersRelations,
   leadsRelations,

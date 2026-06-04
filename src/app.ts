@@ -22,6 +22,7 @@ import opportunitiesRouter from "./routes/opportunities";
 import companiesRouter from "./routes/companies";
 import leadStatusesRouter from "./routes/lead-statuses";
 import searchRouter from "./routes/search";
+import knowledgeBaseRouter from "./routes/knowledge-base";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -76,6 +77,7 @@ app.use("/api", requireAuth(), opportunitiesRouter);
 app.use("/api", requireAuth(), companiesRouter);
 app.use("/api", requireAuth(), leadStatusesRouter);
 app.use("/api", requireAuth(), searchRouter);
+app.use("/api", requireAuth(), knowledgeBaseRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

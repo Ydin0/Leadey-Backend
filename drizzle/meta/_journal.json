@@ -162,6 +162,13 @@
       "when": 1780586348556,
       "tag": "0022_small_wolfpack",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1780593364134,
+      "tag": "0023_blue_young_avengers",
+      "breakpoints": true
     }
   ]
 }
