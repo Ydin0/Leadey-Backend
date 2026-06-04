@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, inArray, isNull, sql } from "drizzle-orm";
+import { eq, and, or, inArray, isNull, sql, count } from "drizzle-orm";
 import { db } from "../db/index";
 import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
@@ -1569,6 +1569,18 @@ router.post(
   "/funnels/backfill-company-data",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+
+    // Fast exit: this backfill only sources data from scraper signals. If the
+    // org has none (e.g. CSV-only), skip the expensive lead scan + fuzzy LIKE
+    // lookups entirely.
+    const [{ signalCount } = { signalCount: 0 }] = await db
+      .select({ signalCount: count() })
+      .from(scraperSignals)
+      .where(eq(scraperSignals.organizationId, orgId));
+    if (Number(signalCount) === 0) {
+      res.json({ data: { total: 0, updated: 0 } });
+      return;
+    }
 
     // Get all leads missing company data
     const leadsToFix = await db
