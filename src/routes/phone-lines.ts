@@ -1040,6 +1040,36 @@ router.delete(
   }),
 );
 
+/** ITU country-calling codes for the countries we issue numbers in, keyed by
+ *  ISO-3166 alpha-2. Used to turn a national rep phone (e.g. "07700 900000")
+ *  into the E.164 Twilio requires ("+447700900000"). */
+const DIALING_CODES: Record<string, string> = {
+  GB: "44", US: "1", CA: "1", AU: "61", IE: "353", DE: "49", FR: "33",
+  ES: "34", IT: "39", NL: "31", BE: "32", PT: "351", SE: "46", NO: "47",
+  DK: "45", FI: "358", CH: "41", AT: "43", PL: "48", NZ: "64", SG: "65",
+  ZA: "27", AE: "971", IN: "91",
+};
+
+/** Best-effort normalise a representative phone to E.164. Handles +cc, 00cc,
+ *  national 0-prefixed, and bare national numbers using the bundle's country. */
+function toE164(raw: string, iso: string): string {
+  const s = (raw || "").trim();
+  const hasPlus = s.startsWith("+");
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return "";
+  if (hasPlus) return "+" + digits;
+  if (digits.startsWith("00")) return "+" + digits.slice(2);
+  const cc = DIALING_CODES[(iso || "").toUpperCase()] || "";
+  if (cc) {
+    if (digits.startsWith("0")) return "+" + cc + digits.slice(1);
+    if (digits.startsWith(cc)) return "+" + digits;
+    return "+" + cc + digits;
+  }
+  return "+" + digits;
+}
+
+const E164_RE = /^\+[1-9]\d{1,14}$/;
+
 // POST /api/phone-lines/bundles/:id/submit — submit bundle to Twilio Trust Hub
 router.post(
   "/phone-lines/bundles/:id/submit",
@@ -1084,6 +1114,15 @@ router.post(
       throw new ApiError(
         400,
         `Missing required fields before Twilio submission: ${missing.join(", ")}`,
+      );
+    }
+
+    // Validate the rep phone up front (before creating any Twilio resources).
+    const phoneE164 = toE164(bundle.representativePhone || "", bundle.countryCode);
+    if (!E164_RE.test(phoneE164)) {
+      throw new ApiError(
+        400,
+        `The authorized representative's phone number ("${bundle.representativePhone}") is not a valid international number. Enter it in full international format, e.g. +447700900000.`,
       );
     }
 
@@ -1165,9 +1204,7 @@ router.post(
         ? bundle.businessClassification
         : "INDEPENDENT_SOFTWARE_VENDOR";
 
-      // Strip whitespace from phone — Twilio's regex rejects "+44 20 1234 ..."
-      const phoneE164 = (bundle.representativePhone || "").replace(/\s+/g, "");
-
+      // phoneE164 was normalised + validated up front (strict E.164).
       const businessAttrsObj: Record<string, unknown> = {
         business_name: bundle.businessName,
         business_registration_number: bundle.businessRegistrationNumber,
@@ -1294,25 +1331,38 @@ router.post(
         }
       }
 
-      // ── 7. Pre-flight evaluation (advisory, not blocking) ──────────
-      // The evaluator can be over-strict about attribute formats (e.g.
-      // it flags is_subassigned="false" as "missing" even though the
-      // value was accepted on create). We log noncompliant findings
-      // for debugging but submit the bundle anyway — the actual Twilio
-      // review (manned by humans) is the source of truth.
+      // ── 7. Pre-flight evaluation ───────────────────────────────────
+      // Twilio refuses to move a noncompliant bundle to "pending-review"
+      // (it 400s with an opaque "not regulatory compliant"). So if the
+      // evaluation fails, surface the SPECIFIC reasons to the user instead
+      // of submitting and erroring out cryptically.
       try {
         const evaluation: any = await client.numbers.v2.regulatoryCompliance
           .bundles(twilioBundle.sid)
           .evaluations.create();
         if (evaluation?.status === "noncompliant") {
+          const reasons: string[] = [];
+          for (const r of evaluation.results || []) {
+            for (const inv of r.invalid || []) {
+              const reason = inv.failure_reason || inv.friendly_name;
+              if (reason) reasons.push(reason);
+            }
+          }
           console.warn(
-            "[Bundle Submit] pre-flight evaluation flagged issues (submitting anyway):",
+            "[Bundle Submit] evaluation noncompliant:",
             JSON.stringify(evaluation.results, null, 2),
           );
+          if (reasons.length > 0) {
+            throw new ApiError(
+              400,
+              `Twilio can't accept this bundle yet — fix the following and resubmit: ${[...new Set(reasons)].join("; ")}`,
+            );
+          }
         } else {
           console.log("[Bundle Submit] pre-flight evaluation passed");
         }
       } catch (evalErr: any) {
+        if (evalErr instanceof ApiError) throw evalErr;
         console.warn(`[Bundle Submit] evaluation check failed: ${evalErr?.message}`);
       }
 
