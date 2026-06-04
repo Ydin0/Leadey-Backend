@@ -2,6 +2,8 @@ import { Router, Request, Response, NextFunction } from "express";
 import { eq, sql, like, or, and, gte, desc } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
+import { regulatoryBundles } from "../db/schema/regulatory-bundles";
+import { phoneLines } from "../db/schema/phone-lines";
 import { adminAuditLog } from "../db/schema/admin-audit-log";
 import { ApiError } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
@@ -310,6 +312,58 @@ router.get(
           : null,
         createdAt: org.createdAt.toISOString(),
         updatedAt: org.updatedAt.toISOString(),
+      },
+    });
+  }),
+);
+
+// ─── GET /organizations/:id/telephony ────────────────────────────────────
+// An org's regulatory-bundle history (with statuses) + every phone number it
+// currently holds. Surfaced in the admin org detail "Telephony" tab.
+router.get(
+  "/organizations/:id/telephony",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const orgId = req.params.id;
+
+    const bundles = await db
+      .select()
+      .from(regulatoryBundles)
+      .where(eq(regulatoryBundles.organizationId, orgId))
+      .orderBy(desc(regulatoryBundles.createdAt));
+
+    const lines = await db
+      .select()
+      .from(phoneLines)
+      .where(eq(phoneLines.organizationId, orgId))
+      .orderBy(desc(phoneLines.createdAt));
+
+    res.json({
+      data: {
+        bundles: bundles.map((b) => ({
+          id: b.id,
+          name: b.name,
+          country: b.country,
+          countryCode: b.countryCode,
+          status: b.status,
+          numberType: b.numberType,
+          endUserType: b.endUserType,
+          businessName: b.businessName,
+          twilioBundleSid: b.twilioBundleSid,
+          createdAt: b.createdAt.toISOString(),
+        })),
+        phoneLines: lines.map((l) => ({
+          id: l.id,
+          number: l.number,
+          friendlyName: l.friendlyName,
+          country: l.country,
+          countryCode: l.countryCode,
+          type: l.type,
+          status: l.status,
+          assignedToName: l.assignedToName,
+          callRecordingEnabled: l.callRecordingEnabled,
+          bundleId: l.bundleId,
+          createdAt: l.createdAt.toISOString(),
+        })),
       },
     });
   }),
@@ -653,18 +707,24 @@ router.get(
 // ─── PATCH /organizations/:id/plan ───────────────────────────────────────
 // Change plan tier (Stripe + DB)
 
+// Admin override: set an org's plan directly. Works WITHOUT a Stripe
+// subscription — we always override our own DB. When a live subscription does
+// exist, we sync it to Stripe best-effort (never blocking the override).
+const ALLOWED_PLAN_STATUSES = new Set([
+  "active", "trialing", "past_due", "canceled", "paused", "incomplete",
+]);
+
 router.patch(
   "/organizations/:id/plan",
   asyncHandler<OrgParams>(async (req, res) => {
-    const { plan } = req.body || {};
+    const { plan, planStatus } = req.body || {};
     const actor = getActorId(req);
 
     if (!["starter", "growth", "scale"].includes(plan)) {
       throw new ApiError(400, "Invalid plan");
     }
-    const newPriceId = priceIdForPlan(plan);
-    if (!newPriceId) {
-      throw new ApiError(500, `Stripe price ID for ${plan} is not configured`);
+    if (planStatus !== undefined && !ALLOWED_PLAN_STATUSES.has(planStatus)) {
+      throw new ApiError(400, "Invalid plan status");
     }
 
     const [org] = await db
@@ -672,30 +732,39 @@ router.patch(
       .from(organizations)
       .where(eq(organizations.id, req.params.id));
     if (!org) throw new ApiError(404, "Organization not found");
-    if (!org.stripeSubscriptionId) {
-      throw new ApiError(
-        400,
-        "Organization has no active subscription. Run checkout instead.",
-      );
+
+    const before = { plan: org.plan, priceId: org.stripePriceId, planStatus: org.planStatus };
+    const newPriceId = priceIdForPlan(plan);
+
+    // Best-effort Stripe sync — only when a subscription + configured price
+    // both exist. Any failure is logged but never blocks the admin override.
+    let stripeSynced = false;
+    if (org.stripeSubscriptionId && newPriceId) {
+      try {
+        const sub: any = await stripe.subscriptions.retrieve(org.stripeSubscriptionId);
+        const item = sub.items?.data?.[0];
+        if (item) {
+          await stripe.subscriptions.update(org.stripeSubscriptionId, {
+            items: [{ id: item.id, price: newPriceId }],
+            proration_behavior: "create_prorations",
+          });
+          stripeSynced = true;
+        }
+      } catch (err) {
+        console.error("[admin] Stripe plan sync failed — applying DB override anyway:", err);
+      }
     }
 
-    const before = { plan: org.plan, priceId: org.stripePriceId };
-
-    const sub: any = await stripe.subscriptions.retrieve(org.stripeSubscriptionId);
-    const item = sub.items?.data?.[0];
-    if (!item) throw new ApiError(500, "Subscription has no items");
-
-    await stripe.subscriptions.update(org.stripeSubscriptionId, {
-      items: [{ id: item.id, price: newPriceId }],
-      proration_behavior: "create_prorations",
-    });
-
+    // Always override our DB (the source of truth for entitlements).
+    const planConfig = getPlanConfig(plan);
+    const nextStatus = planStatus || org.planStatus || "active";
     await db
       .update(organizations)
       .set({
         plan,
-        stripePriceId: newPriceId,
-        planStatus: "active",
+        stripePriceId: newPriceId || org.stripePriceId,
+        planStatus: nextStatus,
+        creditsIncluded: planConfig.scraperCredits * (org.seatsIncluded || 1),
         updatedAt: new Date(),
       })
       .where(eq(organizations.id, req.params.id));
@@ -706,10 +775,10 @@ router.patch(
       targetType: "organization",
       targetId: req.params.id,
       before,
-      after: { plan, priceId: newPriceId },
+      after: { plan, priceId: newPriceId, planStatus: nextStatus, stripeSynced },
     });
 
-    res.json({ data: { plan, priceId: newPriceId } });
+    res.json({ data: { plan, planStatus: nextStatus, priceId: newPriceId, stripeSynced } });
   }),
 );
 
