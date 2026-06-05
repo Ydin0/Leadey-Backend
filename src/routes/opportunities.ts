@@ -1073,13 +1073,14 @@ router.post(
 
     const oppId = createId("opp");
     const userName = await resolveUserName(userId);
+    const oppName = name?.trim() || `${lead.company || lead.name} — Opportunity`;
     await db.transaction(async (tx) => {
       await tx.insert(opportunities).values({
         id: oppId,
         organizationId: orgId,
         pipelineId,
         stageId,
-        name: name?.trim() || `${lead.company || lead.name} — Opportunity`,
+        name: oppName,
         masterCompanyId,
         masterContactId,
         ownerId: ownerId || userId,
@@ -1110,7 +1111,7 @@ router.post(
         type: "converted",
         outcome: "opportunity_created",
         stepIndex: lead.currentStep,
-        meta: { opportunityId: oppId, pipelineId, stageId },
+        meta: { opportunityId: oppId, pipelineId, stageId, oppName, userName },
       });
     });
     const [created] = await db.select().from(opportunities).where(eq(opportunities.id, oppId));
