@@ -6,9 +6,11 @@ import { funnels } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { callRecords } from "../db/schema/call-records";
+import { users } from "../db/schema/organizations";
 import { createId, ApiError } from "../lib/helpers";
 import { buildCockpit, type Funnel, type Lead } from "../lib/funnel-service";
 import { getOrgId } from "../lib/auth";
+import { getSetting } from "../lib/settings-service";
 
 const router = Router();
 
@@ -227,8 +229,44 @@ router.get(
 // are attributed to the current user; email/LinkedIn/replies are org-wide
 // (no per-rep attribution exists yet — honest, not fabricated).
 
-/** Default daily activity goals (used until per-rep KPI targets are wired). */
-const REP_GOALS = { calls: 20, emails: 40, linkedin: 25, replies: 6 };
+/** Daily KPI targets by sales role — mirrors the Team feature defaults. An
+ *  explicit per-member `targets` override (set in /team/kpi-config) wins. */
+const ROLE_TARGETS: Record<string, { calls: number; emails: number; sms: number; linkedin: number }> = {
+  SDR: { calls: 60, emails: 80, sms: 25, linkedin: 30 },
+  AE: { calls: 30, emails: 45, sms: 12, linkedin: 18 },
+  Manager: { calls: 12, emails: 25, sms: 6, linkedin: 12 },
+};
+const DEFAULT_TARGETS = ROLE_TARGETS.SDR;
+const REPLIES_GOAL = 6;
+
+/** Resolve a rep's daily KPI targets from the Team KPI config (keyed by
+ *  lowercased email), falling back to their role's defaults. */
+async function resolveRepTargets(orgId: string, userId: string | null) {
+  if (!userId) return { ...DEFAULT_TARGETS };
+  const [u] = await db.select({ email: users.email }).from(users).where(eq(users.id, userId)).limit(1);
+  const email = (u?.email || "").toLowerCase();
+  let entry: { role?: string; targets?: Record<string, unknown> } | null = null;
+  const raw = await getSetting(orgId, "team_kpi_config");
+  if (raw && email) {
+    try {
+      const cfg = JSON.parse(raw);
+      if (cfg && typeof cfg === "object") entry = cfg[email] ?? null;
+    } catch {
+      /* ignore malformed config */
+    }
+  }
+  const explicit = entry?.targets;
+  if (explicit && typeof explicit === "object") {
+    return {
+      calls: Number(explicit.calls) || DEFAULT_TARGETS.calls,
+      emails: Number(explicit.emails) || DEFAULT_TARGETS.emails,
+      sms: Number(explicit.sms) || DEFAULT_TARGETS.sms,
+      linkedin: Number(explicit.linkedin) || DEFAULT_TARGETS.linkedin,
+    };
+  }
+  const role = entry?.role && ROLE_TARGETS[entry.role] ? entry.role : "SDR";
+  return { ...ROLE_TARGETS[role] };
+}
 
 router.get(
   "/dashboard/rep",
@@ -328,14 +366,15 @@ router.get(
       });
 
     const tasksDone = tasks.filter((t) => t.done).length;
+    const targets = await resolveRepTargets(orgId, userId);
 
     res.json({
       data: {
         kpis: {
-          calls: { value: callsToday, goal: REP_GOALS.calls },
-          emails: { value: emailsToday, goal: REP_GOALS.emails },
-          linkedin: { value: linkedinToday, goal: REP_GOALS.linkedin },
-          replies: { value: repliesToday, goal: REP_GOALS.replies },
+          calls: { value: callsToday, goal: targets.calls },
+          emails: { value: emailsToday, goal: targets.emails },
+          linkedin: { value: linkedinToday, goal: targets.linkedin },
+          replies: { value: repliesToday, goal: REPLIES_GOAL },
           tasks: { value: tasksDone, goal: tasks.length },
         },
         tasks,
