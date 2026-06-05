@@ -127,6 +127,7 @@ async function ensurePrimaryEmailVerified(user: any): Promise<void> {
 async function createClerkUser(
   email: string,
   publicMetadata: Record<string, unknown>,
+  name?: { firstName?: string; lastName?: string },
 ): Promise<any> {
   const user = await clerk("/users", {
     method: "POST",
@@ -135,6 +136,8 @@ async function createClerkUser(
       skip_password_requirement: true,
       skip_password_checks: true,
       public_metadata: publicMetadata,
+      ...(name?.firstName ? { first_name: name.firstName } : {}),
+      ...(name?.lastName ? { last_name: name.lastName } : {}),
     }),
   });
   await ensurePrimaryEmailVerified(user);
@@ -190,6 +193,8 @@ async function createSignInUrl(
 
 export interface InviteToOrgInput {
   email: string;
+  firstName?: string;
+  lastName?: string;
   organizationId: string;
   organizationName: string;
   role: "org:admin" | "org:member";
@@ -215,14 +220,27 @@ export async function inviteEmailToOrganization(
       organization_id: input.organizationId,
       organization_role: input.role,
     });
+    // Fill in a name if we were given one and Clerk doesn't have it yet.
+    if ((input.firstName || input.lastName) && !user.first_name && !user.last_name) {
+      try {
+        await clerk(`/users/${user.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            ...(input.firstName ? { first_name: input.firstName } : {}),
+            ...(input.lastName ? { last_name: input.lastName } : {}),
+          }),
+        });
+      } catch { /* non-blocking */ }
+    }
     // Heal users that were created before email-verification was enforced.
     await ensurePrimaryEmailVerified(user);
   } else {
     try {
-      user = await createClerkUser(input.email, {
-        organization_id: input.organizationId,
-        organization_role: input.role,
-      });
+      user = await createClerkUser(
+        input.email,
+        { organization_id: input.organizationId, organization_role: input.role },
+        { firstName: input.firstName, lastName: input.lastName },
+      );
       isNewUser = true;
     } catch (err: any) {
       if (isClerkAlreadyError(err)) {

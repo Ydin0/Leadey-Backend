@@ -10,6 +10,7 @@ import { ApiError } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
+import { inviteEmailToOrganization } from "../lib/invitations";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 
@@ -143,9 +144,10 @@ router.post(
   "/team/invite",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { email, role } = req.body;
+    const { email, role, firstName, lastName } = req.body;
 
     if (!email) throw new ApiError(400, "email is required");
+    const inviteRole = role === "org:admin" ? "org:admin" : "org:member";
 
     // Check seat limit
     const [org] = await db
@@ -166,23 +168,48 @@ router.post(
       throw new ApiError(403, `Seat limit reached (${seatLimit}). Upgrade your plan to add more team members.`);
     }
 
+    // Look up the inviter's display name (for the email).
+    const auth = getAuth(req);
+    let invitedBy: string | undefined;
+    if (auth?.userId) {
+      const [inviter] = await db
+        .select({ firstName: users.firstName, lastName: users.lastName, email: users.email })
+        .from(users)
+        .where(eq(users.id, auth.userId));
+      if (inviter) {
+        invitedBy =
+          [inviter.firstName, inviter.lastName].filter(Boolean).join(" ").trim() ||
+          inviter.email ||
+          undefined;
+      }
+    }
+
     try {
-      const invitation = await clerkClient.organizations.createOrganizationInvitation({
+      // Create the Clerk user (with name) + org membership directly, then email
+      // a magic-link sign-in. This reliably attaches them to the org (no
+      // accept-flow race) and lets us pre-fill their name.
+      const result = await inviteEmailToOrganization({
+        email: String(email).trim(),
+        firstName: firstName ? String(firstName).trim() : undefined,
+        lastName: lastName ? String(lastName).trim() : undefined,
         organizationId: orgId,
-        emailAddress: email,
-        role: role || "org:member",
+        organizationName: org.name,
+        role: inviteRole,
+        invitedBy,
+        template: "member",
       });
 
       res.status(201).json({
         data: {
-          id: invitation.id,
-          emailAddress: invitation.emailAddress,
-          role: invitation.role,
-          status: invitation.status,
-          createdAt: invitation.createdAt ? new Date(invitation.createdAt).toISOString() : new Date().toISOString(),
+          id: result.userId,
+          emailAddress: String(email).trim(),
+          role: inviteRole,
+          status: "active",
+          createdAt: new Date().toISOString(),
         },
       });
     } catch (err: any) {
+      if (err instanceof ApiError) throw err;
       if (err?.errors?.[0]?.message) {
         throw new ApiError(400, err.errors[0].message);
       }

@@ -188,23 +188,8 @@ router.post("/clerk", async (req: Request, res: Response) => {
             (e: any) => e.id === data.primary_email_address_id
           )?.email_address || data.email_addresses?.[0]?.email_address || "";
 
-        await db.insert(users).values({
-          id: data.id,
-          email: primaryEmail,
-          firstName: data.first_name,
-          lastName: data.last_name,
-          imageUrl: data.image_url,
-          platformRole:
-            data.public_metadata?.platform_role ||
-            data.public_metadata?.role ||
-            null,
-          createdAt: new Date(data.created_at),
-          updatedAt: new Date(data.updated_at),
-        });
-
-        // If this user signed up via a custom invitation (created by our admin
-        // flow with public_metadata.organization_id), automatically add them
-        // to the target organization with the requested role.
+        // Org membership the user was invited into (carried on the invitation's
+        // public_metadata by our invite flow).
         const targetOrgId = data.public_metadata?.organization_id as
           | string
           | undefined;
@@ -212,49 +197,57 @@ router.post("/clerk", async (req: Request, res: Response) => {
           (data.public_metadata?.organization_role as string | undefined) ||
           "org:member";
 
-        if (targetOrgId) {
+        // CRITICAL: write the org id/role straight onto the row at insert time.
+        // The matching organizationMembership.created webhook can arrive BEFORE
+        // this one (its UPDATE would then miss the not-yet-inserted row), so we
+        // must not rely on it to set the org. onConflictDoUpdate makes this
+        // idempotent if the row was somehow created first.
+        await db
+          .insert(users)
+          .values({
+            id: data.id,
+            email: primaryEmail,
+            firstName: data.first_name,
+            lastName: data.last_name,
+            imageUrl: data.image_url,
+            organizationId: targetOrgId || null,
+            role: targetOrgId ? targetRole : null,
+            platformRole:
+              data.public_metadata?.platform_role ||
+              data.public_metadata?.role ||
+              null,
+            createdAt: new Date(data.created_at),
+            updatedAt: new Date(data.updated_at),
+          })
+          .onConflictDoUpdate({
+            target: users.id,
+            set: {
+              email: primaryEmail,
+              firstName: data.first_name,
+              lastName: data.last_name,
+              imageUrl: data.image_url,
+              ...(targetOrgId ? { organizationId: targetOrgId, role: targetRole } : {}),
+              updatedAt: new Date(data.updated_at),
+            },
+          });
+
+        // Best-effort: ensure the Clerk membership exists too (idempotent —
+        // the invite flow usually creates it already; "already a member" is fine).
+        if (targetOrgId && process.env.CLERK_SECRET_KEY) {
           try {
-            const clerkSecretKey = process.env.CLERK_SECRET_KEY;
-            if (clerkSecretKey) {
-              const membershipRes = await fetch(
-                `https://api.clerk.com/v1/organizations/${targetOrgId}/memberships`,
-                {
-                  method: "POST",
-                  headers: {
-                    Authorization: `Bearer ${clerkSecretKey}`,
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({
-                    user_id: data.id,
-                    role: targetRole,
-                  }),
+            await fetch(
+              `https://api.clerk.com/v1/organizations/${targetOrgId}/memberships`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}`,
+                  "Content-Type": "application/json",
                 },
-              );
-              if (!membershipRes.ok) {
-                const body = await membershipRes.json().catch(() => null);
-                console.error(
-                  `[clerk webhook] auto-join failed for ${data.id} → ${targetOrgId}:`,
-                  body,
-                );
-              } else {
-                // organizationMembership.created webhook will fire and update
-                // the DB row's organization_id/role — but we mirror locally
-                // here too in case the membership webhook is delayed.
-                await db
-                  .update(users)
-                  .set({
-                    organizationId: targetOrgId,
-                    role: targetRole,
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(users.id, data.id));
-                console.log(
-                  `[clerk webhook] auto-joined ${data.id} to ${targetOrgId} as ${targetRole}`,
-                );
-              }
-            }
+                body: JSON.stringify({ user_id: data.id, role: targetRole }),
+              },
+            );
           } catch (err) {
-            console.error("[clerk webhook] auto-join error:", err);
+            console.error("[clerk webhook] membership ensure error:", err);
           }
         }
         break;
@@ -288,14 +281,29 @@ router.post("/clerk", async (req: Request, res: Response) => {
 
       // ── Organization membership events ──
       case "organizationMembership.created": {
+        const pud = data.public_user_data || {};
+        const userId = pud.user_id;
+        // Upsert — the user.created webhook may not have landed yet, in which
+        // case a plain UPDATE would silently miss and leave them orgless.
         await db
-          .update(users)
-          .set({
+          .insert(users)
+          .values({
+            id: userId,
+            email: pud.identifier || "",
+            firstName: pud.first_name ?? null,
+            lastName: pud.last_name ?? null,
+            imageUrl: pud.image_url ?? null,
             organizationId: data.organization.id,
             role: data.role,
-            updatedAt: new Date(),
           })
-          .where(eq(users.id, data.public_user_data.user_id));
+          .onConflictDoUpdate({
+            target: users.id,
+            set: {
+              organizationId: data.organization.id,
+              role: data.role,
+              updatedAt: new Date(),
+            },
+          });
         break;
       }
       case "organizationMembership.updated": {
