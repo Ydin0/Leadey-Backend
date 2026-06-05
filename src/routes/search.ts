@@ -29,10 +29,20 @@ type SearchResult = {
   subtitle: string;
   href: string;
   imageUrl?: string | null;
+  /** Company domain — the client renders its favicon as the result icon, with
+   *  the group's lucide icon as a fallback. */
+  domain?: string | null;
 };
 
 function joinParts(parts: Array<string | null | undefined>): string {
   return parts.filter(Boolean).join(" · ");
+}
+
+/** Best-effort domain for a person/company favicon. */
+function emailDomain(email: string | null | undefined): string | null {
+  if (!email || !email.includes("@")) return null;
+  const d = email.split("@")[1]?.trim().toLowerCase();
+  return d || null;
 }
 
 // GET /api/search?q=... — org-scoped global search across the core entities.
@@ -68,6 +78,7 @@ router.get(
             name: leads.name,
             company: leads.company,
             email: leads.email,
+            companyDomain: leads.companyDomain,
             funnelId: leads.funnelId,
           })
           .from(leads)
@@ -217,6 +228,7 @@ router.get(
         title: l.name,
         subtitle: joinParts([l.company, l.email]) || "Lead",
         href: `/dashboard/funnels/${l.funnelId}/leads/${l.id}`,
+        domain: l.companyDomain || emailDomain(l.email),
       })),
       ...oppRows.map((o) => ({
         type: "opportunity" as const,
@@ -235,6 +247,7 @@ router.get(
           title: c.name,
           subtitle: joinParts([c.industry, c.domain]) || "Company",
           href: match ? leadHref(match) : `/dashboard/companies`,
+          domain: c.domain || null,
         };
       }),
       ...contactRows.map((c) => {
@@ -249,6 +262,7 @@ router.get(
             : c.assignmentId
               ? `/dashboard/scrapers/${c.assignmentId}`
               : `/dashboard/companies`,
+          domain: emailDomain(c.email),
         };
       }),
       ...memberRows.map((m) => ({
