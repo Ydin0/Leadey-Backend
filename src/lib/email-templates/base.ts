@@ -2,7 +2,7 @@
 // renders consistently across Gmail, Outlook, Apple Mail, etc.
 //
 // Colors mirror the app's design tokens:
-//   --color-ink:        #0a0f1a (deep navy)
+//   --color-ink:        #0C1122 (deep navy)
 //   --color-accent:     #2563eb (electric blue)
 //   --color-page:       #f8fafc
 //   --color-surface:    #ffffff
@@ -34,7 +34,7 @@ export function renderBaseEmail({ preheader, body }: BaseEmailOptions): string {
       a:hover { text-decoration: underline; }
     </style>
   </head>
-  <body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0a0f1a; -webkit-font-smoothing: antialiased;">
+  <body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0C1122; -webkit-font-smoothing: antialiased;">
     <!-- Preheader: hidden in body, shown in inbox preview -->
     <div style="display:none; max-height:0; overflow:hidden; mso-hide:all; visibility:hidden; opacity:0; color:transparent; line-height:0; font-size:0;">
       ${escapeHtml(preheader)}
@@ -50,10 +50,21 @@ export function renderBaseEmail({ preheader, body }: BaseEmailOptions): string {
                 <table role="presentation" cellspacing="0" cellpadding="0" border="0">
                   <tr>
                     <td style="vertical-align: middle;">
-                      <div style="width: 36px; height: 36px; border-radius: 10px; background-color: #0a0f1a; color: #ffffff; font-size: 16px; font-weight: 600; line-height: 36px; text-align: center;">L</div>
+                      <!-- Brand tile: navy rounded square + periwinkle Leadey chevron.
+                           The chevron is an inline SVG; clients that strip SVG (e.g. Gmail)
+                           still show the on-brand navy badge. -->
+                      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="36" height="36" style="width:36px;height:36px;">
+                        <tr>
+                          <td align="center" valign="middle" width="36" height="36" style="width:36px;height:36px;background-color:#0C1122;border-radius:10px;text-align:center;vertical-align:middle;">
+                            <svg width="18" height="18" viewBox="0 0 301 309" fill="#97A4D6" xmlns="http://www.w3.org/2000/svg" style="display:inline-block;vertical-align:middle;">
+                              <path d="M66.2697 0L300.593 125.175V183.214L66.2697 308.389H0L119.978 162.424H249.917V145.964H119.978L0 0H66.2697Z" />
+                            </svg>
+                          </td>
+                        </tr>
+                      </table>
                     </td>
                     <td style="vertical-align: middle; padding-left: 12px;">
-                      <span style="font-size: 16px; font-weight: 600; color: #0a0f1a; letter-spacing: -0.01em;">Leadey</span>
+                      <span style="font-size: 16px; font-weight: 600; color: #0C1122; letter-spacing: -0.01em;">Leadey</span>
                     </td>
                   </tr>
                 </table>
@@ -92,7 +103,7 @@ export function renderCtaButton(href: string, label: string): string {
   return /* html */ `
     <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin: 28px 0;">
       <tr>
-        <td style="background-color: #0a0f1a; border-radius: 10px;">
+        <td style="background-color: #0C1122; border-radius: 10px;">
           <a href="${escapeHtml(href)}" target="_blank" rel="noopener" style="display: inline-block; padding: 13px 24px; color: #ffffff; font-size: 14px; font-weight: 600; text-decoration: none; letter-spacing: -0.01em;">
             ${escapeHtml(label)}
           </a>
