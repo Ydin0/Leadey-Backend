@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq, ilike, or } from "drizzle-orm";
+import { and, eq, ilike, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { funnels } from "../db/schema/funnels";
 import { leads } from "../db/schema/leads";
@@ -158,6 +158,51 @@ router.get(
           .limit(PER_GROUP),
       ]);
 
+    // Resolve a representative campaign lead for company/contact results so
+    // clicking them opens the Lead View directly (matched by company
+    // name/domain or the contact's email). Bounded: at most PER_GROUP each.
+    const lookupConds = [];
+    for (const c of companyRows) {
+      if (c.name) lookupConds.push(sql`lower(${leads.company}) = ${c.name.toLowerCase()}`);
+      if (c.domain) lookupConds.push(sql`lower(${leads.companyDomain}) = ${c.domain.toLowerCase()}`);
+    }
+    for (const c of contactRows) {
+      if (c.email) lookupConds.push(sql`lower(${leads.email}) = ${c.email.toLowerCase()}`);
+    }
+    const lookupLeads = lookupConds.length
+      ? await db
+          .select({
+            id: leads.id,
+            funnelId: leads.funnelId,
+            company: leads.company,
+            companyDomain: leads.companyDomain,
+            email: leads.email,
+          })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.organizationId, orgId), or(...lookupConds)))
+      : [];
+
+    type LookupLead = (typeof lookupLeads)[number];
+    const byCompanyName = new Map<string, LookupLead>();
+    const byCompanyDomain = new Map<string, LookupLead>();
+    const byEmail = new Map<string, LookupLead>();
+    for (const l of lookupLeads) {
+      if (l.company) {
+        const k = l.company.toLowerCase();
+        if (!byCompanyName.has(k)) byCompanyName.set(k, l);
+      }
+      if (l.companyDomain) {
+        const k = l.companyDomain.toLowerCase();
+        if (!byCompanyDomain.has(k)) byCompanyDomain.set(k, l);
+      }
+      if (l.email) {
+        const k = l.email.toLowerCase();
+        if (!byEmail.has(k)) byEmail.set(k, l);
+      }
+    }
+    const leadHref = (l: LookupLead) => `/dashboard/funnels/${l.funnelId}/leads/${l.id}`;
+
     const results: SearchResult[] = [
       ...campaigns.map((c) => ({
         type: "campaign" as const,
@@ -171,7 +216,7 @@ router.get(
         id: l.id,
         title: l.name,
         subtitle: joinParts([l.company, l.email]) || "Lead",
-        href: `/dashboard/funnels/${l.funnelId}`,
+        href: `/dashboard/funnels/${l.funnelId}/leads/${l.id}`,
       })),
       ...oppRows.map((o) => ({
         type: "opportunity" as const,
@@ -180,22 +225,32 @@ router.get(
         subtitle: "Opportunity",
         href: `/dashboard/opportunities/${o.id}`,
       })),
-      ...companyRows.map((c) => ({
-        type: "company" as const,
-        id: c.id,
-        title: c.name,
-        subtitle: joinParts([c.industry, c.domain]) || "Company",
-        href: `/dashboard/companies`,
-      })),
-      ...contactRows.map((c) => ({
-        type: "contact" as const,
-        id: c.id,
-        title: c.fullName || c.email || "Unknown contact",
-        subtitle: joinParts([c.title, c.company]) || "Contact",
-        href: c.assignmentId
-          ? `/dashboard/scrapers/${c.assignmentId}`
-          : `/dashboard/companies`,
-      })),
+      ...companyRows.map((c) => {
+        const match =
+          (c.name && byCompanyName.get(c.name.toLowerCase())) ||
+          (c.domain && byCompanyDomain.get(c.domain.toLowerCase()));
+        return {
+          type: "company" as const,
+          id: c.id,
+          title: c.name,
+          subtitle: joinParts([c.industry, c.domain]) || "Company",
+          href: match ? leadHref(match) : `/dashboard/companies`,
+        };
+      }),
+      ...contactRows.map((c) => {
+        const match = c.email && byEmail.get(c.email.toLowerCase());
+        return {
+          type: "contact" as const,
+          id: c.id,
+          title: c.fullName || c.email || "Unknown contact",
+          subtitle: joinParts([c.title, c.company]) || "Contact",
+          href: match
+            ? leadHref(match)
+            : c.assignmentId
+              ? `/dashboard/scrapers/${c.assignmentId}`
+              : `/dashboard/companies`,
+        };
+      }),
       ...memberRows.map((m) => ({
         type: "member" as const,
         id: m.id,

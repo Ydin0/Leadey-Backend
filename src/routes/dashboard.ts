@@ -1,8 +1,11 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and } from "drizzle-orm";
+import { eq, and, gte, count } from "drizzle-orm";
+import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { funnels } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
+import { leadTasks } from "../db/schema/lead-tasks";
+import { callRecords } from "../db/schema/call-records";
 import { createId, ApiError } from "../lib/helpers";
 import { buildCockpit, type Funnel, type Lead } from "../lib/funnel-service";
 import { getOrgId } from "../lib/auth";
@@ -214,6 +217,128 @@ router.get(
           bounceRate: totalLeads > 0 ? Math.round((emailBounces / emailBase) * 1000) / 10 : 0,
           needsAttention: bounceEvents.slice(0, 10),
         },
+      },
+    });
+  }),
+);
+
+// ─── GET /dashboard/rep ────────────────────────────────────────────────────
+// Per-rep daily command-center: today's KPI counters + today's tasks. Calls
+// are attributed to the current user; email/LinkedIn/replies are org-wide
+// (no per-rep attribution exists yet — honest, not fabricated).
+
+/** Default daily activity goals (used until per-rep KPI targets are wired). */
+const REP_GOALS = { calls: 20, emails: 40, linkedin: 25, replies: 6 };
+
+router.get(
+  "/dashboard/rep",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const endOfToday = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
+
+    // ── Calls today (attributed to this rep) ──
+    let callsToday = 0;
+    if (userId) {
+      const [row] = await db
+        .select({ c: count() })
+        .from(callRecords)
+        .where(
+          and(
+            eq(callRecords.organizationId, orgId),
+            eq(callRecords.userId, userId),
+            gte(callRecords.calledAt, startOfToday),
+          ),
+        );
+      callsToday = Number(row?.c || 0);
+    }
+
+    // ── Email / LinkedIn / reply activity today (org-wide) ──
+    const todayEvents = await db
+      .select({ type: leadEvents.type, outcome: leadEvents.outcome, meta: leadEvents.meta })
+      .from(leadEvents)
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), gte(leadEvents.timestamp, startOfToday)));
+
+    let emailsToday = 0;
+    let linkedinToday = 0;
+    let repliesToday = 0;
+    for (const e of todayEvents) {
+      const channel = ((e.meta as Record<string, unknown> | null)?.channel as string) || "";
+      const isEmail =
+        (e.type === "step_outcome" && channel === "email") ||
+        (e.type === "smartlead_webhook" && e.outcome === "sent");
+      const isLinkedin =
+        e.type === "linkedin_action" || (e.type === "step_outcome" && channel === "linkedin");
+      const isReply =
+        e.type === "reply_handled" ||
+        e.outcome === "replied";
+      if (isEmail) emailsToday++;
+      else if (isLinkedin) linkedinToday++;
+      if (isReply) repliesToday++;
+    }
+
+    // ── Today's tasks (lead_tasks due/overdue + done today), enriched ──
+    const taskRows = await db
+      .select({
+        id: leadTasks.id,
+        label: leadTasks.label,
+        dueAt: leadTasks.dueAt,
+        done: leadTasks.done,
+        leadId: leadTasks.leadId,
+        funnelId: leadTasks.funnelId,
+        updatedAt: leadTasks.updatedAt,
+        leadName: leads.name,
+        company: leads.company,
+        campaignName: funnels.name,
+      })
+      .from(leadTasks)
+      .innerJoin(leads, eq(leadTasks.leadId, leads.id))
+      .innerJoin(funnels, eq(leadTasks.funnelId, funnels.id))
+      .where(eq(leadTasks.organizationId, orgId));
+
+    const tasks = taskRows
+      .filter((t) => {
+        if (t.done) return t.updatedAt >= startOfToday && t.updatedAt < endOfToday; // done today
+        return !t.dueAt || t.dueAt < endOfToday; // open + due today or overdue (or undated)
+      })
+      .map((t) => {
+        const overdue = !t.done && !!t.dueAt && t.dueAt < startOfToday;
+        return {
+          id: t.id,
+          label: t.label,
+          dueAt: t.dueAt ? t.dueAt.toISOString() : null,
+          done: t.done,
+          leadId: t.leadId,
+          funnelId: t.funnelId,
+          leadName: t.leadName,
+          company: t.company,
+          campaignName: t.campaignName,
+          group: overdue ? "overdue" : "today",
+        };
+      })
+      .sort((a, b) => {
+        const at = a.dueAt ? new Date(a.dueAt).getTime() : Infinity;
+        const bt = b.dueAt ? new Date(b.dueAt).getTime() : Infinity;
+        return at - bt;
+      });
+
+    const tasksDone = tasks.filter((t) => t.done).length;
+
+    res.json({
+      data: {
+        kpis: {
+          calls: { value: callsToday, goal: REP_GOALS.calls },
+          emails: { value: emailsToday, goal: REP_GOALS.emails },
+          linkedin: { value: linkedinToday, goal: REP_GOALS.linkedin },
+          replies: { value: repliesToday, goal: REP_GOALS.replies },
+          tasks: { value: tasksDone, goal: tasks.length },
+        },
+        tasks,
       },
     });
   }),
