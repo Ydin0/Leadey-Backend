@@ -1338,6 +1338,57 @@ router.post(
   }),
 );
 
+// ─── POST /funnels/:funnelId/leads/:leadId/notes ─────────────────────────
+// Persists a free-text note as a lead event so it survives reloads and shows
+// in the lead's activity timeline.
+router.post(
+  "/funnels/:funnelId/leads/:leadId/notes",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const text = normalizeString(req.body && req.body.text);
+    if (!text) {
+      throw new ApiError(400, "text is required");
+    }
+
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) {
+      throw new ApiError(404, "Lead not found in funnel");
+    }
+
+    const id = createId("event");
+    const stepIndex = clamp(
+      (lead.currentStep || 1) - 1,
+      0,
+      Math.max(funnel.steps.length - 1, 0),
+    );
+    const timestamp = new Date();
+    await db.insert(leadEvents).values({
+      id,
+      leadId: lead.id,
+      type: "note",
+      outcome: null,
+      stepIndex,
+      meta: { text },
+      timestamp,
+    });
+
+    res.status(201).json({
+      data: {
+        id,
+        type: "note",
+        outcome: null,
+        stepIndex,
+        meta: { text },
+        timestamp: timestamp.toISOString(),
+      },
+    });
+  }),
+);
+
 // ─── POST /funnels/:funnelId/leads/:leadId/dnc ───────────────────────────
 // Toggles a single PERSON's Do-Not-Contact flag (compliance). NON-DESTRUCTIVE:
 // the person STAYS in every campaign — their lead rows just get flagged (shown
