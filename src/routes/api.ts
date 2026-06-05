@@ -1389,6 +1389,65 @@ router.post(
   }),
 );
 
+// ─── PATCH /funnels/:funnelId/leads/:leadId/notes/:eventId ────────────────
+// Edits a previously-saved note. Verifies the note belongs to this lead/org.
+router.patch(
+  "/funnels/:funnelId/leads/:leadId/notes/:eventId",
+  asyncHandler<{ funnelId: string; leadId: string; eventId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const text = normalizeString(req.body && req.body.text);
+    if (!text) throw new ApiError(400, "text is required");
+
+    const [ev] = await db
+      .select({ id: leadEvents.id, type: leadEvents.type })
+      .from(leadEvents)
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(
+        and(
+          eq(leadEvents.id, req.params.eventId),
+          eq(leads.id, req.params.leadId),
+          eq(funnels.organizationId, orgId),
+        ),
+      )
+      .limit(1);
+    if (!ev || ev.type !== "note") throw new ApiError(404, "Note not found");
+
+    await db
+      .update(leadEvents)
+      .set({ meta: { text } })
+      .where(eq(leadEvents.id, req.params.eventId));
+
+    res.json({ data: { id: req.params.eventId, meta: { text } } });
+  }),
+);
+
+// ─── DELETE /funnels/:funnelId/leads/:leadId/notes/:eventId ───────────────
+router.delete(
+  "/funnels/:funnelId/leads/:leadId/notes/:eventId",
+  asyncHandler<{ funnelId: string; leadId: string; eventId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+
+    const [ev] = await db
+      .select({ id: leadEvents.id, type: leadEvents.type })
+      .from(leadEvents)
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(
+        and(
+          eq(leadEvents.id, req.params.eventId),
+          eq(leads.id, req.params.leadId),
+          eq(funnels.organizationId, orgId),
+        ),
+      )
+      .limit(1);
+    if (!ev || ev.type !== "note") throw new ApiError(404, "Note not found");
+
+    await db.delete(leadEvents).where(eq(leadEvents.id, req.params.eventId));
+    res.status(204).end();
+  }),
+);
+
 // ─── POST /funnels/:funnelId/leads/:leadId/dnc ───────────────────────────
 // Toggles a single PERSON's Do-Not-Contact flag (compliance). NON-DESTRUCTIVE:
 // the person STAYS in every campaign — their lead rows just get flagged (shown

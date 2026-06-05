@@ -19,6 +19,9 @@ export const leadTasks = pgTable("lead_tasks", {
   label: text("label").notNull(),
   dueAt: timestamp("due_at", { withTimezone: true }),
   done: boolean("done").notNull().default(false),
+  /** Clerk user id the task is assigned to. Members can only assign to
+   *  themselves; admins/managers can assign to any org member. */
+  assigneeId: text("assignee_id"),
   createdBy: text("created_by"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

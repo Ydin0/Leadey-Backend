@@ -1,0 +1,1 @@
+ALTER TABLE "lead_tasks" ADD COLUMN "assignee_id" text;
