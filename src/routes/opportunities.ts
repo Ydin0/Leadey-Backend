@@ -76,7 +76,10 @@ function serializeStage(s: typeof pipelineStages.$inferSelect) {
   };
 }
 
-function serializeOpp(o: typeof opportunities.$inferSelect) {
+function serializeOpp(
+  o: typeof opportunities.$inferSelect,
+  funnelId: string | null = null,
+) {
   return {
     id: o.id,
     pipelineId: o.pipelineId,
@@ -86,6 +89,10 @@ function serializeOpp(o: typeof opportunities.$inferSelect) {
     masterContactId: o.masterContactId,
     ownerId: o.ownerId,
     sourceLeadId: o.sourceLeadId,
+    // The funnel (campaign) the source lead belongs to, when this opportunity
+    // was converted from a campaign lead. Lets the client deep-link clicks to
+    // the Lead View instead of the dedicated opportunity page.
+    funnelId,
     value: Number(o.value),
     currency: o.currency,
     probabilityOverride: o.probabilityOverride,
@@ -108,6 +115,24 @@ function serializeEvent(e: typeof opportunityEvents.$inferSelect) {
     userName: e.userName,
     createdAt: e.createdAt.toISOString(),
   };
+}
+
+/** Resolve sourceLeadId → funnelId for a batch of opportunity rows, so the
+ *  client can route opportunity clicks straight into the Lead View. */
+async function resolveLeadFunnels(
+  rows: Array<{ sourceLeadId: string | null }>,
+): Promise<Map<string, string>> {
+  const leadIds = Array.from(
+    new Set(rows.map((r) => r.sourceLeadId).filter((id): id is string => !!id)),
+  );
+  const map = new Map<string, string>();
+  if (!leadIds.length) return map;
+  const leadRows = await db
+    .select({ id: leads.id, funnelId: leads.funnelId })
+    .from(leads)
+    .where(inArray(leads.id, leadIds));
+  for (const l of leadRows) map.set(l.id, l.funnelId);
+  return map;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -492,8 +517,9 @@ router.get(
       };
     }
 
+    const leadFunnels = await resolveLeadFunnels(rows);
     res.json({
-      data: rows.map(serializeOpp),
+      data: rows.map((o) => serializeOpp(o, o.sourceLeadId ? leadFunnels.get(o.sourceLeadId) ?? null : null)),
       summary: summaryPayload,
     });
   }),
@@ -594,9 +620,11 @@ router.get(
       .innerJoin(masterContacts, eq(masterContacts.id, opportunityContacts.masterContactId))
       .where(eq(opportunityContacts.opportunityId, id));
 
+    const leadFunnels = await resolveLeadFunnels([opp]);
+
     res.json({
       data: {
-        ...serializeOpp(opp),
+        ...serializeOpp(opp, opp.sourceLeadId ? leadFunnels.get(opp.sourceLeadId) ?? null : null),
         company: company
           ? { id: company.id, name: company.name, domain: company.domain, logo: company.logo, industry: company.industry }
           : null,
@@ -1086,7 +1114,7 @@ router.post(
       });
     });
     const [created] = await db.select().from(opportunities).where(eq(opportunities.id, oppId));
-    res.status(201).json({ data: serializeOpp(created) });
+    res.status(201).json({ data: serializeOpp(created, lead.funnelId) });
   }),
 );
 

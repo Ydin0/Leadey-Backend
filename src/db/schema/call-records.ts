@@ -14,6 +14,12 @@ export const callRecords = pgTable("call_records", {
   toNumber: text("to_number").notNull(),
   contactName: text("contact_name"),
   companyName: text("company_name"),
+  /** Campaign lead this call was placed against (when dialed from a lead/
+   *  campaign context). Nullable + no FK so a record is never lost if the lead
+   *  is later removed; the lead view also falls back to phone-number matching
+   *  for calls that predate this column. */
+  leadId: text("lead_id"),
+  funnelId: text("funnel_id"),
   duration: integer("duration").notNull().default(0),
   disposition: text("disposition").notNull().default("completed"),
   // Recording

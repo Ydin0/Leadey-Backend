@@ -1,5 +1,6 @@
 export { funnels, funnelSteps, funnelMembers } from "./funnels";
 export { leads, leadEvents } from "./leads";
+export { leadTasks } from "./lead-tasks";
 export { imports } from "./imports";
 export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";

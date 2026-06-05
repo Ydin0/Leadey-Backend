@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc, sql, ilike, isNotNull, gte, lte, or, count } from "drizzle-orm";
+import { eq, and, desc, sql, ilike, isNotNull, gte, lte, or, count, inArray } from "drizzle-orm";
 import multer from "multer";
 import { getAuth } from "@clerk/express";
 import twilioSdk from "twilio";
@@ -527,6 +527,7 @@ router.get(
     const hasRecording = req.query.hasRecording as string | undefined;
     const search = req.query.search as string | undefined;
     const disposition = req.query.disposition as string | undefined;
+    const leadIdParam = req.query.leadId as string | undefined;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(parseInt(req.query.limit as string) || 25, 200);
     const offset = req.query.page ? (page - 1) * limit : parseInt(req.query.offset as string) || 0;
@@ -537,6 +538,32 @@ router.get(
     if (userId) conditions.push(eq(callRecords.userId, userId));
     if (disposition) conditions.push(eq(callRecords.disposition, disposition));
     if (hasRecording === "true") conditions.push(isNotNull(callRecords.recordingUrl));
+    // Filter to a single campaign lead's calls. Matches the precise leadId we
+    // now stamp at dial time, OR (fallback for calls that predate that column)
+    // any call to/from the lead's or its sibling contacts' phone numbers.
+    if (leadIdParam) {
+      const [lead] = await db
+        .select({ phone: leads.phone, company: leads.company, funnelId: leads.funnelId })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(leads.id, leadIdParam), eq(funnels.organizationId, orgId)))
+        .limit(1);
+      const leadConds = [eq(callRecords.leadId, leadIdParam)];
+      if (lead) {
+        const siblings = await db
+          .select({ phone: leads.phone })
+          .from(leads)
+          .where(and(eq(leads.funnelId, lead.funnelId), eq(leads.company, lead.company)));
+        const phoneSet = Array.from(
+          new Set([lead.phone, ...siblings.map((s) => s.phone)].filter((p) => p && p.trim())),
+        ) as string[];
+        if (phoneSet.length) {
+          leadConds.push(inArray(callRecords.toNumber, phoneSet));
+          leadConds.push(inArray(callRecords.fromNumber, phoneSet));
+        }
+      }
+      conditions.push(or(...leadConds)!);
+    }
     if (search) {
       conditions.push(
         or(
@@ -633,6 +660,8 @@ router.post(
       toNumber,
       contactName,
       companyName,
+      leadId,
+      funnelId,
       duration,
       disposition,
       userName: bodyUserName,
@@ -679,6 +708,8 @@ router.post(
         toNumber: safeTo,
         contactName: contactName || null,
         companyName: companyName || null,
+        leadId: leadId || null,
+        funnelId: funnelId || null,
         duration: duration ?? 0,
         disposition: disposition || "completed",
         userId,
