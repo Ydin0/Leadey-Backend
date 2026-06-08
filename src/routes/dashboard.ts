@@ -45,6 +45,9 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
     status: result.status,
     sourceTypes: result.sourceTypes,
     smartleadCampaignId: result.smartleadCampaignId,
+    webhookToken: result.webhookToken,
+    webhookEnabled: result.webhookEnabled,
+    webhookFieldMap: result.webhookFieldMap || {},
     createdAt: result.createdAt,
     steps: result.steps.map((s) => ({
       id: s.id,

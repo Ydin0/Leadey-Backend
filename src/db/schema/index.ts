@@ -1,5 +1,6 @@
 export { funnels, funnelSteps, funnelMembers } from "./funnels";
 export { leads, leadEvents } from "./leads";
+export { leadFieldDefinitions, leadFieldValues } from "./custom-fields";
 export { leadTasks } from "./lead-tasks";
 export { imports } from "./imports";
 export { settings } from "./settings";
@@ -37,6 +38,8 @@ export {
   funnelMembersRelations,
   leadsRelations,
   leadEventsRelations,
+  leadFieldDefinitionsRelations,
+  leadFieldValuesRelations,
   importsRelations,
   settingsRelations,
   linkedinRateLimitsRelations,

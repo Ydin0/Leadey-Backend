@@ -1,6 +1,7 @@
 import { relations } from "drizzle-orm";
 import { funnels, funnelSteps, funnelMembers } from "./funnels";
 import { leads, leadEvents } from "./leads";
+import { leadFieldDefinitions, leadFieldValues } from "./custom-fields";
 import { imports } from "./imports";
 import { settings } from "./settings";
 import { linkedinRateLimits } from "./linkedin-rate-limits";
@@ -51,12 +52,28 @@ export const leadsRelations = relations(leads, ({ one, many }) => ({
     references: [funnels.id],
   }),
   events: many(leadEvents),
+  customFieldValues: many(leadFieldValues),
 }));
 
 export const leadEventsRelations = relations(leadEvents, ({ one }) => ({
   lead: one(leads, {
     fields: [leadEvents.leadId],
     references: [leads.id],
+  }),
+}));
+
+export const leadFieldDefinitionsRelations = relations(leadFieldDefinitions, ({ many }) => ({
+  values: many(leadFieldValues),
+}));
+
+export const leadFieldValuesRelations = relations(leadFieldValues, ({ one }) => ({
+  lead: one(leads, {
+    fields: [leadFieldValues.leadId],
+    references: [leads.id],
+  }),
+  definition: one(leadFieldDefinitions, {
+    fields: [leadFieldValues.fieldDefinitionId],
+    references: [leadFieldDefinitions.id],
   }),
 }));
 

@@ -1,4 +1,4 @@
-import { pgTable, text, integer, jsonb, timestamp, unique } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, jsonb, timestamp, boolean, unique } from "drizzle-orm/pg-core";
 
 export const funnels = pgTable("funnels", {
   id: text("id").primaryKey(),
@@ -8,6 +8,13 @@ export const funnels = pgTable("funnels", {
   status: text("status").notNull().default("draft"),
   sourceTypes: jsonb("source_types").$type<string[]>().notNull().default([]),
   smartleadCampaignId: text("smartlead_campaign_id"),
+  /** Secret token embedded in the inbound webhook URL for this campaign. */
+  webhookToken: text("webhook_token"),
+  /** Whether the inbound lead-ingestion webhook is accepting requests. */
+  webhookEnabled: boolean("webhook_enabled").notNull().default(false),
+  /** Maps incoming payload keys → target field. Target is a standard lead
+   *  field name (e.g. "email") or a custom field as "custom:<fieldKey>". */
+  webhookFieldMap: jsonb("webhook_field_map").$type<Record<string, string>>().notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

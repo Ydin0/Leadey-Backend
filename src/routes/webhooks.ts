@@ -3,11 +3,14 @@ import { eq, and, sql } from "drizzle-orm";
 import { Webhook } from "svix";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
+import { funnels, funnelSteps } from "../db/schema/funnels";
 import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
 import { organizations, users } from "../db/schema/organizations";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
-import { createId } from "../lib/helpers";
+import { createId, scoreLead } from "../lib/helpers";
+import { setLeadCustomFields } from "../lib/custom-fields-service";
+import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig } from "../lib/stripe";
 
 const router = Router();
@@ -89,6 +92,190 @@ router.post("/smartlead", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("Webhook processing error:", err);
     res.status(200).json({ ok: true, error: "internal" });
+  }
+});
+
+// ─── POST /webhooks/funnels/:funnelId/leads ─────────────────────────────
+// Inbound lead-ingestion webhook for a campaign. Authenticated by a
+// per-funnel token (URL query `?token=` or `x-webhook-token` header).
+// External tools (Zapier, n8n, forms) POST a lead JSON body; payload keys
+// are mapped onto standard lead fields and org-defined custom fields.
+
+/** Standard lead fields a webhook payload can target. */
+const STANDARD_LEAD_FIELDS = new Set([
+  "name",
+  "email",
+  "company",
+  "title",
+  "phone",
+  "linkedinUrl",
+]);
+
+/** Convenience aliases so common payload keys map without explicit config. */
+const FIELD_ALIASES: Record<string, string> = {
+  full_name: "name",
+  fullname: "name",
+  company_name: "company",
+  job_title: "title",
+  phone_number: "phone",
+  linkedin_url: "linkedinUrl",
+  linkedin_profile: "linkedinUrl",
+  linkedin: "linkedinUrl",
+};
+
+function resolveTarget(
+  payloadKey: string,
+  fieldMap: Record<string, string>,
+): string | null {
+  // Explicit mapping wins.
+  if (fieldMap[payloadKey]) return fieldMap[payloadKey];
+  // Direct match against a standard field name.
+  if (STANDARD_LEAD_FIELDS.has(payloadKey)) return payloadKey;
+  // Known alias.
+  if (FIELD_ALIASES[payloadKey]) return FIELD_ALIASES[payloadKey];
+  return null;
+}
+
+router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
+  try {
+    const funnelId = String(req.params.funnelId);
+    const token = String(
+      req.query.token ?? req.headers["x-webhook-token"] ?? "",
+    );
+
+    const funnel = await db.query.funnels.findFirst({
+      where: eq(funnels.id, funnelId),
+    });
+
+    // Uniform 401 — don't leak whether the funnel exists.
+    if (
+      !funnel ||
+      !funnel.webhookEnabled ||
+      !funnel.webhookToken ||
+      token !== funnel.webhookToken
+    ) {
+      res.status(401).json({ ok: false, error: "unauthorized" });
+      return;
+    }
+
+    const body = (req.body && typeof req.body === "object") ? req.body : {};
+    const fieldMap = funnel.webhookFieldMap || {};
+
+    // Split the payload into standard lead fields and custom field values.
+    const standard: Record<string, string> = {};
+    const customValues: Record<string, string> = {};
+
+    for (const [rawKey, rawValue] of Object.entries(body)) {
+      if (rawValue === null || rawValue === undefined) continue;
+      const value = String(rawValue).trim();
+      if (!value) continue;
+      const target = resolveTarget(rawKey, fieldMap);
+      if (!target) continue;
+      if (target.startsWith("custom:")) {
+        customValues[target.slice("custom:".length)] = value;
+      } else if (STANDARD_LEAD_FIELDS.has(target)) {
+        standard[target] = value;
+      }
+    }
+
+    const email = (standard.email || "").toLowerCase();
+    // Require at least an email or a name to create a meaningful lead.
+    if (!email && !standard.name) {
+      res
+        .status(422)
+        .json({ ok: false, error: "payload must include an email or name" });
+      return;
+    }
+
+    const orgId = funnel.organizationId;
+    const totalSteps = await db.$count(funnelSteps, eq(funnelSteps.funnelId, funnelId));
+
+    // Upsert by email within this funnel (idempotent across webhook retries).
+    let existing = null as typeof leads.$inferSelect | null;
+    if (email) {
+      existing =
+        (await db.query.leads.findFirst({
+          where: and(eq(leads.funnelId, funnelId), eq(leads.email, email)),
+        })) || null;
+    }
+
+    let leadId: string;
+    let created: boolean;
+
+    if (existing) {
+      leadId = existing.id;
+      created = false;
+      const patch: Partial<typeof leads.$inferInsert> = { updatedAt: new Date() };
+      if (standard.name) patch.name = standard.name;
+      if (standard.company) patch.company = standard.company;
+      if (standard.title) patch.title = standard.title;
+      if (standard.phone) patch.phone = standard.phone;
+      if (standard.linkedinUrl) patch.linkedinUrl = standard.linkedinUrl;
+      await db.update(leads).set(patch).where(eq(leads.id, leadId));
+    } else {
+      leadId = createId("lead");
+      created = true;
+      await db.insert(leads).values({
+        id: leadId,
+        funnelId,
+        name: standard.name || standard.company || email || "Unknown",
+        title: standard.title || "",
+        company: standard.company || "",
+        email,
+        phone: standard.phone || "",
+        linkedinUrl: standard.linkedinUrl || "",
+        currentStep: 1,
+        totalSteps: Math.max(1, totalSteps),
+        status: "pending",
+        source: "Webhook",
+        sourceType: "webhook",
+        score: scoreLead({
+          name: standard.name,
+          email,
+          phone: standard.phone,
+          linkedinUrl: standard.linkedinUrl,
+          title: standard.title,
+          company: standard.company,
+        }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+
+    // Persist mapped custom field values.
+    if (Object.keys(customValues).length > 0) {
+      await setLeadCustomFields(orgId, leadId, customValues);
+    }
+
+    // Record the ingest event.
+    await db.insert(leadEvents).values({
+      id: createId("event"),
+      leadId,
+      type: "webhook_ingest",
+      outcome: created ? "created" : "updated",
+      stepIndex: 0,
+      meta: { source: "webhook", keys: Object.keys(body) },
+      timestamp: new Date(),
+    });
+
+    // Mirror new leads into the linked Smartlead campaign (non-blocking).
+    if (created && funnel.smartleadCampaignId) {
+      await pushLeadsToSmartlead(Number(funnel.smartleadCampaignId), orgId, [
+        {
+          id: leadId,
+          name: standard.name || "",
+          email,
+          company: standard.company || "",
+          phone: standard.phone,
+          linkedinUrl: standard.linkedinUrl,
+        },
+      ]);
+    }
+
+    res.status(created ? 201 : 200).json({ ok: true, leadId, created });
+  } catch (err) {
+    console.error("Inbound funnel webhook error:", err);
+    res.status(500).json({ ok: false, error: "internal" });
   }
 });
 

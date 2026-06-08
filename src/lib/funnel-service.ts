@@ -56,6 +56,8 @@ export interface Lead {
   doNotCall?: boolean;
   opportunityId?: string | null;
   notes: Record<string, string> | null;
+  /** Org-defined custom field values, joined in for the lead detail view. */
+  customFields?: { key: string; label: string; value: string; isLink: boolean }[];
   createdAt: Date;
   updatedAt: Date;
   events: LeadEvent[];
@@ -68,6 +70,9 @@ export interface Funnel {
   status: string;
   sourceTypes: string[];
   smartleadCampaignId: string | null;
+  webhookToken: string | null;
+  webhookEnabled: boolean;
+  webhookFieldMap: Record<string, string>;
   createdAt: Date;
   steps: Step[];
   leads: Lead[];
@@ -102,6 +107,7 @@ function serializeLead(lead: Lead) {
     doNotCall: lead.doNotCall ?? false,
     opportunityId: lead.opportunityId ?? null,
     notes: lead.notes,
+    customFields: lead.customFields ?? [],
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),
     events: lead.events.map((e) => ({
@@ -392,11 +398,24 @@ export function buildFunnelPayload(
   const metrics = computeMetrics(leads);
   const sources = computeSources(leads);
 
+  // Build the public inbound webhook URL from the configured base. Uses
+  // WEBHOOK_BASE_URL (e.g. the ngrok/public backend host) so the URL is
+  // reachable by external tools, not just the API origin the app talks to.
+  const webhookBase = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
+  const webhookUrl =
+    funnel.webhookToken && webhookBase
+      ? `${webhookBase}/webhooks/funnels/${funnel.id}/leads?token=${funnel.webhookToken}`
+      : null;
+
   return {
     id: funnel.id,
     name: funnel.name,
     description: funnel.description,
     status: funnel.status,
+    webhookToken: funnel.webhookToken,
+    webhookEnabled: funnel.webhookEnabled,
+    webhookFieldMap: funnel.webhookFieldMap || {},
+    webhookUrl,
     steps: funnel.steps.map(serializeStep),
     metrics,
     sources,

@@ -51,9 +51,11 @@ import {
   type Lead,
   type Step,
 } from "../lib/funnel-service";
-import { SmartleadClient, type SmartleadSequence, type SmartleadLeadInput } from "../lib/smartlead-client";
+import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client";
+import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { getSetting } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
+import { getCustomFieldsForLeads } from "../lib/custom-fields-service";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 
@@ -94,6 +96,18 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
 
   if (!result) return null;
 
+  // Lazily mint a webhook token for funnels created before this feature.
+  let webhookToken = result.webhookToken;
+  if (!webhookToken) {
+    webhookToken = createId("whk");
+    await db.update(funnels).set({ webhookToken }).where(eq(funnels.id, result.id));
+  }
+
+  // Join in org-defined custom field values for the lead detail view.
+  const customFieldsByLead = await getCustomFieldsForLeads(
+    result.leads.map((l) => l.id),
+  );
+
   return {
     id: result.id,
     name: result.name,
@@ -101,6 +115,9 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
     status: result.status,
     sourceTypes: result.sourceTypes,
     smartleadCampaignId: result.smartleadCampaignId,
+    webhookToken,
+    webhookEnabled: result.webhookEnabled,
+    webhookFieldMap: result.webhookFieldMap || {},
     createdAt: result.createdAt,
     steps: result.steps.map((s) => ({
       id: s.id,
@@ -141,6 +158,7 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
       doNotCall: l.doNotCall,
       opportunityId: l.opportunityId,
       notes: l.notes,
+      customFields: customFieldsByLead.get(l.id) ?? [],
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
       events: l.events.map((e) => ({
@@ -173,6 +191,9 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
     status: result.status,
     sourceTypes: result.sourceTypes,
     smartleadCampaignId: result.smartleadCampaignId,
+    webhookToken: result.webhookToken,
+    webhookEnabled: result.webhookEnabled,
+    webhookFieldMap: result.webhookFieldMap || {},
     createdAt: result.createdAt,
     steps: result.steps.map((s) => ({
       id: s.id,
@@ -401,6 +422,7 @@ router.post(
         description: normalizeString(description),
         status: normalizedStatus,
         sourceTypes: normalizedSourceTypes,
+        webhookToken: createId("whk"),
         createdAt: now,
       });
 
@@ -654,6 +676,50 @@ router.patch(
 
     const updated = await loadFunnel(orgId, req.params.funnelId);
     res.json({ data: buildFunnelPayload(updated!, { includeLeads: true }) });
+  }),
+);
+
+// ─── PATCH /funnels/:funnelId/webhook ────────────────────────────────────
+// Manage the inbound lead-ingestion webhook: enable/disable, rotate the
+// secret token, and update the payload→field mapping.
+
+router.patch(
+  "/funnels/:funnelId/webhook",
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+
+    const { enabled, rotateToken, fieldMap } = req.body || {};
+    const patch: Partial<typeof funnels.$inferInsert> = {};
+
+    if (typeof enabled === "boolean") {
+      patch.webhookEnabled = enabled;
+    }
+
+    if (rotateToken === true) {
+      patch.webhookToken = createId("whk");
+    }
+
+    if (fieldMap && typeof fieldMap === "object" && !Array.isArray(fieldMap)) {
+      // Sanitise: keep only string→string entries.
+      const clean: Record<string, string> = {};
+      for (const [key, value] of Object.entries(fieldMap)) {
+        const k = normalizeString(key);
+        const v = normalizeString(value);
+        if (k && v) clean[k] = v;
+      }
+      patch.webhookFieldMap = clean;
+    }
+
+    if (Object.keys(patch).length > 0) {
+      await db.update(funnels).set(patch).where(eq(funnels.id, funnel.id));
+    }
+
+    const updated = await loadFunnel(orgId, req.params.funnelId);
+    res.json({ data: buildFunnelPayload(updated!, { includeLeads: false }) });
   }),
 );
 
@@ -960,52 +1026,18 @@ router.post(
 
     // Push leads to Smartlead if campaign exists
     if (funnel.smartleadCampaignId && newLeads.length > 0) {
-      try {
-        const apiKey = await getSetting(orgId, "smartlead_api_key");
-        if (apiKey) {
-          const client = new SmartleadClient(apiKey);
-          const campaignId = Number(funnel.smartleadCampaignId);
-
-          // Convert leads to Smartlead format
-          const smartleadLeads: SmartleadLeadInput[] = newLeads.map((l) => {
-            const nameParts = (l.name || "").split(" ");
-            return {
-              email: l.email || "",
-              first_name: nameParts[0] || "",
-              last_name: nameParts.slice(1).join(" ") || "",
-              company_name: l.company || "",
-              phone_number: l.phone || undefined,
-              linkedin_profile: l.linkedinUrl || undefined,
-            };
-          });
-
-          // Batch push in groups of 100
-          for (let i = 0; i < smartleadLeads.length; i += 100) {
-            const batch = smartleadLeads.slice(i, i + 100);
-            const result = await client.addLeads(campaignId, batch, {
-              return_lead_ids: true,
-            });
-
-            // Map returned Smartlead lead IDs back to our leads
-            const newlyAdded = result.emailToLeadIdMap?.newlyAddedLeads;
-            if (newlyAdded) {
-              for (const [email, slLeadId] of Object.entries(newlyAdded)) {
-                const matchIdx = newLeads.findIndex(
-                  (nl) => nl.email?.toLowerCase() === email.toLowerCase(),
-                );
-                if (matchIdx >= 0) {
-                  await db
-                    .update(leads)
-                    .set({ smartleadLeadId: String(slLeadId) })
-                    .where(eq(leads.id, newLeads[matchIdx].id));
-                }
-              }
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Smartlead lead push failed (non-blocking):", err);
-      }
+      await pushLeadsToSmartlead(
+        Number(funnel.smartleadCampaignId),
+        orgId,
+        newLeads.map((l) => ({
+          id: l.id,
+          name: l.name,
+          email: l.email,
+          company: l.company,
+          phone: l.phone,
+          linkedinUrl: l.linkedinUrl,
+        })),
+      );
     }
 
     res.status(201).json({
