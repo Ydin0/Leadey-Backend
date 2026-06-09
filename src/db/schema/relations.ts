@@ -2,6 +2,7 @@ import { relations } from "drizzle-orm";
 import { funnels, funnelSteps, funnelMembers } from "./funnels";
 import { leads, leadEvents } from "./leads";
 import { leadFieldDefinitions, leadFieldValues } from "./custom-fields";
+import { emailDomains, emailMailboxes } from "./email";
 import { imports } from "./imports";
 import { settings } from "./settings";
 import { linkedinRateLimits } from "./linkedin-rate-limits";
@@ -74,6 +75,17 @@ export const leadFieldValuesRelations = relations(leadFieldValues, ({ one }) => 
   definition: one(leadFieldDefinitions, {
     fields: [leadFieldValues.fieldDefinitionId],
     references: [leadFieldDefinitions.id],
+  }),
+}));
+
+export const emailDomainsRelations = relations(emailDomains, ({ many }) => ({
+  mailboxes: many(emailMailboxes),
+}));
+
+export const emailMailboxesRelations = relations(emailMailboxes, ({ one }) => ({
+  domain: one(emailDomains, {
+    fields: [emailMailboxes.domainId],
+    references: [emailDomains.id],
   }),
 }));
 

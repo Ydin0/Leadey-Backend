@@ -23,6 +23,8 @@ import leadTasksRouter from "./routes/lead-tasks";
 import companiesRouter from "./routes/companies";
 import leadStatusesRouter from "./routes/lead-statuses";
 import customFieldsRouter from "./routes/custom-fields";
+import emailDomainsRouter from "./routes/email-domains";
+import emailMailboxesRouter from "./routes/email-mailboxes";
 import searchRouter from "./routes/search";
 import knowledgeBaseRouter from "./routes/knowledge-base";
 import adminRouter, { adminMeRouter } from "./routes/admin";
@@ -80,6 +82,8 @@ app.use("/api", requireAuth(), leadTasksRouter);
 app.use("/api", requireAuth(), companiesRouter);
 app.use("/api", requireAuth(), leadStatusesRouter);
 app.use("/api", requireAuth(), customFieldsRouter);
+app.use("/api", requireAuth(), emailDomainsRouter);
+app.use("/api", requireAuth(), emailMailboxesRouter);
 app.use("/api", requireAuth(), searchRouter);
 app.use("/api", requireAuth(), knowledgeBaseRouter);
 
