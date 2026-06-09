@@ -11,7 +11,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { organizations } from "./organizations";
-import { funnelSteps } from "./funnels";
+import { funnelSteps, funnels } from "./funnels";
 import { leads } from "./leads";
 import { callRecords } from "./call-records";
 import { masterContacts } from "./master";
@@ -93,9 +93,13 @@ export const dialerSessions = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
     userId: text("user_id").notNull(),
+    // Null when the session targets a whole campaign that has no call step.
     funnelStepId: text("funnel_step_id")
-      .notNull()
       .references(() => funnelSteps.id, { onDelete: "cascade" }),
+    // The campaign the session belongs to. Always set; the source of the
+    // queue when there's no specific call step.
+    funnelId: text("funnel_id")
+      .references(() => funnels.id, { onDelete: "cascade" }),
     status: text("status").notNull().default("active"), // active|paused|completed|abandoned
     totalLeads: integer("total_leads").notNull().default(0),
     completedLeads: integer("completed_leads").notNull().default(0),

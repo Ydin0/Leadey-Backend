@@ -419,6 +419,7 @@ function serializeSession(s: typeof dialerSessions.$inferSelect) {
     id: s.id,
     userId: s.userId,
     funnelStepId: s.funnelStepId,
+    funnelId: s.funnelId,
     status: s.status,
     totalLeads: s.totalLeads,
     completedLeads: s.completedLeads,
@@ -515,8 +516,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getUserId(req);
-    const { funnelStepId, filters } = req.body as {
-      funnelStepId: string;
+    const { funnelStepId, funnelId, filters } = req.body as {
+      funnelStepId?: string;
+      funnelId?: string;
       filters?: {
         excludeDoNotCall?: boolean;
         excludeRecentlyCalled?: boolean;
@@ -524,7 +526,9 @@ router.post(
         maxAttempts?: number | null;
       };
     };
-    if (!funnelStepId) throw new ApiError(400, "funnelStepId required");
+    if (!funnelStepId && !funnelId) {
+      throw new ApiError(400, "funnelStepId or funnelId required");
+    }
 
     const resolvedFilters = {
       excludeDoNotCall: filters?.excludeDoNotCall ?? true,
@@ -533,31 +537,56 @@ router.post(
       maxAttempts: filters?.maxAttempts ?? 3,
     };
 
-    // Verify the step belongs to this org and is a call channel
-    const [step] = await db
-      .select({ id: funnelSteps.id, channel: funnelSteps.channel, funnelId: funnelSteps.funnelId, sortOrder: funnelSteps.sortOrder })
-      .from(funnelSteps)
-      .innerJoin(funnels, eq(funnels.id, funnelSteps.funnelId))
-      .where(and(eq(funnelSteps.id, funnelStepId), eq(funnels.organizationId, orgId)));
-    if (!step) throw new ApiError(404, "Funnel step not found");
-    if (step.channel !== "call") {
-      throw new ApiError(400, `Dialer requires a call-channel step (got ${step.channel})`);
-    }
+    // Resolve the target. Two modes:
+    //   1. Step mode — a call-channel step; queue leads sitting on that step.
+    //   2. Campaign mode — no call step; queue every lead in the funnel that
+    //      has a phone number, regardless of which step they're on.
+    let sessionStepId: string | null = null;
+    let sessionFunnelId: string;
+    let candidateLeads: (typeof leads.$inferSelect)[];
 
-    // Pull candidate leads: same funnel, currentStep = step.sortOrder+1 (1-indexed),
-    // phone present. Then filter via master_contacts for DNC/timezone/attempts.
-    const stepNumber = step.sortOrder + 1;
-    const candidateLeads = await db
-      .select()
-      .from(leads)
-      .where(
-        and(
-          eq(leads.funnelId, step.funnelId),
-          eq(leads.currentStep, stepNumber),
-          sql`${leads.phone} <> ''`,
-        ),
-      )
-      .orderBy(asc(leads.createdAt));
+    if (funnelStepId) {
+      const [step] = await db
+        .select({ id: funnelSteps.id, channel: funnelSteps.channel, funnelId: funnelSteps.funnelId, sortOrder: funnelSteps.sortOrder })
+        .from(funnelSteps)
+        .innerJoin(funnels, eq(funnels.id, funnelSteps.funnelId))
+        .where(and(eq(funnelSteps.id, funnelStepId), eq(funnels.organizationId, orgId)));
+      if (!step) throw new ApiError(404, "Funnel step not found");
+      if (step.channel !== "call") {
+        throw new ApiError(400, `Dialer requires a call-channel step (got ${step.channel})`);
+      }
+      sessionStepId = step.id;
+      sessionFunnelId = step.funnelId;
+
+      // Leads on this step (currentStep is 1-indexed) with a phone.
+      const stepNumber = step.sortOrder + 1;
+      candidateLeads = await db
+        .select()
+        .from(leads)
+        .where(
+          and(
+            eq(leads.funnelId, step.funnelId),
+            eq(leads.currentStep, stepNumber),
+            sql`${leads.phone} <> ''`,
+          ),
+        )
+        .orderBy(asc(leads.createdAt));
+    } else {
+      // Campaign mode — verify the funnel belongs to the org.
+      const [funnel] = await db
+        .select({ id: funnels.id })
+        .from(funnels)
+        .where(and(eq(funnels.id, funnelId!), eq(funnels.organizationId, orgId)));
+      if (!funnel) throw new ApiError(404, "Campaign not found");
+      sessionFunnelId = funnel.id;
+
+      // Every lead in the funnel with a phone number, any step.
+      candidateLeads = await db
+        .select()
+        .from(leads)
+        .where(and(eq(leads.funnelId, funnel.id), sql`${leads.phone} <> ''`))
+        .orderBy(asc(leads.createdAt));
+    }
 
     // Resolve master contacts by linkedinUrl (preferred) then email.
     const linkedinUrls = candidateLeads.map((l) => l.linkedinUrl).filter(Boolean) as string[];
@@ -642,7 +671,7 @@ router.post(
     if (queue.length === 0) {
       throw new ApiError(
         400,
-        `No dialable leads on this step. Excluded — DNC:${excludedDnc} recent:${excludedRecent} attempts:${excludedAttempts} timezone:${excludedTimezone}`,
+        `No dialable leads found. Excluded — DNC:${excludedDnc} recent:${excludedRecent} attempts:${excludedAttempts} timezone:${excludedTimezone}`,
       );
     }
 
@@ -656,7 +685,8 @@ router.post(
           id: sessionId,
           organizationId: orgId,
           userId,
-          funnelStepId: step.id,
+          funnelStepId: sessionStepId,
+          funnelId: sessionFunnelId,
           status: "active",
           totalLeads: queue.length,
           completedLeads: 0,
@@ -845,36 +875,67 @@ router.post(
   asyncHandler(async (req, res) => {
     const s = await loadSessionOr404(req, req.params.id as string);
     const { dispositionSlug, notes, callRecordId } = req.body as {
-      dispositionSlug: string;
+      dispositionSlug?: string;
       notes?: string;
       callRecordId?: string;
     };
-    if (!dispositionSlug) throw new ApiError(400, "dispositionSlug required");
 
-    // Resolve disposition
-    const [disposition] = await db
-      .select()
-      .from(callDispositions)
-      .where(
-        and(
-          eq(callDispositions.organizationId, s.organizationId),
-          eq(callDispositions.slug, dispositionSlug),
-        ),
-      );
-    if (!disposition) throw new ApiError(400, `Unknown disposition: ${dispositionSlug}`);
+    // Auto mode (Close-style dialer): no disposition picked. Dialing the lead
+    // simply ticks off the call step. With a disposition, the legacy behaviour
+    // (funnel rules, lead-status, DNC) still applies.
+    const auto = !dispositionSlug;
 
-    // Resolve action — funnel rule overrides disposition default.
-    const [rule] = await db
-      .select()
-      .from(funnelDispositionRules)
-      .where(
-        and(
-          eq(funnelDispositionRules.funnelStepId, s.funnelStepId),
-          eq(funnelDispositionRules.dispositionId, disposition.id),
-        ),
-      );
-    const action = rule?.funnelAction || disposition.funnelAction;
-    const retryDays = rule?.retryAfterDays ?? disposition.retryAfterDays;
+    // Resolve disposition (only when one was provided).
+    const disposition = dispositionSlug
+      ? (
+          await db
+            .select()
+            .from(callDispositions)
+            .where(
+              and(
+                eq(callDispositions.organizationId, s.organizationId),
+                eq(callDispositions.slug, dispositionSlug),
+              ),
+            )
+        )[0]
+      : null;
+    if (dispositionSlug && !disposition) {
+      throw new ApiError(400, `Unknown disposition: ${dispositionSlug}`);
+    }
+
+    // Resolve action — a step-specific funnel rule overrides the disposition
+    // default. In auto mode we advance the lead past the call step (step mode)
+    // or do nothing (campaign mode, no step to tick).
+    const [rule] = disposition && s.funnelStepId
+      ? await db
+          .select()
+          .from(funnelDispositionRules)
+          .where(
+            and(
+              eq(funnelDispositionRules.funnelStepId, s.funnelStepId),
+              eq(funnelDispositionRules.dispositionId, disposition.id),
+            ),
+          )
+      : [];
+    const action = disposition
+      ? rule?.funnelAction || disposition.funnelAction
+      : s.funnelStepId
+        ? "advance"
+        : "none";
+    const retryDays = rule?.retryAfterDays ?? disposition?.retryAfterDays ?? null;
+
+    // For auto-mode step ticking we need the call step's position so the tick
+    // is idempotent across back→re-advance (set to one past the call step
+    // rather than blindly incrementing).
+    const callStepSortOrder =
+      auto && s.funnelStepId
+        ? (
+            await db
+              .select({ sortOrder: funnelSteps.sortOrder })
+              .from(funnelSteps)
+              .where(eq(funnelSteps.id, s.funnelStepId))
+          )[0]?.sortOrder ?? null
+        : null;
 
     // Begin transaction.
     const result = await db.transaction(async (tx) => {
@@ -897,7 +958,7 @@ router.post(
         .update(dialerQueueItems)
         .set({
           status: "completed",
-          dispositionId: disposition.id,
+          dispositionId: disposition?.id ?? null,
           notes: notes || null,
           callRecordId: callRecordId || null,
           calledAt: new Date(),
@@ -919,14 +980,21 @@ router.post(
       // Apply funnel action to the lead
       const [lead] = await tx.select().from(leads).where(eq(leads.id, current.leadId));
       if (lead) {
-        const leadStatus = disposition.leadStatus ?? null;
+        const leadStatus = disposition?.leadStatus ?? null;
 
         // 1) Step / schedule movement for the dialed contact.
         if (action === "advance") {
+          // Auto step-tick uses an absolute target (one past the call step) so
+          // it's idempotent under back→re-advance; the disposition path keeps
+          // the legacy relative increment.
+          const target =
+            callStepSortOrder !== null
+              ? Math.min(callStepSortOrder + 2, lead.totalSteps)
+              : Math.min(lead.currentStep + 1, lead.totalSteps);
           await tx
             .update(leads)
             .set({
-              currentStep: Math.min(lead.currentStep + 1, lead.totalSteps),
+              currentStep: target,
               nextDate: new Date(),
               updatedAt: new Date(),
             })
@@ -964,9 +1032,9 @@ router.post(
           id: createId("le"),
           leadId: lead.id,
           type: "call",
-          outcome: dispositionSlug,
+          outcome: dispositionSlug || "dialed",
           stepIndex: lead.currentStep,
-          meta: { dispositionId: disposition.id, callRecordId: callRecordId || null, action, leadStatus, retryDays },
+          meta: { dispositionId: disposition?.id ?? null, callRecordId: callRecordId || null, action, leadStatus, retryDays, auto },
         });
       }
 
@@ -991,7 +1059,9 @@ router.post(
 
       // Update session counters
       const newDispoCounts = { ...(s.dispositionsJson || {}) };
-      newDispoCounts[dispositionSlug] = (newDispoCounts[dispositionSlug] || 0) + 1;
+      if (dispositionSlug) {
+        newDispoCounts[dispositionSlug] = (newDispoCounts[dispositionSlug] || 0) + 1;
+      }
       const completedLeads = s.completedLeads + 1;
       const isLast = !next;
       await tx
@@ -1132,6 +1202,22 @@ router.post(
           calledAt: null,
         })
         .where(eq(dialerQueueItems.id, prev.id));
+
+      // Un-tick the call step for the re-opened lead (step mode only). The
+      // auto step-tick set currentStep to one past the call step; reset it
+      // back to the call step so re-dialing behaves the same as the first time.
+      if (s.funnelStepId) {
+        const [fs] = await tx
+          .select({ sortOrder: funnelSteps.sortOrder })
+          .from(funnelSteps)
+          .where(eq(funnelSteps.id, s.funnelStepId));
+        if (fs) {
+          await tx
+            .update(leads)
+            .set({ currentStep: fs.sortOrder + 1, updatedAt: new Date() })
+            .where(eq(leads.id, prev.leadId));
+        }
+      }
       // Decrement counters (best-effort: dispositions counts left as-is —
       // a back+advance will inflate counts, acceptable for v1).
       await tx
