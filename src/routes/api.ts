@@ -1083,7 +1083,7 @@ router.patch(
       type: "status_change",
       outcome: status,
       stepIndex: Math.max((lead.currentStep || 1) - 1, 0),
-      meta: { manual: true },
+      meta: { manual: true, userId: getAuth(req as unknown as Request)?.userId ?? null },
       timestamp: new Date(now),
     });
 
@@ -1398,13 +1398,14 @@ router.post(
       Math.max(funnel.steps.length - 1, 0),
     );
     const timestamp = new Date();
+    const noteMeta = { text, userId: getAuth(req as unknown as Request)?.userId ?? null };
     await db.insert(leadEvents).values({
       id,
       leadId: lead.id,
       type: "note",
       outcome: null,
       stepIndex,
-      meta: { text },
+      meta: noteMeta,
       timestamp,
     });
 
@@ -1414,7 +1415,7 @@ router.post(
         type: "note",
         outcome: null,
         stepIndex,
-        meta: { text },
+        meta: noteMeta,
         timestamp: timestamp.toISOString(),
       },
     });
@@ -1431,7 +1432,7 @@ router.patch(
     if (!text) throw new ApiError(400, "text is required");
 
     const [ev] = await db
-      .select({ id: leadEvents.id, type: leadEvents.type })
+      .select({ id: leadEvents.id, type: leadEvents.type, meta: leadEvents.meta })
       .from(leadEvents)
       .innerJoin(leads, eq(leadEvents.leadId, leads.id))
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
@@ -1445,12 +1446,14 @@ router.patch(
       .limit(1);
     if (!ev || ev.type !== "note") throw new ApiError(404, "Note not found");
 
+    // Preserve the original author (and any other meta) when editing the text.
+    const mergedMeta = { ...(ev.meta || {}), text };
     await db
       .update(leadEvents)
-      .set({ meta: { text } })
+      .set({ meta: mergedMeta })
       .where(eq(leadEvents.id, req.params.eventId));
 
-    res.json({ data: { id: req.params.eventId, meta: { text } } });
+    res.json({ data: { id: req.params.eventId, meta: mergedMeta } });
   }),
 );
 

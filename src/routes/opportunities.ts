@@ -1111,7 +1111,7 @@ router.post(
         type: "converted",
         outcome: "opportunity_created",
         stepIndex: lead.currentStep,
-        meta: { opportunityId: oppId, pipelineId, stageId, oppName, userName },
+        meta: { opportunityId: oppId, pipelineId, stageId, oppName, userName, userId },
       });
     });
     const [created] = await db.select().from(opportunities).where(eq(opportunities.id, oppId));
