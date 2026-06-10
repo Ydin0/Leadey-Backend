@@ -1,13 +1,45 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db/index";
-import { emailMailboxes } from "../db/schema/email";
+import { emailMailboxes, emailDomains } from "../db/schema/email";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
 import { getSetting } from "../lib/settings-service";
-import { SmartleadClient } from "../lib/smartlead-client";
+import { SmartleadClient, type SmartleadEmailAccount } from "../lib/smartlead-client";
 
 const router = Router();
+
+/** Map Smartlead's account `type` to a display provider. */
+function providerFromType(type?: string): string {
+  const t = (type || "").toUpperCase();
+  if (t.includes("GMAIL") || t.includes("GOOGLE")) return "Google";
+  if (t.includes("OUTLOOK") || t.includes("MICROSOFT") || t.includes("OFFICE")) return "Outlook";
+  if (t.includes("SMTP")) return "SMTP";
+  return "Google";
+}
+
+/** Parse Smartlead warmup reputation ("98%" | 98 | null) to 0–100. */
+function parseReputation(v: unknown): number {
+  if (typeof v === "number") return Math.round(v);
+  if (typeof v === "string") {
+    const n = parseFloat(v.replace("%", "").trim());
+    return Number.isFinite(n) ? Math.round(n) : 0;
+  }
+  return 0;
+}
+
+function warmupState(acc: SmartleadEmailAccount): "on" | "ramp" | "off" {
+  if (!acc.warmup_details) return "off";
+  const s = (acc.warmup_details.status || "").toUpperCase();
+  if (s === "PAUSED" || s === "INACTIVE" || s === "OFF" || s === "STOPPED") return "off";
+  return "on";
+}
+
+function domainStatus(health: number): "healthy" | "warning" | "critical" {
+  if (health >= 90) return "healthy";
+  if (health >= 70) return "warning";
+  return "critical";
+}
 
 function asyncHandler(
   handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
@@ -143,6 +175,41 @@ router.post(
     const client = new SmartleadClient(apiKey);
     const accounts = await client.getEmailAccounts();
 
+    const now = new Date();
+
+    // ── 1. Ensure a domain row exists for every distinct mailbox domain ──
+    const domainNames = new Set<string>();
+    for (const acc of accounts) {
+      const email = (acc.from_email || acc.email || "").toLowerCase();
+      const dom = email.split("@")[1];
+      if (dom) domainNames.add(dom);
+    }
+    const existingDomains = await db
+      .select()
+      .from(emailDomains)
+      .where(eq(emailDomains.organizationId, orgId));
+    const domainIdByName = new Map(existingDomains.map((d) => [d.name.toLowerCase(), d.id]));
+    for (const dom of domainNames) {
+      if (!domainIdByName.has(dom)) {
+        const id = createId("edom");
+        await db.insert(emailDomains).values({
+          id,
+          organizationId: orgId,
+          name: dom,
+          registrar: "Smartlead",
+          purchased: false,
+          ageLabel: "synced",
+          health: 0,
+          status: "warning",
+          dnsRecords: [],
+          createdAt: now,
+          updatedAt: now,
+        });
+        domainIdByName.set(dom, id);
+      }
+    }
+
+    // ── 2. Upsert each mailbox with real Smartlead data ──
     const existing = await db
       .select()
       .from(emailMailboxes)
@@ -151,38 +218,64 @@ router.post(
 
     let created = 0;
     let updated = 0;
-    const now = new Date();
     for (const acc of accounts) {
-      const email = (acc.email || "").toLowerCase();
+      const email = (acc.from_email || acc.email || "").toLowerCase();
       if (!email) continue;
+      const dom = email.split("@")[1];
+      const domainId = dom ? domainIdByName.get(dom) ?? null : null;
       const match = byEmail.get(email);
-      const status = acc.is_active ? "active" : "paused";
+      const status = acc.is_smtp_success === false ? "disconnected" : acc.is_active === false ? "paused" : "active";
+      const reputation = parseReputation(acc.warmup_details?.warmup_reputation);
+      const fields = {
+        smartleadAccountId: String(acc.id),
+        domainId,
+        provider: providerFromType(acc.type),
+        warmup: warmupState(acc),
+        warmScore: reputation,
+        reputation,
+        sentToday: typeof acc.daily_sent_count === "number" ? acc.daily_sent_count : 0,
+        dailyLimit: typeof acc.message_per_day === "number" ? acc.message_per_day : match?.dailyLimit ?? 50,
+        status,
+        updatedAt: now,
+      };
       if (match) {
         await db
           .update(emailMailboxes)
-          .set({
-            smartleadAccountId: String(acc.id),
-            name: match.name || acc.from_name || "",
-            status: match.status === "disconnected" ? status : match.status,
-            updatedAt: now,
-          })
+          .set({ ...fields, name: match.name || acc.from_name || "" })
           .where(eq(emailMailboxes.id, match.id));
         updated++;
       } else {
         await db.insert(emailMailboxes).values({
           id: createId("embx"),
           organizationId: orgId,
-          smartleadAccountId: String(acc.id),
           email,
           name: acc.from_name || "",
-          provider: "Google",
-          warmup: "on",
-          status,
+          ...fields,
           createdAt: now,
-          updatedAt: now,
         });
         created++;
       }
+    }
+
+    // ── 3. Recompute each domain's health from its mailboxes' warmup ──
+    const allMailboxes = await db
+      .select()
+      .from(emailMailboxes)
+      .where(eq(emailMailboxes.organizationId, orgId));
+    const byDomainId = new Map<string, { sum: number; count: number }>();
+    for (const m of allMailboxes) {
+      if (!m.domainId) continue;
+      const agg = byDomainId.get(m.domainId) ?? { sum: 0, count: 0 };
+      agg.sum += m.reputation;
+      agg.count += 1;
+      byDomainId.set(m.domainId, agg);
+    }
+    for (const [domainId, agg] of byDomainId) {
+      const health = agg.count ? Math.round(agg.sum / agg.count) : 0;
+      await db
+        .update(emailDomains)
+        .set({ health, status: domainStatus(health), updatedAt: now })
+        .where(eq(emailDomains.id, domainId));
     }
 
     const rows = await db

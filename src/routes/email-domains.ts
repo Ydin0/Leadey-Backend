@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "../db/index";
-import { emailDomains, type DnsRecord } from "../db/schema/email";
+import { emailDomains, emailMailboxes, type DnsRecord } from "../db/schema/email";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
 
@@ -63,7 +63,18 @@ router.get(
       .from(emailDomains)
       .where(eq(emailDomains.organizationId, orgId))
       .orderBy(desc(emailDomains.createdAt));
-    res.json({ data: rows.map(serialize) });
+
+    // Real mailbox count per domain (from Smartlead-synced mailboxes).
+    const counts = await db
+      .select({ domainId: emailMailboxes.domainId, c: sql<number>`count(*)::int` })
+      .from(emailMailboxes)
+      .where(eq(emailMailboxes.organizationId, orgId))
+      .groupBy(emailMailboxes.domainId);
+    const countByDomain = new Map(counts.map((r) => [r.domainId, r.c]));
+
+    res.json({
+      data: rows.map((r) => ({ ...serialize(r), mailboxes: countByDomain.get(r.id) ?? 0 })),
+    });
   }),
 );
 

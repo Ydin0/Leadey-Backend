@@ -7,6 +7,18 @@ export interface SmartleadEmailAccount {
   email: string;
   from_name: string;
   is_active: boolean;
+  /** Real fields returned by GET /email-accounts (optional — parsed
+   *  defensively since Smartlead's shape varies by account type). */
+  from_email?: string;
+  type?: string; // GMAIL | OUTLOOK | SMTP | GMAIL_OAUTH | OUTLOOK_OAUTH
+  message_per_day?: number;
+  daily_sent_count?: number;
+  is_smtp_success?: boolean;
+  warmup_details?: {
+    status?: string; // ACTIVE | PAUSED | etc.
+    warmup_reputation?: string | number;
+  } | null;
+  [key: string]: unknown;
 }
 
 export interface SmartleadSequenceVariant {
