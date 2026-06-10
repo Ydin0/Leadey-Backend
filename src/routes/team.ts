@@ -184,6 +184,18 @@ router.post(
       }
     }
 
+    // Keep Clerk's org membership cap in sync with our seat allowance.
+    // Clerk enforces its own `max_allowed_memberships` (default 5) and will
+    // reject invites with "organization membership quota exceeded" even when
+    // we have seats free, so raise it to at least our seat limit first.
+    try {
+      await clerkClient.organizations.updateOrganization(orgId, {
+        maxAllowedMemberships: seatLimit,
+      });
+    } catch {
+      // Non-fatal — if this fails, the invite below surfaces the real error.
+    }
+
     try {
       // Create the Clerk user (with name) + org membership directly, then email
       // a magic-link sign-in. This reliably attaches them to the org (no
