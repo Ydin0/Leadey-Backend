@@ -45,6 +45,35 @@ export interface SmartleadLeadInput {
   [key: string]: string | undefined;
 }
 
+export interface SmartleadClientResult {
+  id: number;
+  api_key?: string;
+}
+
+export interface SmartleadAddEmailAccountInput {
+  from_name: string;
+  from_email: string;
+  user_name: string;
+  password: string;
+  smtp_host: string;
+  smtp_port: number;
+  imap_host: string;
+  imap_port: number;
+  warmup_enabled: boolean;
+  type?: string; // GMAIL | OUTLOOK | SMTP
+  max_email_per_day?: number;
+  total_warmup_per_day?: number;
+  daily_rampup?: number;
+  reply_rate_percentage?: number;
+  client_id?: number;
+}
+
+export interface SmartleadAddEmailAccountResult {
+  id: number;
+  is_smtp_success?: boolean;
+  is_imap_success?: boolean;
+}
+
 export class SmartleadClient {
   private apiKey: string;
   private requestCount = 0;
@@ -170,5 +199,46 @@ export class SmartleadClient {
     return this.request("POST", `/campaigns/${campaignId}/webhooks`, {
       webhook_url: webhookUrl,
     });
+  }
+
+  /** Create a white-label client (one per Leadey org). */
+  async createClient(input: {
+    name: string;
+    email: string;
+    password?: string;
+    permission?: string[];
+  }): Promise<SmartleadClientResult> {
+    const res = await this.request<{
+      ok?: boolean;
+      data?: SmartleadClientResult;
+      id?: number;
+      client_id?: number;
+      api_key?: string;
+    }>("POST", "/client/save", input);
+    const data = res.data ?? res;
+    const id = data.id ?? (res as { client_id?: number }).client_id;
+    if (id == null) throw new Error("Smartlead createClient returned no id");
+    return { id, api_key: data.api_key };
+  }
+
+  /** Add an email account (SMTP/IMAP or provider) — optionally scoped to a
+   *  client. Enables warmup. */
+  async addEmailAccount(
+    input: SmartleadAddEmailAccountInput,
+  ): Promise<SmartleadAddEmailAccountResult> {
+    const res = await this.request<{
+      ok?: boolean;
+      data?: SmartleadAddEmailAccountResult;
+      id?: number;
+      is_smtp_success?: boolean;
+      is_imap_success?: boolean;
+    }>("POST", "/email-accounts/save", input);
+    const data = res.data ?? res;
+    if (data.id == null) throw new Error("Smartlead addEmailAccount returned no id");
+    return {
+      id: data.id,
+      is_smtp_success: data.is_smtp_success,
+      is_imap_success: data.is_imap_success,
+    };
   }
 }

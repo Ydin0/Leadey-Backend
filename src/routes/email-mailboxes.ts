@@ -5,6 +5,7 @@ import { emailMailboxes, emailDomains } from "../db/schema/email";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
 import { getSmartleadApiKey } from "../lib/settings-service";
+import { ensureSmartleadClient } from "../lib/smartlead-provision";
 import { SmartleadClient, type SmartleadEmailAccount } from "../lib/smartlead-client";
 
 const router = Router();
@@ -284,6 +285,128 @@ router.post(
       .where(eq(emailMailboxes.organizationId, orgId))
       .orderBy(desc(emailMailboxes.createdAt));
     res.json({ data: { created, updated, mailboxes: rows.map(serialize) } });
+  }),
+);
+
+// POST /api/email/mailboxes/smtp — provision an SMTP/IMAP mailbox on Smartlead
+// under this org's white-label client, then mirror it into our DB.
+router.post(
+  "/email/mailboxes/smtp",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const b = req.body || {};
+    const fromEmail = normalizeString(b.fromEmail).toLowerCase();
+    const fromName = normalizeString(b.fromName);
+    const userName = normalizeString(b.userName) || fromEmail;
+    const password = typeof b.password === "string" ? b.password : "";
+    const smtpHost = normalizeString(b.smtpHost);
+    const smtpPort = Number(b.smtpPort);
+    const imapHost = normalizeString(b.imapHost) || smtpHost;
+    const imapPort = Number(b.imapPort) || 993;
+    const maxPerDay = typeof b.maxPerDay === "number" ? b.maxPerDay : 50;
+
+    if (!fromEmail || !password || !smtpHost || !Number.isFinite(smtpPort)) {
+      throw new ApiError(400, "fromEmail, password, smtpHost and smtpPort are required");
+    }
+
+    // One Smartlead client per org; provision the mailbox under it with warmup.
+    const { apiKey, clientId } = await ensureSmartleadClient(orgId);
+    const client = new SmartleadClient(apiKey);
+    const result = await client.addEmailAccount({
+      from_name: fromName || fromEmail,
+      from_email: fromEmail,
+      user_name: userName,
+      password,
+      smtp_host: smtpHost,
+      smtp_port: smtpPort,
+      imap_host: imapHost,
+      imap_port: imapPort,
+      warmup_enabled: true,
+      type: "SMTP",
+      max_email_per_day: maxPerDay,
+      total_warmup_per_day: 20,
+      daily_rampup: 2,
+      reply_rate_percentage: 30,
+      client_id: clientId,
+    });
+
+    const now = new Date();
+
+    // Ensure a domain row for the mailbox's domain.
+    const dom = fromEmail.split("@")[1];
+    let domainId: string | null = null;
+    if (dom) {
+      const [existingDomain] = await db
+        .select()
+        .from(emailDomains)
+        .where(and(eq(emailDomains.organizationId, orgId), eq(emailDomains.name, dom)));
+      if (existingDomain) {
+        domainId = existingDomain.id;
+      } else {
+        domainId = createId("edom");
+        await db.insert(emailDomains).values({
+          id: domainId,
+          organizationId: orgId,
+          name: dom,
+          registrar: "Smartlead",
+          purchased: false,
+          ageLabel: "synced",
+          health: 0,
+          status: "warning",
+          dnsRecords: [],
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+
+    const status = result.is_smtp_success === false ? "disconnected" : "active";
+
+    const [existingMb] = await db
+      .select()
+      .from(emailMailboxes)
+      .where(and(eq(emailMailboxes.organizationId, orgId), eq(emailMailboxes.email, fromEmail)));
+
+    let row;
+    if (existingMb) {
+      [row] = await db
+        .update(emailMailboxes)
+        .set({
+          smartleadAccountId: String(result.id),
+          name: fromName || existingMb.name,
+          provider: "SMTP",
+          warmup: "on",
+          status,
+          dailyLimit: maxPerDay,
+          domainId,
+          updatedAt: now,
+        })
+        .where(eq(emailMailboxes.id, existingMb.id))
+        .returning();
+    } else {
+      [row] = await db
+        .insert(emailMailboxes)
+        .values({
+          id: createId("embx"),
+          organizationId: orgId,
+          smartleadAccountId: String(result.id),
+          email: fromEmail,
+          name: fromName || "",
+          provider: "SMTP",
+          warmup: "on",
+          warmScore: 0,
+          sentToday: 0,
+          dailyLimit: maxPerDay,
+          reputation: 0,
+          status,
+          domainId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+    }
+
+    res.status(201).json({ data: serialize(row) });
   }),
 );
 
