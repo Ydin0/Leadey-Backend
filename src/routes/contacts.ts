@@ -8,7 +8,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { ApifyClient, mapSeniorityLevels, type ApifyProfileItem } from "../lib/apify-client";
 import { BetterContactClient, type BetterContactInput } from "../lib/bettercontact-client";
 import { SmartleadClient, type SmartleadLeadInput } from "../lib/smartlead-client";
-import { getSetting } from "../lib/settings-service";
+import { getSmartleadApiKey } from "../lib/settings-service";
 import { ApiError, createId, DAY_MS, scoreLead, dedupeKey } from "../lib/helpers";
 import { getOrgId } from "../lib/auth";
 import { upsertMasterContact } from "../lib/master-db";
@@ -989,7 +989,7 @@ router.post(
     // Push to Smartlead if campaign exists
     if (funnel.smartleadCampaignId && newLeads.length > 0) {
       try {
-        const apiKey = await getSetting(orgId, "smartlead_api_key");
+        const apiKey = await getSmartleadApiKey(orgId);
         if (apiKey) {
           const client = new SmartleadClient(apiKey);
           const campaignId = Number(funnel.smartleadCampaignId);

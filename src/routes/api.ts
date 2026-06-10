@@ -53,7 +53,7 @@ import {
 } from "../lib/funnel-service";
 import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
-import { getSetting } from "../lib/settings-service";
+import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads } from "../lib/custom-fields-service";
 import { getOrgId } from "../lib/auth";
@@ -475,7 +475,7 @@ router.post(
 
     if (emailStepsWithContent.length > 0) {
       try {
-        const apiKey = await getSetting(orgId, "smartlead_api_key");
+        const apiKey = await getSmartleadApiKey(orgId);
         if (apiKey) {
           const client = new SmartleadClient(apiKey);
           const campaign = await client.createCampaign(normalizeString(name));
@@ -659,7 +659,7 @@ router.patch(
     // Sync campaign status with Smartlead
     if (funnel.smartleadCampaignId) {
       try {
-        const apiKey = await getSetting(orgId, "smartlead_api_key");
+        const apiKey = await getSmartleadApiKey(orgId);
         if (apiKey) {
           const client = new SmartleadClient(apiKey);
           const campaignId = Number(funnel.smartleadCampaignId);

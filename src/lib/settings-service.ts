@@ -37,3 +37,13 @@ export async function deleteSetting(orgId: string, key: string): Promise<void> {
     and(eq(settings.organizationId, orgId), eq(settings.key, key)),
   );
 }
+
+/** Resolve the Smartlead API key for an org. We run a white-label Smartlead
+ *  account, so the platform key from the environment is used for every org —
+ *  customers never see or enter a Smartlead key. Falls back to a per-org key
+ *  only if the env var is unset (legacy/dev). */
+export async function getSmartleadApiKey(orgId: string): Promise<string | null> {
+  const envKey = process.env.SMARTLEAD_API_KEY?.trim();
+  if (envKey) return envKey;
+  return getSetting(orgId, "smartlead_api_key");
+}

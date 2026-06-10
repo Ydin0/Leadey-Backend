@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { leads } from "../db/schema/leads";
-import { getSetting } from "./settings-service";
+import { getSmartleadApiKey } from "./settings-service";
 import { SmartleadClient, type SmartleadLeadInput } from "./smartlead-client";
 
 export interface SmartleadSyncLead {
@@ -25,7 +25,7 @@ export async function pushLeadsToSmartlead(
   if (!Number.isFinite(campaignId) || newLeads.length === 0) return;
 
   try {
-    const apiKey = await getSetting(orgId, "smartlead_api_key");
+    const apiKey = await getSmartleadApiKey(orgId);
     if (!apiKey) return;
 
     const client = new SmartleadClient(apiKey);

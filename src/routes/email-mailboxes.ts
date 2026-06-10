@@ -4,7 +4,7 @@ import { db } from "../db/index";
 import { emailMailboxes, emailDomains } from "../db/schema/email";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
-import { getSetting } from "../lib/settings-service";
+import { getSmartleadApiKey } from "../lib/settings-service";
 import { SmartleadClient, type SmartleadEmailAccount } from "../lib/smartlead-client";
 
 const router = Router();
@@ -169,7 +169,7 @@ router.post(
   "/email/mailboxes/sync",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const apiKey = await getSetting(orgId, "smartlead_api_key");
+    const apiKey = await getSmartleadApiKey(orgId);
     if (!apiKey) throw new ApiError(400, "Smartlead is not connected");
 
     const client = new SmartleadClient(apiKey);
