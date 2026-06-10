@@ -330,6 +330,14 @@ router.delete(
         userId,
       });
 
+      // Detach immediately in our DB too — GET /team reads from the users
+      // table, so we can't wait on the Clerk webhook or the member reappears
+      // on refresh.
+      await db
+        .update(users)
+        .set({ organizationId: null, updatedAt: new Date() })
+        .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+
       res.json({ data: { id: userId, removed: true } });
     } catch (err: any) {
       throw new ApiError(400, err?.errors?.[0]?.message || "Failed to remove member");
