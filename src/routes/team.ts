@@ -336,24 +336,31 @@ router.delete(
       throw new ApiError(400, "You cannot remove yourself from the organization");
     }
 
+    // Remove the Clerk org membership. Treat "not found" as success — the
+    // member may already be gone in Clerk (or was never a live membership),
+    // but we still need to detach them in our DB so they leave the team list.
     try {
       await clerkClient.organizations.deleteOrganizationMembership({
         organizationId: orgId,
         userId,
       });
-
-      // Detach immediately in our DB too — GET /team reads from the users
-      // table, so we can't wait on the Clerk webhook or the member reappears
-      // on refresh.
-      await db
-        .update(users)
-        .set({ organizationId: null, updatedAt: new Date() })
-        .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
-
-      res.json({ data: { id: userId, removed: true } });
     } catch (err: any) {
-      throw new ApiError(400, err?.errors?.[0]?.message || "Failed to remove member");
+      const status = err?.status ?? err?.statusCode;
+      const msg = (err?.errors?.[0]?.message || err?.message || "").toLowerCase();
+      const alreadyGone = status === 404 || msg.includes("not found");
+      if (!alreadyGone) {
+        throw new ApiError(400, err?.errors?.[0]?.message || "Failed to remove member");
+      }
     }
+
+    // Detach in our DB — GET /team reads from the users table, so this is what
+    // actually removes them from the list (idempotent regardless of Clerk).
+    await db
+      .update(users)
+      .set({ organizationId: null, updatedAt: new Date() })
+      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+
+    res.json({ data: { id: userId, removed: true } });
   }),
 );
 
