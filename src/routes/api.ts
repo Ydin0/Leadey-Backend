@@ -1015,8 +1015,16 @@ router.post(
           }).onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
         }
       }
-      if (newLeads.length > 0) await tx.insert(leads).values(newLeads);
-      if (newEvents.length > 0) await tx.insert(leadEvents).values(newEvents);
+      // Batch inserts — Postgres caps a single statement at 65534 bind
+      // parameters, so a large import (thousands of rows × ~30 cols) must be
+      // chunked or it errors with MAX_PARAMETERS_EXCEEDED.
+      const INSERT_CHUNK = 500;
+      for (let i = 0; i < newLeads.length; i += INSERT_CHUNK) {
+        await tx.insert(leads).values(newLeads.slice(i, i + INSERT_CHUNK));
+      }
+      for (let i = 0; i < newEvents.length; i += INSERT_CHUNK) {
+        await tx.insert(leadEvents).values(newEvents.slice(i, i + INSERT_CHUNK));
+      }
       await tx.insert(imports).values({
         id: importId, funnelId: funnel.id, fileName: normalizedFileName,
         totalRows: rows.length, importedRows, skippedRows,

@@ -956,8 +956,15 @@ router.post(
 
     if (newLeads.length > 0) {
       await db.transaction(async (tx) => {
-        await tx.insert(leads).values(newLeads);
-        await tx.insert(leadEvents).values(newEvents);
+        // Chunk inserts — Postgres caps a statement at 65534 bind params, so
+        // large batches must be split or they hit MAX_PARAMETERS_EXCEEDED.
+        const INSERT_CHUNK = 500;
+        for (let i = 0; i < newLeads.length; i += INSERT_CHUNK) {
+          await tx.insert(leads).values(newLeads.slice(i, i + INSERT_CHUNK));
+        }
+        for (let i = 0; i < newEvents.length; i += INSERT_CHUNK) {
+          await tx.insert(leadEvents).values(newEvents.slice(i, i + INSERT_CHUNK));
+        }
       });
 
       // Mark contacts as in_funnel
