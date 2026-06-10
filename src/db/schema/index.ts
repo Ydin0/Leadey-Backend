@@ -3,6 +3,7 @@ export { leads, leadEvents } from "./leads";
 export { leadFieldDefinitions, leadFieldValues } from "./custom-fields";
 export { emailDomains, emailMailboxes } from "./email";
 export { leadTasks } from "./lead-tasks";
+export { leadHiringRoles } from "./hiring-roles";
 export { imports } from "./imports";
 export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";
