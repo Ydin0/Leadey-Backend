@@ -1553,6 +1553,65 @@ router.post(
 // org so the live-call UI can show the lead's name/company (and a profile link)
 // instead of a bare number. Matches on the last 9 digits to tolerate country
 // code / trunk-0 formatting differences.
+// GET /api/phone-lines/recent-calls — the current rep's recently-called leads,
+// deduped + newest first. Powers the search-bar quick-jump (handy when the
+// power dialer skipped to the next call before you dispositioned the last one).
+router.get(
+  "/phone-lines/recent-calls",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    if (!userId) {
+      res.json({ data: [] });
+      return;
+    }
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 8));
+
+    const rows = await db
+      .select({
+        leadId: callRecords.leadId,
+        funnelId: callRecords.funnelId,
+        contactName: callRecords.contactName,
+        companyName: callRecords.companyName,
+        calledAt: callRecords.calledAt,
+        leadName: leads.name,
+        leadCompany: leads.company,
+        leadDomain: leads.companyDomain,
+      })
+      .from(callRecords)
+      .leftJoin(leads, eq(callRecords.leadId, leads.id))
+      .where(
+        and(
+          eq(callRecords.organizationId, orgId),
+          eq(callRecords.userId, userId),
+          eq(callRecords.direction, "outbound"),
+          isNotNull(callRecords.leadId),
+          isNotNull(callRecords.funnelId),
+        ),
+      )
+      .orderBy(desc(callRecords.calledAt))
+      .limit(80);
+
+    // Dedup by lead (keep the most recent call), capped to `limit`.
+    const seen = new Set<string>();
+    const data: Array<{ leadId: string; funnelId: string; name: string; company: string; domain: string | null; calledAt: string }> = [];
+    for (const r of rows) {
+      if (!r.leadId || !r.funnelId || seen.has(r.leadId)) continue;
+      seen.add(r.leadId);
+      data.push({
+        leadId: r.leadId,
+        funnelId: r.funnelId,
+        name: r.leadName || r.contactName || "Unknown lead",
+        company: r.leadCompany || r.companyName || "",
+        domain: r.leadDomain || null,
+        calledAt: r.calledAt.toISOString(),
+      });
+      if (data.length >= limit) break;
+    }
+    res.json({ data });
+  }),
+);
+
 router.get(
   "/calls/resolve",
   asyncHandler(async (req, res) => {

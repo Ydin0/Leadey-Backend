@@ -31,6 +31,7 @@ import knowledgeBaseRouter from "./routes/knowledge-base";
 import importsRouter from "./routes/imports";
 import smsRouter from "./routes/sms";
 import notificationsRouter from "./routes/notifications";
+import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -67,6 +68,10 @@ app.use("/api/admin", requireApiAuth);
 app.use("/api/admin", adminMeRouter);
 app.use("/api/admin", requireAdmin, adminRouter);
 
+// Unauthenticated email routes (OAuth callback + open-tracking pixel) — must be
+// registered BEFORE the authed /api routers so they aren't gated by requireAuth.
+app.use(emailPublicRouter);
+
 // Authenticated API routes
 app.use("/api", requireAuth(), dashboardRouter);
 app.use("/api", requireAuth(), apiRouter);
@@ -94,6 +99,7 @@ app.use("/api", requireAuth(), knowledgeBaseRouter);
 app.use("/api", requireAuth(), importsRouter);
 app.use("/api", requireAuth(), smsRouter);
 app.use("/api", requireAuth(), notificationsRouter);
+app.use("/api", requireAuth(), emailAccountsRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

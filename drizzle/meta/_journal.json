@@ -225,6 +225,13 @@
       "when": 1781187243839,
       "tag": "0031_outstanding_weapon_omega",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1781193245887,
+      "tag": "0032_numerous_warhawk",
+      "breakpoints": true
     }
   ]
 }

@@ -7,6 +7,7 @@ export { leadHiringRoles } from "./hiring-roles";
 export { imports } from "./imports";
 export { smsMessages } from "./sms";
 export { notifications } from "./notifications";
+export { emailAccounts, emailMessages } from "./email-accounts";
 export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";
 export { organizations, users } from "./organizations";
