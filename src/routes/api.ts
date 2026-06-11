@@ -609,116 +609,177 @@ router.patch(
     const hasName = body.name !== undefined;
     const hasDescription = body.description !== undefined;
     const hasSteps = Array.isArray(body.steps);
+    const hasVisibility = body.visibility !== undefined;
+    const hasMembers = Array.isArray(body.members);
+    const hasConfig =
+      body.audience !== undefined || body.exit !== undefined || body.emailAutomation !== undefined;
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
       req.params.funnelId,
     );
 
-    // ── Editing name / description / steps ──────────────────────────────
-    if (hasName || hasDescription || hasSteps) {
-      const funnelUpdates: Record<string, unknown> = {};
+    // Unified update — the create-campaign wizard's "edit" mode can change any
+    // of: name, description, status, visibility, sequence steps, builder config
+    // (audience / exit / email automation) and the assigned members, in one call.
+    const funnelUpdates: Record<string, unknown> = {};
 
-      if (hasName) {
-        const name = normalizeString(body.name);
-        if (!name) throw new ApiError(400, "Funnel name cannot be empty");
-        funnelUpdates.name = name;
+    if (hasName) {
+      const name = normalizeString(body.name);
+      if (!name) throw new ApiError(400, "Funnel name cannot be empty");
+      funnelUpdates.name = name;
+    }
+    if (hasDescription) {
+      funnelUpdates.description = normalizeString(body.description);
+    }
+    if (hasVisibility) {
+      funnelUpdates.visibility =
+        normalizeString(body.visibility).toLowerCase() === "public" ? "public" : "private";
+    }
+
+    let normalizedStatus = "";
+    if (hasStatus) {
+      normalizedStatus = normalizeString(body.status).toLowerCase();
+      if (!normalizedStatus || !ALLOWED_STATUSES.has(normalizedStatus)) {
+        throw new ApiError(400, "Invalid funnel status");
       }
-      if (hasDescription) {
-        funnelUpdates.description = normalizeString(body.description);
+      funnelUpdates.status = normalizedStatus;
+    }
+    if (hasConfig) {
+      const cfg: Record<string, unknown> = { ...(funnel.config || {}) };
+      if (body.audience !== undefined) cfg.audience = body.audience;
+      if (body.exit !== undefined) cfg.exit = body.exit;
+      if (body.emailAutomation !== undefined) cfg.emailAutomation = body.emailAutomation;
+      funnelUpdates.config = cfg;
+    }
+
+    let normalizedSteps: Array<{
+      id: string;
+      channel: string;
+      label: string;
+      dayOffset: number;
+      subject: string | null;
+      emailBody: string | null;
+      action: string;
+    }> | null = null;
+
+    if (hasSteps) {
+      if (body.steps.length === 0) {
+        throw new ApiError(400, "At least one funnel step is required");
+      }
+      normalizedSteps = body.steps
+        .map(
+          (
+            step: { channel?: string; label?: string; dayOffset?: number; subject?: string; emailBody?: string; action?: string },
+            index: number,
+          ) => {
+            const channel = normalizeString(step.channel).toLowerCase();
+            const label = normalizeString(step.label) || `Step ${index + 1}`;
+            const dayOffset = Number(step.dayOffset);
+            const subject = normalizeString(step.subject) || null;
+            const emailBody = normalizeString(step.emailBody) || null;
+            const action = resolveAction(channel, step.action || null);
+            if (!ALLOWED_CHANNELS.has(channel)) {
+              throw new ApiError(400, `Invalid channel for step ${index + 1}`);
+            }
+            if (!Number.isFinite(dayOffset) || dayOffset < 0) {
+              throw new ApiError(400, `Invalid dayOffset for step ${index + 1}`);
+            }
+            return { id: createId("step"), channel, label, dayOffset, subject, emailBody, action };
+          },
+        )
+        .sort((a: { dayOffset: number }, b: { dayOffset: number }) => a.dayOffset - b.dayOffset);
+    }
+
+    if (
+      Object.keys(funnelUpdates).length === 0 &&
+      !normalizedSteps &&
+      !hasMembers
+    ) {
+      throw new ApiError(400, "Nothing to update");
+    }
+
+    // Resolve the owner so member sync never drops the campaign owner.
+    const auth = getAuth(req as unknown as Request);
+
+    await db.transaction(async (tx) => {
+      if (Object.keys(funnelUpdates).length > 0) {
+        await tx.update(funnels).set(funnelUpdates).where(eq(funnels.id, funnel.id));
       }
 
-      let normalizedSteps: Array<{
-        id: string;
-        channel: string;
-        label: string;
-        dayOffset: number;
-        subject: string | null;
-        emailBody: string | null;
-        action: string;
-      }> | null = null;
-
-      if (hasSteps) {
-        if (body.steps.length === 0) {
-          throw new ApiError(400, "At least one funnel step is required");
-        }
-        normalizedSteps = body.steps
-          .map(
-            (
-              step: { channel?: string; label?: string; dayOffset?: number; subject?: string; emailBody?: string; action?: string },
-              index: number,
-            ) => {
-              const channel = normalizeString(step.channel).toLowerCase();
-              const label = normalizeString(step.label) || `Step ${index + 1}`;
-              const dayOffset = Number(step.dayOffset);
-              const subject = normalizeString(step.subject) || null;
-              const emailBody = normalizeString(step.emailBody) || null;
-              const action = resolveAction(channel, step.action || null);
-              if (!ALLOWED_CHANNELS.has(channel)) {
-                throw new ApiError(400, `Invalid channel for step ${index + 1}`);
-              }
-              if (!Number.isFinite(dayOffset) || dayOffset < 0) {
-                throw new ApiError(400, `Invalid dayOffset for step ${index + 1}`);
-              }
-              return { id: createId("step"), channel, label, dayOffset, subject, emailBody, action };
-            },
-          )
-          .sort((a: { dayOffset: number }, b: { dayOffset: number }) => a.dayOffset - b.dayOffset);
+      if (normalizedSteps) {
+        // Replace the step set, then clamp every lead's progress to the new
+        // length so currentStep can't point past the end of the sequence.
+        await tx.delete(funnelSteps).where(eq(funnelSteps.funnelId, funnel.id));
+        await tx.insert(funnelSteps).values(
+          normalizedSteps.map((step, index) => ({
+            id: step.id,
+            funnelId: funnel.id,
+            channel: step.channel,
+            label: step.label,
+            dayOffset: step.dayOffset,
+            sortOrder: index,
+            subject: step.subject,
+            emailBody: step.emailBody,
+            action: step.action,
+          })),
+        );
+        const newLen = normalizedSteps.length;
+        await tx
+          .update(leads)
+          .set({
+            totalSteps: newLen,
+            currentStep: sql`LEAST(${leads.currentStep}, ${newLen})`,
+            updatedAt: new Date(),
+          })
+          .where(eq(leads.funnelId, funnel.id));
       }
 
-      await db.transaction(async (tx) => {
-        if (Object.keys(funnelUpdates).length > 0) {
-          await tx.update(funnels).set(funnelUpdates).where(eq(funnels.id, funnel.id));
-        }
+      // Sync assigned members to exactly `body.members` (contributors), while
+      // never touching the owner row.
+      if (hasMembers) {
+        const desired = new Set(
+          (body.members as unknown[])
+            .map((m) => (typeof m === "string" ? m : normalizeString((m as { userId?: string })?.userId)))
+            .filter((id: string) => !!id),
+        );
+        const existing = await tx
+          .select()
+          .from(funnelMembers)
+          .where(eq(funnelMembers.funnelId, funnel.id));
+        const ownerIds = new Set(existing.filter((m) => m.role === "owner").map((m) => m.userId));
+        const existingIds = new Set(existing.map((m) => m.userId));
 
-        if (normalizedSteps) {
-          // Replace the step set, then clamp every lead's progress to the new
-          // length so currentStep can't point past the end of the sequence.
-          await tx.delete(funnelSteps).where(eq(funnelSteps.funnelId, funnel.id));
-          await tx.insert(funnelSteps).values(
-            normalizedSteps.map((step, index) => ({
-              id: step.id,
-              funnelId: funnel.id,
-              channel: step.channel,
-              label: step.label,
-              dayOffset: step.dayOffset,
-              sortOrder: index,
-              subject: step.subject,
-              emailBody: step.emailBody,
-              action: step.action,
-            })),
-          );
-          const newLen = normalizedSteps.length;
+        const toRemove = existing
+          .filter((m) => m.role !== "owner" && !desired.has(m.userId))
+          .map((m) => m.userId);
+        if (toRemove.length > 0) {
           await tx
-            .update(leads)
-            .set({
-              totalSteps: newLen,
-              currentStep: sql`LEAST(${leads.currentStep}, ${newLen})`,
-              updatedAt: new Date(),
-            })
-            .where(eq(leads.funnelId, funnel.id));
+            .delete(funnelMembers)
+            .where(and(eq(funnelMembers.funnelId, funnel.id), inArray(funnelMembers.userId, toRemove)));
         }
-      });
 
-      const reloaded = await loadFunnel(orgId, req.params.funnelId);
-      res.json({ data: buildFunnelPayload(reloaded!, { includeLeads: true }) });
-      return;
-    }
+        const toAdd = [...desired].filter(
+          (id) => !existingIds.has(id) && !ownerIds.has(id) && id !== auth?.userId,
+        );
+        if (toAdd.length > 0) {
+          await tx
+            .insert(funnelMembers)
+            .values(
+              toAdd.map((userId) => ({
+                id: createId("fm"),
+                funnelId: funnel.id,
+                userId,
+                role: "contributor",
+              })),
+            )
+            .onConflictDoNothing();
+        }
+      }
+    });
 
-    // ── Status change (existing behavior) ───────────────────────────────
-    const normalizedStatus = normalizeString(body.status).toLowerCase();
-
-    if (!hasStatus || !normalizedStatus || !ALLOWED_STATUSES.has(normalizedStatus)) {
-      throw new ApiError(400, "Invalid funnel status");
-    }
-
-    await db
-      .update(funnels)
-      .set({ status: normalizedStatus })
-      .where(eq(funnels.id, funnel.id));
-
-    // Sync campaign status with Smartlead
-    if (funnel.smartleadCampaignId) {
+    // Sync campaign status with Smartlead when it changed.
+    if (hasStatus && funnel.smartleadCampaignId) {
       try {
         const apiKey = await getSmartleadApiKey(orgId);
         if (apiKey) {
@@ -735,8 +796,18 @@ router.patch(
       }
     }
 
-    const updated = await loadFunnel(orgId, req.params.funnelId);
-    res.json({ data: buildFunnelPayload(updated!, { includeLeads: true }) });
+    const reloaded = await loadFunnel(orgId, req.params.funnelId);
+    const payload = buildFunnelPayload(reloaded!, { includeLeads: true }) as Record<string, unknown>;
+    const memberRows = await db
+      .select()
+      .from(funnelMembers)
+      .where(eq(funnelMembers.funnelId, funnel.id));
+    payload.members = memberRows.map((m) => ({
+      teamMemberId: m.userId,
+      role: m.role,
+      addedAt: m.createdAt.toISOString(),
+    }));
+    res.json({ data: payload });
   }),
 );
 
