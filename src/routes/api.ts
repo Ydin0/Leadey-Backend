@@ -951,7 +951,7 @@ router.post(
       const linkedinUrl = getField(row, LBL.linkedin);
       const leadId = createId("lead");
       newLeads.push({
-        id: leadId, funnelId: funnel.id, name, title, company: canonicalCompany, email, phone, linkedinUrl,
+        id: leadId, funnelId: funnel.id, importId, name, title, company: canonicalCompany, email, phone, linkedinUrl,
         currentStep: 1, totalSteps: funnel.steps.length, status: "pending",
         nextAction: firstStep.label, nextDate: new Date(now + firstStep.dayOffset * DAY_MS),
         source: "CSV Import", sourceType: "csv",

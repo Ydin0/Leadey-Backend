@@ -157,6 +157,77 @@ webhookRouter.post(
     const recordingCallback = webhookBase ? `${webhookBase}/webhooks/twilio/recording` : undefined;
     const amdCallback = webhookBase ? `${webhookBase}/webhooks/twilio/amd` : undefined;
 
+    // ── Inbound PSTN call routing ────────────────────────────────────────
+    // A call placed by a browser softphone hits this same voice URL but with
+    // From="client:<userId>". Anything else is a real inbound call to one of
+    // our Twilio numbers, which must ring the browser(s) of whoever owns that
+    // number — otherwise the call never reaches the dashboard. (Previously the
+    // webhook treated every call as outbound and tried to dial the inbound
+    // number itself, so inbound calls never connected.)
+    const isFromBrowser = typeof from === "string" && from.startsWith("client:");
+    if (!isFromBrowser) {
+      try {
+        const { db } = await import("../db");
+        const { phoneLines } = await import("../db/schema/phone-lines");
+        const { users } = await import("../db/schema/organizations");
+        const { eq: e } = await import("drizzle-orm");
+
+        const dialedDigits = (to || "").replace(/[^\d]/g, "");
+        const allLines = await db
+          .select({
+            organizationId: phoneLines.organizationId,
+            assignedTo: phoneLines.assignedTo,
+            number: phoneLines.number,
+          })
+          .from(phoneLines);
+        // Match the called number exactly, then fall back to a digits-only
+        // comparison to tolerate formatting differences.
+        const line =
+          allLines.find((l) => l.number === to) ||
+          allLines.find((l) => l.number.replace(/[^\d]/g, "") === dialedDigits) ||
+          null;
+
+        // The browser registers with the user's Clerk id as its Voice identity,
+        // and phone_lines.assignedTo holds that same id. An assigned line rings
+        // just that user; an org-wide line rings everyone (first to answer wins).
+        let identities: string[] = [];
+        if (line?.assignedTo) {
+          identities = [line.assignedTo];
+        } else if (line) {
+          const orgUsers = await db
+            .select({ id: users.id })
+            .from(users)
+            .where(e(users.organizationId, line.organizationId));
+          identities = orgUsers.map((u) => u.id);
+        }
+
+        if (identities.length > 0) {
+          const dial = response.dial({
+            callerId: from || undefined,
+            answerOnBridge: true,
+            timeout: 25,
+            record: "record-from-answer-dual" as any,
+            recordingStatusCallback: recordingCallback,
+            recordingStatusCallbackEvent: "completed" as any,
+          } as any);
+          for (const id of identities) dial.client(id);
+        } else {
+          response.say(
+            "Sorry, no one is available to take your call right now. Please try again later.",
+          );
+          response.hangup();
+        }
+      } catch (err) {
+        console.error("[Twilio Voice] inbound routing failed:", err);
+        response.say(
+          "We are unable to take your call right now. Please try again later.",
+        );
+        response.hangup();
+      }
+      res.type("text/xml").send(response.toString());
+      return;
+    }
+
     // Answering Machine Detection: Twilio runs detection on the dialed leg.
     // When it concludes (machine_end_beep / human / etc.) it posts to
     // amdStatusCallback. The dialer uses that to auto-drop a voicemail.

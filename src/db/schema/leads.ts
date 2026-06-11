@@ -35,6 +35,10 @@ export const leads = pgTable("leads", {
   doNotCall: boolean("do_not_call").notNull().default(false),
   smartleadLeadId: text("smartlead_lead_id"),
   unipileProviderId: text("unipile_provider_id"),
+  /** The CSV import that created this lead, if any. Lets the Imports page
+   *  list and roll back a bad import. FK to imports.id ON DELETE SET NULL
+   *  (added in migration) so deleting an import record never kills leads. */
+  importId: text("import_id"),
   /** Set once the lead is converted to an Opportunity. The lead stays
    *  active in the campaign — this is just a link. ON DELETE SET NULL
    *  so removing an opp doesn't cascade-kill the lead history. */
