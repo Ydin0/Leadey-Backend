@@ -6,6 +6,12 @@ export const funnels = pgTable("funnels", {
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
   status: text("status").notNull().default("draft"),
+  /** "private" (only assigned members) | "public" (whole team). */
+  visibility: text("visibility").notNull().default("private"),
+  /** Campaign builder config that has no dedicated column yet — audience
+   *  filters, sequence exit conditions, and cold-email automation settings.
+   *  Persisted from the create-campaign wizard so the full setup round-trips. */
+  config: jsonb("config").$type<Record<string, unknown>>().notNull().default({}),
   sourceTypes: jsonb("source_types").$type<string[]>().notNull().default([]),
   smartleadCampaignId: text("smartlead_campaign_id"),
   /** Secret token embedded in the inbound webhook URL for this campaign. */

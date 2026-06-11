@@ -113,6 +113,8 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
     name: result.name,
     description: result.description,
     status: result.status,
+    visibility: result.visibility,
+    config: result.config || {},
     sourceTypes: result.sourceTypes,
     smartleadCampaignId: result.smartleadCampaignId,
     webhookToken,
@@ -189,6 +191,8 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
     name: result.name,
     description: result.description,
     status: result.status,
+    visibility: result.visibility,
+    config: result.config || {},
     sourceTypes: result.sourceTypes,
     smartleadCampaignId: result.smartleadCampaignId,
     webhookToken: result.webhookToken,
@@ -275,6 +279,26 @@ router.get(
     const data = allFunnels.map((f) =>
       buildFunnelPayload(f, { includeLeads: false }),
     );
+
+    // Attach assigned members per funnel (one batched query) so the campaigns
+    // list can render the assigned-rep facepiles. Names are resolved client-side.
+    if (allFunnels.length > 0) {
+      const ids = allFunnels.map((f) => f.id);
+      const rows = await db
+        .select()
+        .from(funnelMembers)
+        .where(inArray(funnelMembers.funnelId, ids));
+      const byFunnel = new Map<string, { teamMemberId: string; role: string; addedAt: string }[]>();
+      for (const m of rows) {
+        const list = byFunnel.get(m.funnelId) ?? [];
+        list.push({ teamMemberId: m.userId, role: m.role, addedAt: m.createdAt.toISOString() });
+        byFunnel.set(m.funnelId, list);
+      }
+      for (const payload of data as any[]) {
+        payload.members = byFunnel.get(payload.id) ?? [];
+      }
+    }
+
     res.json({ data });
   }),
 );
@@ -360,7 +384,7 @@ router.post(
   "/funnels",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { name, description, status, steps, sourceTypes } = req.body || {};
+    const { name, description, status, steps, sourceTypes, visibility, audience, exit, emailAutomation, members } = req.body || {};
 
     if (!normalizeString(name)) {
       throw new ApiError(400, "Funnel name is required");
@@ -411,6 +435,16 @@ router.post(
           .filter((st: string) => ALLOWED_SOURCE_TYPES.has(st))
       : [];
 
+    const normalizedVisibility =
+      normalizeString(visibility).toLowerCase() === "public" ? "public" : "private";
+
+    // Campaign builder settings that live in the `config` jsonb. Stored as-is so
+    // the full wizard setup round-trips; the runtime engines read these later.
+    const config: Record<string, unknown> = {};
+    if (audience && typeof audience === "object") config.audience = audience;
+    if (exit && typeof exit === "object") config.exit = exit;
+    if (emailAutomation && typeof emailAutomation === "object") config.emailAutomation = emailAutomation;
+
     const funnelId = createId("funnel");
     const now = new Date();
 
@@ -421,6 +455,8 @@ router.post(
         name: normalizeString(name),
         description: normalizeString(description),
         status: normalizedStatus,
+        visibility: normalizedVisibility,
+        config,
         sourceTypes: normalizedSourceTypes,
         webhookToken: createId("whk"),
         createdAt: now,
@@ -465,6 +501,31 @@ router.post(
         userId: auth.userId,
         role: "owner",
       }).onConflictDoNothing();
+    }
+
+    // Assign any additional members chosen in the wizard as contributors
+    // (the creator/owner is skipped — they're already the owner above).
+    if (Array.isArray(members) && members.length > 0) {
+      const extraIds = [
+        ...new Set(
+          members
+            .map((m: unknown) => (typeof m === "string" ? m : normalizeString((m as { userId?: string })?.userId)))
+            .filter((id: string) => id && id !== auth?.userId),
+        ),
+      ];
+      if (extraIds.length > 0) {
+        await db
+          .insert(funnelMembers)
+          .values(
+            extraIds.map((userId: string) => ({
+              id: createId("fm"),
+              funnelId,
+              userId,
+              role: "contributor",
+            })),
+          )
+          .onConflictDoNothing();
+      }
     }
 
     // Smartlead integration: create campaign if email steps have content

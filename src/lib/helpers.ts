@@ -1,12 +1,13 @@
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
-export const ALLOWED_CHANNELS = new Set(["email", "linkedin", "call", "whatsapp"]);
+export const ALLOWED_CHANNELS = new Set(["email", "linkedin", "call", "whatsapp", "task"]);
 
 export const ALLOWED_ACTIONS: Record<string, Set<string>> = {
   email: new Set(["send_email"]),
   linkedin: new Set(["view_profile", "send_connection", "send_message"]),
   call: new Set(["make_call"]),
   whatsapp: new Set(["send_message"]),
+  task: new Set(["manual_task"]),
 };
 
 export const DEFAULT_ACTIONS: Record<string, string> = {
@@ -14,6 +15,7 @@ export const DEFAULT_ACTIONS: Record<string, string> = {
   linkedin: "send_connection",
   call: "make_call",
   whatsapp: "send_message",
+  task: "manual_task",
 };
 
 export function resolveAction(channel: string, action: string | null | undefined): string {

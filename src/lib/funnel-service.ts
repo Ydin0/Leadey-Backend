@@ -68,6 +68,8 @@ export interface Funnel {
   name: string;
   description: string;
   status: string;
+  visibility?: string;
+  config?: Record<string, unknown>;
   sourceTypes: string[];
   smartleadCampaignId: string | null;
   webhookToken: string | null;
@@ -412,6 +414,8 @@ export function buildFunnelPayload(
     name: funnel.name,
     description: funnel.description,
     status: funnel.status,
+    visibility: funnel.visibility ?? "private",
+    config: funnel.config ?? {},
     webhookToken: funnel.webhookToken,
     webhookEnabled: funnel.webhookEnabled,
     webhookFieldMap: funnel.webhookFieldMap || {},

@@ -232,6 +232,13 @@
       "when": 1781193245887,
       "tag": "0032_numerous_warhawk",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1781203138106,
+      "tag": "0033_campaign_config_visibility",
+      "breakpoints": true
     }
   ]
 }
