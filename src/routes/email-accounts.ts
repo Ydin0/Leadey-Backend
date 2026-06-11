@@ -261,7 +261,7 @@ router.post(
       type: "step_outcome",
       outcome: "sent",
       stepIndex: Math.max(0, (lead.currentStep || 1) - 1),
-      meta: { channel: "email", direction: "outbound", subject, body: bodyHtml, fromEmail: account.email, userId, userName },
+      meta: { channel: "email", direction: "outbound", subject, body: bodyHtml, fromEmail: account.email, fromName: account.fromName, toEmail: lead.email, userId, userName },
       timestamp: now,
     });
 
@@ -303,8 +303,10 @@ router.get(
         toEmail: emailMessages.toEmail,
         subject: emailMessages.subject,
         bodyHtml: emailMessages.bodyHtml,
+        bodyText: emailMessages.bodyText,
         status: emailMessages.status,
         openedAt: emailMessages.openedAt,
+        openCount: emailMessages.openCount,
         userId: emailMessages.userId,
         createdAt: emailMessages.createdAt,
       })
