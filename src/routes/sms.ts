@@ -51,6 +51,7 @@ router.post(
     const funnelId = String(req.params.funnelId);
     const leadId = String(req.params.leadId);
     const body = String((req.body?.body ?? "")).trim();
+    const requestedLineId = req.body?.lineId ? String(req.body.lineId) : null;
     if (!body) throw new ApiError(400, "Message body is required");
 
     // Lead must belong to the caller's org (via its funnel).
@@ -69,7 +70,10 @@ router.post(
       .from(phoneLines)
       .where(eq(phoneLines.organizationId, orgId));
     const activeLines = orgLines.filter((l) => l.status === "active");
+    // If the sender explicitly chose a line, honour it (any active org line);
+    // otherwise default to their assigned line, then the first active line.
     const line =
+      (requestedLineId && activeLines.find((l) => l.id === requestedLineId)) ||
       (userId && activeLines.find((l) => l.assignedTo === userId)) ||
       activeLines[0] ||
       null;
