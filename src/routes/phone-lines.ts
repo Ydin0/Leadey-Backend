@@ -10,6 +10,7 @@ import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
 import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
+import { masterContacts } from "../db/schema/master";
 
 /** Normalised phone key for fuzzy matching across formats (+44…, 07…, etc.).
  *  Uses the last 9 significant digits so a leading country code / trunk-0
@@ -352,6 +353,9 @@ router.post(
       bought = await client.incomingPhoneNumbers.create({
         phoneNumber: candidate.phoneNumber,
         voiceApplicationSid: process.env.TWILIO_TWIML_APP_SID!,
+        ...(process.env.WEBHOOK_BASE_URL
+          ? { smsUrl: `${process.env.WEBHOOK_BASE_URL}/webhooks/twilio/sms`, smsMethod: "POST" }
+          : {}),
         ...(approvedBundle?.twilioBundleSid
           ? { bundleSid: approvedBundle.twilioBundleSid }
           : {}),
@@ -436,7 +440,10 @@ router.post(
       phoneNumber,
       friendlyName: friendlyName || undefined,
       voiceApplicationSid: process.env.TWILIO_TWIML_APP_SID!,
-    });
+      ...(process.env.WEBHOOK_BASE_URL
+        ? { smsUrl: `${process.env.WEBHOOK_BASE_URL}/webhooks/twilio/sms`, smsMethod: "POST" }
+        : {}),
+    } as any);
 
     const id = createId("pl");
     const [line] = await db
@@ -1539,6 +1546,59 @@ router.post(
       console.error("[Summarize] Error:", err);
       throw new ApiError(500, "Failed to transcribe and summarize call");
     }
+  }),
+);
+
+// GET /api/calls/resolve?number=+44… — identify a caller by phone within the
+// org so the live-call UI can show the lead's name/company (and a profile link)
+// instead of a bare number. Matches on the last 9 digits to tolerate country
+// code / trunk-0 formatting differences.
+router.get(
+  "/calls/resolve",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const key = phoneKey((req.query.number as string) || "");
+    if (!key) {
+      res.json({ data: { name: null, company: null, leadId: null, funnelId: null } });
+      return;
+    }
+
+    const digitsExpr = sql`regexp_replace(${leads.phone}, '\\D', '', 'g')`;
+    const [lead] = await db
+      .select({
+        leadId: leads.id,
+        funnelId: leads.funnelId,
+        name: leads.name,
+        company: leads.company,
+      })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), sql`${digitsExpr} LIKE ${"%" + key}`))
+      .limit(1);
+
+    if (lead) {
+      res.json({
+        data: { name: lead.name, company: lead.company || null, leadId: lead.leadId, funnelId: lead.funnelId },
+      });
+      return;
+    }
+
+    // No campaign lead — fall back to the org's master contact list.
+    const mcDigits = sql`regexp_replace(${masterContacts.phone}, '\\D', '', 'g')`;
+    const [contact] = await db
+      .select({ name: masterContacts.fullName, company: masterContacts.currentCompany })
+      .from(masterContacts)
+      .where(and(eq(masterContacts.organizationId, orgId), sql`${mcDigits} LIKE ${"%" + key}`))
+      .limit(1);
+
+    res.json({
+      data: {
+        name: contact?.name || null,
+        company: contact?.company || null,
+        leadId: null,
+        funnelId: null,
+      },
+    });
   }),
 );
 

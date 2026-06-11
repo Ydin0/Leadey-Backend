@@ -218,6 +218,13 @@
       "when": 1781177419324,
       "tag": "0030_solid_ares",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1781187243839,
+      "tag": "0031_outstanding_weapon_omega",
+      "breakpoints": true
     }
   ]
 }

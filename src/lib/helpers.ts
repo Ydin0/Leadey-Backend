@@ -20,6 +20,16 @@ export function resolveAction(channel: string, action: string | null | undefined
   if (action && ALLOWED_ACTIONS[channel]?.has(action)) return action;
   return DEFAULT_ACTIONS[channel] || "send_email";
 }
+/** Normalised phone key for fuzzy matching across formats (+44…, 07…, etc.).
+ *  Uses the last 9 significant digits so a leading country code / trunk-0
+ *  difference doesn't prevent a match. Returns null if too short to match. */
+export function phoneKey(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length < 7) return null;
+  return digits.slice(-9);
+}
+
 export const ALLOWED_STATUSES = new Set(["active", "paused", "draft"]);
 export const ALLOWED_SOURCE_TYPES = new Set(["csv", "signals", "webhook", "companies"]);
 export const TERMINAL_STATUSES = new Set(["replied", "bounced", "completed"]);

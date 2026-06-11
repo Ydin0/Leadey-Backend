@@ -1,0 +1,31 @@
+import { pgTable, text, timestamp, index } from "drizzle-orm/pg-core";
+import { organizations } from "./organizations";
+
+/** One row per SMS sent to or received from a lead — the conversation thread
+ *  and the system of record for delivery status + "who texted last". */
+export const smsMessages = pgTable(
+  "sms_messages",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    // Lead/funnel are nullable: an inbound text may not match a known lead.
+    leadId: text("lead_id"),
+    funnelId: text("funnel_id"),
+    lineId: text("line_id"),
+    // The rep who sent it (null for inbound).
+    userId: text("user_id"),
+    direction: text("direction").notNull(), // "outbound" | "inbound"
+    fromNumber: text("from_number").notNull(),
+    toNumber: text("to_number").notNull(),
+    body: text("body").notNull().default(""),
+    status: text("status").notNull().default("queued"), // queued|sent|delivered|failed|received
+    twilioSid: text("twilio_sid"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("sms_messages_lead_idx").on(t.leadId),
+    index("sms_messages_org_idx").on(t.organizationId),
+  ],
+);

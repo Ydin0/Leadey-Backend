@@ -29,6 +29,8 @@ import emailMailboxesRouter from "./routes/email-mailboxes";
 import searchRouter from "./routes/search";
 import knowledgeBaseRouter from "./routes/knowledge-base";
 import importsRouter from "./routes/imports";
+import smsRouter from "./routes/sms";
+import notificationsRouter from "./routes/notifications";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -90,6 +92,8 @@ app.use("/api", requireAuth(), emailMailboxesRouter);
 app.use("/api", requireAuth(), searchRouter);
 app.use("/api", requireAuth(), knowledgeBaseRouter);
 app.use("/api", requireAuth(), importsRouter);
+app.use("/api", requireAuth(), smsRouter);
+app.use("/api", requireAuth(), notificationsRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

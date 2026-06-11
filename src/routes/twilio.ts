@@ -295,4 +295,125 @@ webhookRouter.post(
   }),
 );
 
+// POST /webhooks/twilio/sms — inbound SMS from a lead. Routes the text to the
+// org that owns the receiving number, attaches it to the matching lead, logs
+// it on the timeline, and notifies the rep who last texted that lead.
+webhookRouter.post(
+  "/twilio/sms",
+  asyncHandler(async (req, res) => {
+    const from = (req.body?.From as string) || "";
+    const to = (req.body?.To as string) || "";
+    const body = (req.body?.Body as string) || "";
+    const messageSid = (req.body?.MessageSid as string) || null;
+
+    try {
+      const { db } = await import("../db");
+      const { phoneLines } = await import("../db/schema/phone-lines");
+      const { leads, leadEvents } = await import("../db/schema/leads");
+      const { funnels } = await import("../db/schema/funnels");
+      const { smsMessages } = await import("../db/schema/sms");
+      const { eq: e, and: a, desc: d } = await import("drizzle-orm");
+      const { createId, phoneKey } = await import("../lib/helpers");
+      const { createNotification } = await import("./notifications");
+
+      // Which org owns the number that was texted?
+      const toDigits = to.replace(/\D/g, "");
+      const allLines = await db
+        .select({ id: phoneLines.id, number: phoneLines.number, organizationId: phoneLines.organizationId, assignedTo: phoneLines.assignedTo })
+        .from(phoneLines);
+      const line =
+        allLines.find((l) => l.number === to) ||
+        allLines.find((l) => l.number.replace(/\D/g, "") === toDigits) ||
+        null;
+
+      if (line) {
+        const orgId = line.organizationId;
+        // Find the lead by the caller's number within that org.
+        const key = phoneKey(from);
+        let lead: { id: string; funnelId: string; name: string } | null = null;
+        if (key) {
+          const candidates = await db
+            .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, phone: leads.phone })
+            .from(leads)
+            .innerJoin(funnels, e(leads.funnelId, funnels.id))
+            .where(e(funnels.organizationId, orgId));
+          lead = candidates.find((c) => phoneKey(c.phone) === key) || null;
+        }
+
+        await db.insert(smsMessages).values({
+          id: createId("sms"),
+          organizationId: orgId,
+          leadId: lead?.id ?? null,
+          funnelId: lead?.funnelId ?? null,
+          lineId: line.id,
+          userId: null,
+          direction: "inbound",
+          fromNumber: from,
+          toNumber: to,
+          body,
+          status: "received",
+          twilioSid: messageSid,
+        });
+
+        if (lead) {
+          await db.insert(leadEvents).values({
+            id: createId("event"),
+            leadId: lead.id,
+            type: "step_outcome",
+            outcome: "replied",
+            stepIndex: 0,
+            meta: { channel: "sms", direction: "inbound", body },
+            timestamp: new Date(),
+          });
+
+          // Notify the rep who last texted this lead, else the line's owner.
+          const [lastOut] = await db
+            .select({ userId: smsMessages.userId })
+            .from(smsMessages)
+            .where(a(e(smsMessages.leadId, lead.id), e(smsMessages.direction, "outbound")))
+            .orderBy(d(smsMessages.createdAt))
+            .limit(1);
+          const targetUserId = lastOut?.userId || line.assignedTo || null;
+          if (targetUserId) {
+            await createNotification({
+              orgId,
+              userId: targetUserId,
+              type: "sms_reply",
+              title: `${lead.name} replied`,
+              body: body.slice(0, 140),
+              leadId: lead.id,
+              funnelId: lead.funnelId,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Twilio SMS] inbound handling failed:", err);
+    }
+
+    // Always 200 with empty TwiML so Twilio doesn't retry/treat it as an error.
+    res.type("text/xml").send("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response></Response>");
+  }),
+);
+
+// POST /webhooks/twilio/sms-status — delivery receipts update the thread status.
+webhookRouter.post(
+  "/twilio/sms-status",
+  asyncHandler(async (req, res) => {
+    const messageSid = (req.body?.MessageSid as string) || null;
+    const status = (req.body?.MessageStatus as string) || null;
+    if (messageSid && status) {
+      try {
+        const { db } = await import("../db");
+        const { smsMessages } = await import("../db/schema/sms");
+        const { eq: e } = await import("drizzle-orm");
+        await db.update(smsMessages).set({ status }).where(e(smsMessages.twilioSid, messageSid));
+      } catch (err) {
+        console.error("[Twilio SMS] status update failed:", err);
+      }
+    }
+    res.sendStatus(200);
+  }),
+);
+
 export { authRouter as twilioAuthRouter, webhookRouter as twilioWebhookRouter };
