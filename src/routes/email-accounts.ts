@@ -229,8 +229,9 @@ router.post(
     try {
       result = await sendEmailVia(account, { to: lead.email, toName: lead.name, subject, html });
     } catch (err: any) {
+      console.error(`[email send] ${account.provider} ${account.email} failed:`, err?.message || err);
       await db.update(emailAccounts).set({ status: "error", lastError: String(err?.message || err) }).where(eq(emailAccounts.id, account.id));
-      throw new ApiError(502, `Send failed: ${err?.message || "provider error"}`);
+      throw new ApiError(502, `Email send failed: ${err?.message || "provider error"}`);
     }
 
     const userName = await resolveUserName(userId);
