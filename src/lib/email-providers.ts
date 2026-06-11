@@ -158,31 +158,26 @@ async function sendGmail(account: Account, input: SendInput): Promise<SendResult
 
 async function sendOutlook(account: Account, input: SendInput): Promise<SendResult> {
   const token = await getAccessToken(account);
-  // Create a draft (so we capture the Message-ID + conversationId), then send.
-  const draftRes = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
+  // Use /me/sendMail — it only needs the Mail.Send permission (which we have).
+  // (Creating a draft to capture the thread id would require Mail.ReadWrite;
+  // reply threading instead falls back to matching the recipient address.)
+  const res = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      subject: input.subject,
-      body: { contentType: "HTML", content: input.html },
-      toRecipients: [{ emailAddress: { address: input.to, name: input.toName || undefined } }],
+      message: {
+        subject: input.subject,
+        body: { contentType: "HTML", content: input.html },
+        toRecipients: [{ emailAddress: { address: input.to, name: input.toName || undefined } }],
+      },
+      saveToSentItems: true,
     }),
   });
-  const draft = await draftRes.json();
-  if (!draftRes.ok) throw new Error(`Outlook draft failed: ${draft?.error?.message || draftRes.status}`);
-  const sendRes = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${draft.id}/send`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!sendRes.ok) {
-    const e = await sendRes.json().catch(() => null);
-    throw new Error(`Outlook send failed: ${e?.error?.message || sendRes.status}`);
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(`Outlook send failed: ${e?.error?.message || res.status}`);
   }
-  return {
-    providerMessageId: draft.id,
-    providerThreadId: draft.conversationId || null,
-    messageIdHeader: draft.internetMessageId || null,
-  };
+  return { providerMessageId: null, providerThreadId: null, messageIdHeader: null };
 }
 
 export async function sendEmailVia(account: Account, input: SendInput): Promise<SendResult> {
