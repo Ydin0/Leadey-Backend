@@ -199,6 +199,7 @@ router.post(
     const subject = String(req.body?.subject || "").trim();
     const bodyHtml = String(req.body?.bodyHtml || "");
     const fromAccountId = req.body?.fromAccountId ? String(req.body.fromAccountId) : null;
+    const cc = String(req.body?.cc || "").trim();
     if (!subject && !bodyHtml) throw new ApiError(400, "Subject or body is required");
 
     const [lead] = await db
@@ -207,7 +208,12 @@ router.post(
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(and(eq(leads.id, leadId), eq(leads.funnelId, funnelId), eq(funnels.organizationId, orgId)));
     if (!lead) throw new ApiError(404, "Lead not found");
-    if (!lead.email) throw new ApiError(400, "This lead has no email address");
+
+    // Recipient: an explicit override (reply to a different sender, or forward to
+    // a new address) wins; otherwise default to the lead's own email.
+    const toEmail = String(req.body?.toEmail || "").trim() || lead.email;
+    if (!toEmail) throw new ApiError(400, "A recipient email address is required");
+    const toName = toEmail === lead.email ? lead.name : null;
 
     // Pick the sender account: explicit choice → the rep's default → first.
     const accounts = await db
@@ -227,7 +233,7 @@ router.post(
 
     let result;
     try {
-      result = await sendEmailVia(account, { to: lead.email, toName: lead.name, subject, html });
+      result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, subject, html });
     } catch (err: any) {
       console.error(`[email send] ${account.provider} ${account.email} failed:`, err?.message || err);
       await db.update(emailAccounts).set({ status: "error", lastError: String(err?.message || err) }).where(eq(emailAccounts.id, account.id));
@@ -246,7 +252,7 @@ router.post(
       direction: "outbound",
       fromEmail: account.email,
       fromName: account.fromName || "",
-      toEmail: lead.email,
+      toEmail,
       subject,
       bodyHtml,
       providerMessageId: result.providerMessageId,
@@ -261,7 +267,7 @@ router.post(
       type: "step_outcome",
       outcome: "sent",
       stepIndex: Math.max(0, (lead.currentStep || 1) - 1),
-      meta: { channel: "email", direction: "outbound", subject, body: bodyHtml, fromEmail: account.email, fromName: account.fromName, toEmail: lead.email, userId, userName },
+      meta: { channel: "email", direction: "outbound", subject, body: bodyHtml, fromEmail: account.email, fromName: account.fromName, toEmail, cc: cc || undefined, userId, userName },
       timestamp: now,
     });
 
@@ -271,7 +277,7 @@ router.post(
         direction: "outbound",
         fromEmail: account.email,
         fromName: account.fromName,
-        toEmail: lead.email,
+        toEmail,
         subject,
         bodyHtml,
         status: "sent",

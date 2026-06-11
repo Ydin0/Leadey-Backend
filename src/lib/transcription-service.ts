@@ -1,95 +1,70 @@
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI, { toFile } from "openai";
 import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { callRecords } from "../db/schema/call-records";
 
-const SUMMARY_PROMPT = `You are a sales call analyst. Analyze this call transcript and provide a concise summary with the following sections:
+// Cheap, fast, ideal for a short sales-call recap.
+const SUMMARY_MODEL = "gpt-4o-mini";
+// Accurate transcription at low cost; phone mp3s are well under the 25MB limit.
+const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 
-**Key Discussion Points** — What was discussed (2-4 bullet points)
-**Prospect Sentiment** — How receptive was the prospect? (Positive/Neutral/Negative with brief explanation)
-**Action Items** — What needs to happen next (bullet points)
-**Next Steps** — Recommended follow-up action
+const SUMMARY_SYSTEM = `You are a sales-call analyst. Given a call transcript, write a SHORT plain-text summary (2-4 sentences, no headings, no bullet points) capturing what was discussed, the prospect's stance/outcome, and the agreed next step. Be specific and useful for a sales rep skimming their activity. If the transcript is empty or just noise, reply exactly: "No meaningful conversation captured."`;
 
-Keep the summary concise and actionable. Focus on what matters for the sales process.`;
-
+/**
+ * Transcribe a Twilio call recording and produce a short AI summary using
+ * OpenAI, then persist both onto the call record. Called on-demand from the
+ * /summarize endpoint and fire-and-forget from the recording webhook.
+ */
 export async function transcribeAndSummarize(
   callRecordId: string,
   recordingUrl: string,
 ): Promise<void> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not configured");
+    throw new Error("OPENAI_API_KEY is not configured");
   }
 
-  // For MVP: fetch the recording audio and use Claude to analyze
-  // Twilio recordings are accessible via URL with account credentials
+  // Twilio recording media requires Basic auth (account SID + auth token).
   const accountSid = process.env.TWILIO_ACCOUNT_SID!;
   const authToken = process.env.TWILIO_AUTH_TOKEN!;
-
-  // Fetch recording as base64
   const audioResponse = await fetch(recordingUrl, {
     headers: {
       Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
     },
   });
-
   if (!audioResponse.ok) {
     throw new Error(`Failed to fetch recording: ${audioResponse.status}`);
   }
-
-  const audioBuffer = await audioResponse.arrayBuffer();
-  const audioBase64 = Buffer.from(audioBuffer).toString("base64");
   const contentType = audioResponse.headers.get("content-type") || "audio/mpeg";
+  const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
 
-  // Determine media type for Claude
-  let mediaType: "audio/mpeg" | "audio/wav" | "audio/webm" | "audio/ogg" = "audio/mpeg";
-  if (contentType.includes("wav")) mediaType = "audio/wav";
-  else if (contentType.includes("webm")) mediaType = "audio/webm";
-  else if (contentType.includes("ogg")) mediaType = "audio/ogg";
+  const client = new OpenAI({ apiKey });
 
-  const client = new Anthropic({ apiKey });
-
-  // Use Claude to transcribe and summarize in one call
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: "Please transcribe this sales call recording, then provide a summary.\n\nFirst output the full transcript under a **Transcript** header.\nThen output the summary.\n\n" + SUMMARY_PROMPT,
-          },
-          {
-            type: "document" as any,
-            source: {
-              type: "base64",
-              media_type: mediaType,
-              data: audioBase64,
-            },
-          } as any,
-        ],
-      },
-    ],
+  // 1) Transcribe the audio.
+  const file = await toFile(audioBuffer, "call.mp3", { type: contentType });
+  const transcription = await client.audio.transcriptions.create({
+    file,
+    model: TRANSCRIBE_MODEL,
   });
+  const transcript = (transcription.text || "").trim();
 
-  const fullResponse = response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
+  // 2) Summarise the transcript into a short recap.
+  let summary = "";
+  if (transcript) {
+    const completion = await client.chat.completions.create({
+      model: SUMMARY_MODEL,
+      temperature: 0.3,
+      max_tokens: 220,
+      messages: [
+        { role: "system", content: SUMMARY_SYSTEM },
+        { role: "user", content: `Call transcript:\n\n${transcript}` },
+      ],
+    });
+    summary = (completion.choices[0]?.message?.content || "").trim();
+  } else {
+    summary = "No speech was detected in this recording.";
+  }
 
-  // Split transcript and summary
-  const transcriptMatch = fullResponse.match(/\*\*Transcript\*\*\s*([\s\S]*?)(?=\*\*Key Discussion Points\*\*|\*\*Summary\*\*|$)/i);
-  const transcript = transcriptMatch?.[1]?.trim() || fullResponse;
-
-  // Everything after the transcript is the summary
-  const summaryStart = fullResponse.indexOf("**Key Discussion Points**");
-  const summary = summaryStart !== -1
-    ? fullResponse.slice(summaryStart).trim()
-    : "";
-
-  // Update the call record
   await db
     .update(callRecords)
     .set({
@@ -98,5 +73,7 @@ export async function transcribeAndSummarize(
     })
     .where(eq(callRecords.id, callRecordId));
 
-  console.log(`[Transcription] Completed for call record ${callRecordId}: ${transcript.length} chars transcript, ${summary.length} chars summary`);
+  console.log(
+    `[Transcription] ${callRecordId}: ${transcript.length} chars transcript, ${summary.length} chars summary`,
+  );
 }

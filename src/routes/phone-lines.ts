@@ -535,6 +535,10 @@ router.get(
     const search = req.query.search as string | undefined;
     const disposition = req.query.disposition as string | undefined;
     const leadIdParam = req.query.leadId as string | undefined;
+    const minDuration = req.query.minDuration ? parseInt(req.query.minDuration as string) : undefined;
+    const maxDuration = req.query.maxDuration ? parseInt(req.query.maxDuration as string) : undefined;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(parseInt(req.query.limit as string) || 25, 200);
     const offset = req.query.page ? (page - 1) * limit : parseInt(req.query.offset as string) || 0;
@@ -545,6 +549,10 @@ router.get(
     if (userId) conditions.push(eq(callRecords.userId, userId));
     if (disposition) conditions.push(eq(callRecords.disposition, disposition));
     if (hasRecording === "true") conditions.push(isNotNull(callRecords.recordingUrl));
+    if (minDuration !== undefined && !Number.isNaN(minDuration)) conditions.push(gte(callRecords.duration, minDuration));
+    if (maxDuration !== undefined && !Number.isNaN(maxDuration)) conditions.push(lte(callRecords.duration, maxDuration));
+    if (startDate) { const d = new Date(startDate); if (!Number.isNaN(d.getTime())) conditions.push(gte(callRecords.calledAt, d)); }
+    if (endDate) { const d = new Date(endDate); if (!Number.isNaN(d.getTime())) conditions.push(lte(callRecords.calledAt, d)); }
     // Filter to a single campaign lead's calls. Matches the precise leadId we
     // now stamp at dial time, OR (fallback for calls that predate that column)
     // any call to/from the lead's or its sibling contacts' phone numbers.

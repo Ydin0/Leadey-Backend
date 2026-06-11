@@ -13,6 +13,8 @@ type Account = typeof emailAccounts.$inferSelect;
 export interface SendInput {
   to: string;
   toName?: string | null;
+  /** Optional comma-separated Cc recipients. */
+  cc?: string;
   subject: string;
   html: string;
 }
@@ -115,6 +117,7 @@ async function buildMime(account: Account, input: SendInput): Promise<{ raw: Buf
   const composer = new MailComposer({
     from: { name: account.fromName || account.email, address: account.email },
     to: input.toName ? { name: input.toName, address: input.to } : input.to,
+    ...(input.cc ? { cc: input.cc } : {}),
     subject: input.subject,
     html: input.html,
     messageId,
@@ -137,6 +140,7 @@ async function sendSmtp(account: Account, input: SendInput): Promise<SendResult>
   const info = await transport.sendMail({
     from: { name: account.fromName || account.email, address: account.email },
     to: input.toName ? `"${input.toName}" <${input.to}>` : input.to,
+    ...(input.cc ? { cc: input.cc } : {}),
     subject: input.subject,
     html: input.html,
   });
@@ -169,6 +173,11 @@ async function sendOutlook(account: Account, input: SendInput): Promise<SendResu
         subject: input.subject,
         body: { contentType: "HTML", content: input.html },
         toRecipients: [{ emailAddress: { address: input.to, name: input.toName || undefined } }],
+        ccRecipients: (input.cc || "")
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean)
+          .map((address) => ({ emailAddress: { address } })),
       },
       saveToSentItems: true,
     }),
