@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, desc, asc, inArray, isNull, sql, gte, count } from "drizzle-orm";
+import { eq, and, or, desc, asc, inArray, notInArray, isNull, sql, gte, count } from "drizzle-orm";
 import multer from "multer";
 import twilioSdk from "twilio";
 import { getAuth } from "@clerk/express";
@@ -703,6 +703,25 @@ router.post(
       );
     }
 
+    // Realtime claim — which of these leads is another rep actively on right
+    // now (in_progress in another live session)? Open this session on the first
+    // lead that's free, so two reps sharing a campaign don't both start on the
+    // same contact. (Recently-completed leads were already filtered out above.)
+    const busyRows = await db
+      .select({ leadId: dialerQueueItems.leadId })
+      .from(dialerQueueItems)
+      .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+      .where(
+        and(
+          eq(dialerSessions.organizationId, orgId),
+          inArray(dialerSessions.status, ["active", "paused"]),
+          inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+        ),
+      );
+    const busyLeadIds = new Set(busyRows.map((r) => r.leadId));
+    const firstClean = queue.findIndex((q) => !busyLeadIds.has(q.lead.id));
+    const inProgressIdx = firstClean === -1 ? 0 : firstClean;
+
     // Insert session + queue items in a transaction. The partial unique
     // index on (user_id) WHERE status='active' will reject if the user has
     // an active session already.
@@ -718,7 +737,7 @@ router.post(
           status: "active",
           totalLeads: queue.length,
           completedLeads: 0,
-          currentLeadIndex: 0,
+          currentLeadIndex: inProgressIdx,
           dispositionsJson: {},
           filtersJson: resolvedFilters,
         });
@@ -730,7 +749,7 @@ router.post(
             masterContactId: q.master?.id ?? null,
             leadPhone: q.lead.phone,
             position: i,
-            status: i === 0 ? "in_progress" : "pending",
+            status: i === inProgressIdx ? "in_progress" : "pending",
           })),
         );
       });
@@ -1071,16 +1090,54 @@ router.post(
         });
       }
 
-      // Find next pending item; promote to in_progress.
+      // Find the next dialable lead, skipping any another rep is currently on
+      // (in_progress in another live session) or — when this session excludes
+      // recently-called — one another session already completed in the last 24h.
+      // Collided leads are left PENDING (retried on a later advance once the
+      // collision clears), so two reps sharing a campaign split the leads
+      // dynamically instead of double-dialing the same people.
+      const recentSkip =
+        (s.filtersJson as { excludeRecentlyCalled?: boolean } | null)?.excludeRecentlyCalled !== false;
+      const collidedRows = await tx
+        .select({ leadId: dialerQueueItems.leadId })
+        .from(dialerQueueItems)
+        .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+        .where(
+          and(
+            eq(dialerSessions.organizationId, s.organizationId),
+            sql`${dialerQueueItems.sessionId} <> ${s.id}`,
+            or(
+              and(
+                inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+                inArray(dialerSessions.status, ["active", "paused"]),
+              ),
+              ...(recentSkip
+                ? [
+                    and(
+                      eq(dialerQueueItems.status, "completed"),
+                      gte(dialerQueueItems.calledAt, new Date(Date.now() - 24 * 60 * 60 * 1000)),
+                    ),
+                  ]
+                : []),
+            ),
+          ),
+        );
+      const collidedLeadIds = [...new Set(collidedRows.map((r) => r.leadId))];
+
+      // First pending lead that isn't collided. Collided leads are simply not
+      // picked now — they stay pending and get retried on a later advance once
+      // the other rep is off them.
+      const nextConds = [
+        eq(dialerQueueItems.sessionId, s.id),
+        eq(dialerQueueItems.status, "pending"),
+      ];
+      if (collidedLeadIds.length) {
+        nextConds.push(notInArray(dialerQueueItems.leadId, collidedLeadIds));
+      }
       const [next] = await tx
         .select()
         .from(dialerQueueItems)
-        .where(
-          and(
-            eq(dialerQueueItems.sessionId, s.id),
-            eq(dialerQueueItems.status, "pending"),
-          ),
-        )
+        .where(and(...nextConds))
         .orderBy(asc(dialerQueueItems.position))
         .limit(1);
       if (next) {
