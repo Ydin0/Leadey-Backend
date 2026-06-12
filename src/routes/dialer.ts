@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, desc, asc, inArray, isNull, sql } from "drizzle-orm";
+import { eq, and, or, desc, asc, inArray, isNull, sql, gte } from "drizzle-orm";
 import multer from "multer";
 import twilioSdk from "twilio";
 import { getAuth } from "@clerk/express";
@@ -623,6 +623,28 @@ router.post(
     const now = Date.now();
     const RECENT_MS = 24 * 60 * 60 * 1000;
 
+    // Lead-level "recently called" set — the master-contact match above only
+    // works for leads with an email / LinkedIn URL. Cold-call CSV lists are
+    // usually phone-only with no master, so we ALSO exclude any lead that the
+    // dialer has already completed a call for within the window, keyed by leadId
+    // (works regardless of master). Org-wide so two reps don't double-dial.
+    const recentlyCalledLeadIds = new Set<string>();
+    if (resolvedFilters.excludeRecentlyCalled) {
+      const since = new Date(now - RECENT_MS);
+      const calledRows = await db
+        .select({ leadId: dialerQueueItems.leadId })
+        .from(dialerQueueItems)
+        .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+        .where(
+          and(
+            eq(dialerSessions.organizationId, orgId),
+            eq(dialerQueueItems.status, "completed"),
+            gte(dialerQueueItems.calledAt, since),
+          ),
+        );
+      for (const r of calledRows) recentlyCalledLeadIds.add(r.leadId);
+    }
+
     type QueueEntry = { lead: typeof leads.$inferSelect; master: typeof masterContacts.$inferSelect | null };
     const queue: QueueEntry[] = [];
     let excludedDnc = 0;
@@ -642,8 +664,8 @@ router.post(
       }
       if (
         resolvedFilters.excludeRecentlyCalled &&
-        master?.lastCalledAt &&
-        now - master.lastCalledAt.getTime() < RECENT_MS
+        ((master?.lastCalledAt && now - master.lastCalledAt.getTime() < RECENT_MS) ||
+          recentlyCalledLeadIds.has(lead.id))
       ) {
         excludedRecent++;
         continue;
@@ -740,18 +762,23 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getUserId(req);
-    const [row] = await db
+    // Return the in-progress session whether it's running OR paused. Pausing
+    // must not make the session "disappear" — otherwise re-opening the app
+    // shows the launcher again, the rep starts a brand-new session, and the
+    // queue restarts from the top (re-including everyone called today).
+    const rows = await db
       .select()
       .from(dialerSessions)
       .where(
         and(
           eq(dialerSessions.organizationId, orgId),
           eq(dialerSessions.userId, userId),
-          eq(dialerSessions.status, "active"),
+          inArray(dialerSessions.status, ["active", "paused"]),
         ),
       )
-      .orderBy(desc(dialerSessions.startedAt))
-      .limit(1);
+      .orderBy(desc(dialerSessions.startedAt));
+    // Prefer an active session if one exists, otherwise the most recent paused.
+    const row = rows.find((r) => r.status === "active") ?? rows[0] ?? null;
     res.json({ data: row ? serializeSession(row) : null });
   }),
 );
