@@ -238,25 +238,35 @@ const LINKEDIN_DAILY_LIMITS: Record<string, number> = {
   view_profile: 80,
 };
 
-export function buildCockpit(funnel: Funnel, leads: Lead[]) {
+export function buildCockpit(
+  funnel: Funnel,
+  leads: Lead[],
+  opts?: { todayLinkedinCompletions?: Record<string, number> },
+) {
   const pending = leads.filter((l) => l.status === "pending");
 
-  // Count today's completed LinkedIn actions from events
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayMs = todayStart.getTime();
-
-  const todayCompletions: Record<string, number> = {};
-  for (const lead of leads) {
-    for (const ev of lead.events) {
-      if (
-        ev.type === "step_outcome" &&
-        ev.timestamp.getTime() >= todayMs &&
-        ev.meta &&
-        ev.meta.channel === "linkedin"
-      ) {
-        const action = (ev.meta.action as string) || "send_connection";
-        todayCompletions[action] = (todayCompletions[action] || 0) + 1;
+  // Today's completed LinkedIn actions. Callers that don't load per-lead events
+  // (e.g. the dashboard, for speed) can pass these precomputed; otherwise we
+  // derive them from the leads' event history.
+  let todayCompletions: Record<string, number>;
+  if (opts?.todayLinkedinCompletions) {
+    todayCompletions = opts.todayLinkedinCompletions;
+  } else {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayMs = todayStart.getTime();
+    todayCompletions = {};
+    for (const lead of leads) {
+      for (const ev of lead.events) {
+        if (
+          ev.type === "step_outcome" &&
+          ev.timestamp.getTime() >= todayMs &&
+          ev.meta &&
+          ev.meta.channel === "linkedin"
+        ) {
+          const action = (ev.meta.action as string) || "send_connection";
+          todayCompletions[action] = (todayCompletions[action] || 0) + 1;
+        }
       }
     }
   }

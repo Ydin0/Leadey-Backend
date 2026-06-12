@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, gte, count } from "drizzle-orm";
+import { eq, and, gte, count, inArray, or, sql } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { funnels } from "../db/schema/funnels";
@@ -26,14 +26,34 @@ function asyncHandler<P = Record<string, string>>(handler: AsyncHandler<P>) {
   };
 }
 
-/** Load all funnels for an org with steps, leads, and events. */
+/** Load all funnels for an org with steps + leads (NO per-lead events — those
+ *  are the expensive part on big campaigns; the cockpit derives the few
+ *  event-dependent bits via small targeted queries instead). */
 async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
   const results = await db.query.funnels.findMany({
     where: eq(funnels.organizationId, orgId),
     with: {
       steps: { orderBy: (s, { asc }) => [asc(s.sortOrder)] },
       leads: {
-        with: { events: { orderBy: (e, { asc }) => [asc(e.timestamp)] } },
+        columns: {
+          id: true,
+          name: true,
+          title: true,
+          company: true,
+          email: true,
+          phone: true,
+          linkedinUrl: true,
+          currentStep: true,
+          totalSteps: true,
+          status: true,
+          nextAction: true,
+          nextDate: true,
+          source: true,
+          sourceType: true,
+          score: true,
+          createdAt: true,
+          updatedAt: true,
+        },
       },
     },
   });
@@ -75,19 +95,12 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
       source: l.source,
       sourceType: l.sourceType,
       score: l.score,
-      smartleadLeadId: l.smartleadLeadId,
-      unipileProviderId: l.unipileProviderId,
-      notes: l.notes,
+      smartleadLeadId: null,
+      unipileProviderId: null,
+      notes: null,
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
-      events: l.events.map((e) => ({
-        id: e.id,
-        type: e.type,
-        outcome: e.outcome,
-        stepIndex: e.stepIndex,
-        meta: e.meta,
-        timestamp: e.timestamp,
-      })),
+      events: [],
     })),
   }));
 }
@@ -99,6 +112,85 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const allFunnels = await loadAllFunnels(orgId);
+    const funnelIds = allFunnels.map((f) => f.id);
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    // ── Targeted event queries (instead of loading every lead's full history) ──
+    const liByFunnel = new Map<string, Record<string, number>>(); // today's LinkedIn actions
+    const replyEvByLead = new Map<string, { handled: boolean; channel?: string; message?: string; timestamp?: Date }>();
+    const bounceEvents: Record<string, unknown>[] = [];
+    const repliedLeadIds = allFunnels.flatMap((f) =>
+      (f.leads || []).filter((l) => l.status === "replied").map((l) => l.id),
+    );
+
+    if (funnelIds.length > 0) {
+      const liRows = await db
+        .select({ funnelId: leads.funnelId, meta: leadEvents.meta })
+        .from(leadEvents)
+        .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+        .where(
+          and(
+            inArray(leads.funnelId, funnelIds),
+            eq(leadEvents.type, "step_outcome"),
+            gte(leadEvents.timestamp, todayStart),
+            sql`${leadEvents.meta}->>'channel' = 'linkedin'`,
+          ),
+        );
+      for (const r of liRows) {
+        const action = ((r.meta as Record<string, unknown> | null)?.action as string) || "send_connection";
+        const m = liByFunnel.get(r.funnelId) ?? {};
+        m[action] = (m[action] || 0) + 1;
+        liByFunnel.set(r.funnelId, m);
+      }
+
+      const bounceRows = await db
+        .select({ id: leadEvents.id, meta: leadEvents.meta, email: leads.email, company: leads.company })
+        .from(leadEvents)
+        .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+        .where(
+          and(
+            inArray(leads.funnelId, funnelIds),
+            or(
+              eq(leadEvents.type, "bounce"),
+              and(eq(leadEvents.type, "step_outcome"), eq(leadEvents.outcome, "bounced")),
+            ),
+          ),
+        );
+      for (const r of bounceRows) {
+        bounceEvents.push({
+          id: r.id,
+          contact: r.email,
+          company: r.company,
+          type: "bounce",
+          detail: ((r.meta as Record<string, unknown> | null)?.reason as string) || "Email bounced",
+        });
+      }
+    }
+
+    if (repliedLeadIds.length > 0) {
+      const rows = await db
+        .select()
+        .from(leadEvents)
+        .where(
+          and(
+            inArray(leadEvents.leadId, repliedLeadIds),
+            inArray(leadEvents.type, ["reply_handled", "step_outcome"]),
+          ),
+        )
+        .orderBy(leadEvents.timestamp);
+      for (const ev of rows) {
+        const cur = replyEvByLead.get(ev.leadId) ?? { handled: false };
+        if (ev.type === "reply_handled") cur.handled = true;
+        else if (ev.type === "step_outcome" && ev.outcome === "replied") {
+          cur.channel = ((ev.meta as Record<string, unknown> | null)?.channel as string) || "email";
+          cur.message = ((ev.meta as Record<string, unknown> | null)?.replyMessage as string) || "";
+          cur.timestamp = ev.timestamp;
+        }
+        replyEvByLead.set(ev.leadId, cur);
+      }
+    }
 
     // Build per-funnel cockpit and merge
     const allReplies: Record<string, unknown>[] = [];
@@ -113,28 +205,20 @@ router.get(
 
     for (const funnel of allFunnels) {
       const funnelLeads = funnel.leads || [];
-      const cockpit = buildCockpit(funnel, funnelLeads);
+      const cockpit = buildCockpit(funnel, funnelLeads, { todayLinkedinCompletions: liByFunnel.get(funnel.id) });
 
       // Replies: leads with status "replied" that have no "reply_handled" event
       for (const lead of funnelLeads) {
         if (lead.status !== "replied") continue;
-        const hasHandled = lead.events.some((e) => e.type === "reply_handled");
-        if (hasHandled) continue;
-
-        // Find the reply event to get channel and message
-        const replyEvent = [...lead.events].reverse().find(
-          (e) => e.type === "step_outcome" && e.outcome === "replied"
-        );
-        const channel = (replyEvent?.meta?.channel as string) || "email";
-        const message = (replyEvent?.meta?.replyMessage as string) || "";
-
+        const re = replyEvByLead.get(lead.id);
+        if (re?.handled) continue;
         allReplies.push({
           id: lead.id,
           contact: { name: lead.name, title: lead.title || "Unknown title" },
           company: lead.company,
-          channel,
-          message,
-          timestamp: replyEvent?.timestamp || lead.updatedAt || lead.createdAt,
+          channel: re?.channel || "email",
+          message: re?.message || "",
+          timestamp: re?.timestamp || lead.updatedAt || lead.createdAt,
           status: "unhandled",
           funnelId: funnel.id,
           funnel: funnel.name,
@@ -187,23 +271,6 @@ router.get(
 
     // Compute aggregate email rates
     const emailBase = Math.max(totalLeads, 1);
-    const bounceEvents: Record<string, unknown>[] = [];
-    for (const funnel of allFunnels) {
-      for (const lead of funnel.leads || []) {
-        for (const ev of lead.events) {
-          if (ev.type === "bounce" || (ev.type === "step_outcome" && ev.outcome === "bounced")) {
-            bounceEvents.push({
-              id: ev.id,
-              contact: lead.email,
-              company: lead.company,
-              type: "bounce",
-              detail: (ev.meta?.reason as string) || "Email bounced",
-            });
-          }
-        }
-      }
-    }
-
     const emailBounces = bounceEvents.length;
 
     res.json({
