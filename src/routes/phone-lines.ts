@@ -652,6 +652,9 @@ router.get(
       recordingDuration: r.recordingDuration,
       transcript: r.transcript,
       summary: r.summary,
+      transcriptSegments: r.transcriptSegments ?? null,
+      speakers: r.speakers ?? null,
+      summaryStructured: r.summaryStructured ?? null,
       userId: r.userId,
       userName: r.userName,
       timestamp: r.calledAt.toISOString(),
@@ -1548,6 +1551,9 @@ router.post(
         data: {
           transcript: updated.transcript,
           summary: updated.summary,
+          transcriptSegments: updated.transcriptSegments ?? null,
+          speakers: updated.speakers ?? null,
+          summaryStructured: updated.summaryStructured ?? null,
         },
       });
     } catch (err) {

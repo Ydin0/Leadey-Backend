@@ -1,6 +1,26 @@
-import { pgTable, text, integer, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, jsonb } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 import { phoneLines } from "./phone-lines";
+
+/** One diarized line of the transcript. `speaker` is a stable id ("A"/"B"); the
+ *  display name + colour are resolved from `speakers`. */
+export interface TranscriptSegment {
+  speaker: string;
+  start: number; // seconds
+  end: number;
+  text: string;
+}
+export interface TranscriptSpeaker {
+  id: string;
+  name: string;
+  role: "rep" | "prospect" | "other";
+  talkPct: number; // 0-100
+}
+export interface CallSummaryStructured {
+  tldr: string[];
+  sections: { title: string; points: string[] }[];
+  nextSteps?: string[];
+}
 
 export const callRecords = pgTable("call_records", {
   id: text("id").primaryKey(),
@@ -29,6 +49,12 @@ export const callRecords = pgTable("call_records", {
   // Transcription + AI
   transcript: text("transcript"),
   summary: text("summary"),
+  /** Diarized, timestamped transcript lines (interactive transcript UI). */
+  transcriptSegments: jsonb("transcript_segments").$type<TranscriptSegment[]>(),
+  /** Resolved speakers with display name, role and talk-time %. */
+  speakers: jsonb("speakers").$type<TranscriptSpeaker[]>(),
+  /** Sectioned AI summary (TL;DR + breakdown + next steps). */
+  summaryStructured: jsonb("summary_structured").$type<CallSummaryStructured>(),
   // Rep who made/received the call
   userId: text("user_id"),
   userName: text("user_name"),
