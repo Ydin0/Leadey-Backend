@@ -13,6 +13,7 @@ import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
 import phoneLineRouter from "./routes/phone-lines";
 import scraperRouter from "./routes/scrapers";
 import contactsRouter from "./routes/contacts";
+import leadsRouter from "./routes/leads";
 import templatesRouter from "./routes/templates";
 import billingRouter from "./routes/billing";
 import masterRouter from "./routes/master";
@@ -76,6 +77,7 @@ app.use(emailPublicRouter);
 
 // Authenticated API routes
 app.use("/api", requireAuth(), dashboardRouter);
+app.use("/api", requireAuth(), leadsRouter);
 app.use("/api", requireAuth(), apiRouter);
 app.use("/api", requireAuth(), settingsRouter);
 app.use("/api", requireAuth(), unipileRouter);
