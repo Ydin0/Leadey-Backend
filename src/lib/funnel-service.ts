@@ -80,7 +80,11 @@ export interface Funnel {
   leads: Lead[];
 }
 
-function serializeLead(lead: Lead) {
+/** Serialize a lead. In `lite` mode the heavy fields that aren't needed for the
+ *  leads table / nav / contacts (the long company description, per-lead event
+ *  history, notes and custom fields) are dropped so a campaign with thousands of
+ *  leads loads fast. The currently-viewed lead is always sent full. */
+function serializeLead(lead: Lead, lite = false) {
   return {
     id: lead.id,
     name: lead.name,
@@ -102,24 +106,26 @@ function serializeLead(lead: Lead) {
     companyIndustry: lead.companyIndustry,
     companyEmployeeCount: lead.companyEmployeeCount,
     companyLocation: lead.companyLocation,
-    companyDescription: lead.companyDescription,
+    companyDescription: lite ? null : lead.companyDescription,
     companyLinkedin: lead.companyLinkedin,
     companyAnnualRevenue: lead.companyAnnualRevenue,
     companyHiringRoles: lead.companyHiringRoles,
     doNotCall: lead.doNotCall ?? false,
     opportunityId: lead.opportunityId ?? null,
-    notes: lead.notes,
-    customFields: lead.customFields ?? [],
+    notes: lite ? undefined : lead.notes,
+    customFields: lite ? [] : (lead.customFields ?? []),
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),
-    events: lead.events.map((e) => ({
-      id: e.id,
-      type: e.type,
-      outcome: e.outcome,
-      stepIndex: e.stepIndex,
-      meta: e.meta,
-      timestamp: e.timestamp.toISOString(),
-    })),
+    events: lite
+      ? []
+      : (lead.events ?? []).map((e) => ({
+          id: e.id,
+          type: e.type,
+          outcome: e.outcome,
+          stepIndex: e.stepIndex,
+          meta: e.meta,
+          timestamp: e.timestamp.toISOString(),
+        })),
   };
 }
 
@@ -393,9 +399,11 @@ export function buildCockpit(funnel: Funnel, leads: Lead[]) {
 
 export function buildFunnelPayload(
   funnel: Funnel,
-  options: { includeLeads?: boolean } = {},
+  options: { includeLeads?: boolean; lite?: boolean; fullLeadId?: string | null } = {},
 ) {
   const includeLeads = options.includeLeads !== false;
+  const lite = options.lite === true;
+  const fullLeadId = options.fullLeadId ?? null;
   const leads = sortLeadsForQueue(funnel.leads || []);
   const metrics = computeMetrics(leads);
   const sources = computeSources(leads);
@@ -423,7 +431,9 @@ export function buildFunnelPayload(
     steps: funnel.steps.map(serializeStep),
     metrics,
     sources,
-    leads: includeLeads ? leads.map(serializeLead) : [],
+    leads: includeLeads
+      ? leads.map((l) => serializeLead(l, lite && l.id !== fullLeadId))
+      : [],
     cockpit: buildCockpit(funnel, leads),
     analyticsSteps: computeAnalyticsSteps(funnel.steps || [], leads),
     createdAt: funnel.createdAt.toISOString(),

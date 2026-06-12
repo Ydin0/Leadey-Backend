@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, inArray, isNull, sql, count } from "drizzle-orm";
+import { eq, and, or, inArray, isNull, sql, count, asc } from "drizzle-orm";
 import { db } from "../db/index";
 import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
@@ -84,15 +84,25 @@ interface LeadAdvanceParams {
   leadId: string;
 }
 
-/** Load a full funnel with steps, leads, and events from the DB. */
-async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | null> {
+/** Load a funnel with steps + leads from the DB.
+ *  `withEvents: false` (lite) skips the heavy per-lead events + custom-field
+ *  joins so a campaign with thousands of leads loads fast; `fullLeadId` then
+ *  pulls events + custom fields for just the currently-viewed lead. */
+async function loadFunnel(
+  orgId: string,
+  funnelId: string,
+  opts: { withEvents?: boolean; fullLeadId?: string | null } = {},
+): Promise<Funnel | null> {
+  const withEvents = opts.withEvents !== false;
+  const fullLeadId = opts.fullLeadId ?? null;
+
   const result = await db.query.funnels.findFirst({
     where: and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)),
     with: {
       steps: { orderBy: (s, { asc }) => [asc(s.sortOrder)] },
-      leads: {
-        with: { events: { orderBy: (e, { asc }) => [asc(e.timestamp)] } },
-      },
+      leads: withEvents
+        ? { with: { events: { orderBy: (e, { asc }) => [asc(e.timestamp)] } } }
+        : true,
     },
   });
 
@@ -105,10 +115,25 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
     await db.update(funnels).set({ webhookToken }).where(eq(funnels.id, result.id));
   }
 
-  // Join in org-defined custom field values for the lead detail view.
-  const customFieldsByLead = await getCustomFieldsForLeads(
-    result.leads.map((l) => l.id),
-  );
+  // Custom fields: the full set on a full load, just the focused lead's on a
+  // lite load (the leads table / nav don't render custom fields).
+  const customFieldsByLead = withEvents
+    ? await getCustomFieldsForLeads(result.leads.map((l) => l.id))
+    : fullLeadId
+      ? await getCustomFieldsForLeads([fullLeadId])
+      : new Map();
+
+  // Events for the focused lead only, when this is a lite load.
+  type EventRow = { id: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
+  const focusedEvents = new Map<string, EventRow[]>();
+  if (!withEvents && fullLeadId) {
+    const evs = await db
+      .select()
+      .from(leadEvents)
+      .where(eq(leadEvents.leadId, fullLeadId))
+      .orderBy(asc(leadEvents.timestamp));
+    focusedEvents.set(fullLeadId, evs as unknown as EventRow[]);
+  }
 
   return {
     id: result.id,
@@ -165,7 +190,7 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
       customFields: customFieldsByLead.get(l.id) ?? [],
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
-      events: l.events.map((e) => ({
+      events: (withEvents ? ((l as { events?: EventRow[] }).events ?? []) : (focusedEvents.get(l.id) ?? [])).map((e) => ({
         id: e.id,
         type: e.type,
         outcome: e.outcome,
@@ -316,8 +341,14 @@ router.get(
   "/funnels/:funnelId",
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
+    // Lite load: skip the heavy per-lead events/custom-field/description fields
+    // for every lead except the one being viewed (`fullLeadId`). Big speed-up
+    // for campaigns with thousands of leads.
+    const lite = req.query.lite === "1" || req.query.lite === "true";
+    const fullLeadId = typeof req.query.fullLeadId === "string" ? req.query.fullLeadId : null;
+
     const funnel = getFunnelOrThrow(
-      await loadFunnel(orgId, req.params.funnelId),
+      await loadFunnel(orgId, req.params.funnelId, { withEvents: !lite, fullLeadId }),
       req.params.funnelId,
     );
     // Fetch real members
@@ -335,7 +366,7 @@ router.get(
         lastName: user?.lastName || null,
       });
     }
-    const payload = buildFunnelPayload(funnel, { includeLeads: true }) as any;
+    const payload = buildFunnelPayload(funnel, { includeLeads: true, lite, fullLeadId }) as any;
     payload.members = memberData;
     res.json({ data: payload });
   }),
