@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, desc, asc, inArray, isNull, sql, gte } from "drizzle-orm";
+import { eq, and, or, desc, asc, inArray, isNull, sql, gte, count } from "drizzle-orm";
 import multer from "multer";
 import twilioSdk from "twilio";
 import { getAuth } from "@clerk/express";
@@ -623,16 +623,17 @@ router.post(
     const now = Date.now();
     const RECENT_MS = 24 * 60 * 60 * 1000;
 
-    // Lead-level "recently called" set — the master-contact match above only
-    // works for leads with an email / LinkedIn URL. Cold-call CSV lists are
-    // usually phone-only with no master, so we ALSO exclude any lead that the
-    // dialer has already completed a call for within the window, keyed by leadId
-    // (works regardless of master). Org-wide so two reps don't double-dial.
-    const recentlyCalledLeadIds = new Set<string>();
-    if (resolvedFilters.excludeRecentlyCalled) {
+    // Per-lead dialer attempts in the last 24h, keyed by leadId. The
+    // master-contact counters above only work for leads with an email /
+    // LinkedIn URL; cold-call CSV lists are usually phone-only with no master,
+    // so we count the dialer's OWN completed calls per lead instead. This drives
+    // both "exclude recently called" (≥1 attempt) and "max attempts per contact
+    // (last 24h)" (≥N attempts) — org-wide so two reps don't double-dial.
+    const recentAttemptsByLead = new Map<string, number>();
+    if (resolvedFilters.excludeRecentlyCalled || resolvedFilters.maxAttempts !== null) {
       const since = new Date(now - RECENT_MS);
       const calledRows = await db
-        .select({ leadId: dialerQueueItems.leadId })
+        .select({ leadId: dialerQueueItems.leadId, n: count() })
         .from(dialerQueueItems)
         .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
         .where(
@@ -641,8 +642,9 @@ router.post(
             eq(dialerQueueItems.status, "completed"),
             gte(dialerQueueItems.calledAt, since),
           ),
-        );
-      for (const r of calledRows) recentlyCalledLeadIds.add(r.leadId);
+        )
+        .groupBy(dialerQueueItems.leadId);
+      for (const r of calledRows) recentAttemptsByLead.set(r.leadId, r.n);
     }
 
     type QueueEntry = { lead: typeof leads.$inferSelect; master: typeof masterContacts.$inferSelect | null };
@@ -662,20 +664,24 @@ router.post(
         excludedDnc++;
         continue;
       }
+      const recentAttempts = recentAttemptsByLead.get(lead.id) ?? 0;
       if (
         resolvedFilters.excludeRecentlyCalled &&
         ((master?.lastCalledAt && now - master.lastCalledAt.getTime() < RECENT_MS) ||
-          recentlyCalledLeadIds.has(lead.id))
+          recentAttempts >= 1)
       ) {
         excludedRecent++;
         continue;
       }
       if (
         resolvedFilters.maxAttempts !== null &&
-        master &&
-        master.callAttempts >= resolvedFilters.maxAttempts &&
-        master.lastCalledAt &&
-        now - master.lastCalledAt.getTime() < RECENT_MS
+        // Real dialer attempts on this lead in the last 24h (works for every
+        // lead) — OR the master-contact counter for cross-source dedup.
+        (recentAttempts >= resolvedFilters.maxAttempts ||
+          (master !== null &&
+            master.callAttempts >= resolvedFilters.maxAttempts &&
+            master.lastCalledAt !== null &&
+            now - master.lastCalledAt.getTime() < RECENT_MS))
       ) {
         excludedAttempts++;
         continue;
