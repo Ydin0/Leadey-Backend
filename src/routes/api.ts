@@ -40,6 +40,8 @@ import {
   mappedValue,
   dedupeKey,
   resolveAction,
+  formatPct,
+  sourceLabel,
   type MappingEntry,
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
@@ -175,83 +177,6 @@ async function loadFunnel(orgId: string, funnelId: string): Promise<Funnel | nul
   };
 }
 
-async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
-  const results = await db.query.funnels.findMany({
-    where: eq(funnels.organizationId, orgId),
-    with: {
-      steps: { orderBy: (s, { asc }) => [asc(s.sortOrder)] },
-      leads: {
-        with: { events: { orderBy: (e, { asc }) => [asc(e.timestamp)] } },
-      },
-    },
-  });
-
-  return results.map((result) => ({
-    id: result.id,
-    name: result.name,
-    description: result.description,
-    status: result.status,
-    visibility: result.visibility,
-    config: result.config || {},
-    sourceTypes: result.sourceTypes,
-    smartleadCampaignId: result.smartleadCampaignId,
-    webhookToken: result.webhookToken,
-    webhookEnabled: result.webhookEnabled,
-    webhookFieldMap: result.webhookFieldMap || {},
-    createdAt: result.createdAt,
-    steps: result.steps.map((s) => ({
-      id: s.id,
-      channel: s.channel,
-      label: s.label,
-      dayOffset: s.dayOffset,
-      sortOrder: s.sortOrder,
-      subject: s.subject,
-      emailBody: s.emailBody,
-      action: s.action,
-    })),
-    leads: result.leads.map((l) => ({
-      id: l.id,
-      name: l.name,
-      title: l.title,
-      company: l.company,
-      email: l.email,
-      phone: l.phone,
-      linkedinUrl: l.linkedinUrl,
-      currentStep: l.currentStep,
-      totalSteps: l.totalSteps,
-      status: l.status,
-      nextAction: l.nextAction,
-      nextDate: l.nextDate,
-      source: l.source,
-      sourceType: l.sourceType,
-      score: l.score,
-      smartleadLeadId: l.smartleadLeadId,
-      unipileProviderId: l.unipileProviderId,
-      companyDomain: l.companyDomain,
-      companyIndustry: l.companyIndustry,
-      companyEmployeeCount: l.companyEmployeeCount,
-      companyLocation: l.companyLocation,
-      companyDescription: l.companyDescription,
-      companyLinkedin: l.companyLinkedin,
-      companyAnnualRevenue: l.companyAnnualRevenue,
-      companyHiringRoles: l.companyHiringRoles,
-      doNotCall: l.doNotCall,
-      opportunityId: l.opportunityId,
-      notes: l.notes,
-      createdAt: l.createdAt,
-      updatedAt: l.updatedAt,
-      events: l.events.map((e) => ({
-        id: e.id,
-        type: e.type,
-        outcome: e.outcome,
-        stepIndex: e.stepIndex,
-        meta: e.meta,
-        timestamp: e.timestamp,
-      })),
-    })),
-  }));
-}
-
 function getFunnelOrThrow(funnel: Funnel | null, funnelId: string): Funnel {
   if (!funnel) {
     throw new ApiError(404, "Funnel not found");
@@ -275,29 +200,111 @@ router.get(
   "/funnels",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const allFunnels = await loadAllFunnels(orgId);
-    const data = allFunnels.map((f) =>
-      buildFunnelPayload(f, { includeLeads: false }),
-    );
 
-    // Attach assigned members per funnel (one batched query) so the campaigns
-    // list can render the assigned-rep facepiles. Names are resolved client-side.
-    if (allFunnels.length > 0) {
-      const ids = allFunnels.map((f) => f.id);
-      const rows = await db
+    // The campaigns list only needs lightweight per-campaign summaries. Loading
+    // every lead (and its full event history) for every campaign just to count
+    // them was the source of the slow load on big campaigns — instead we load
+    // funnels + steps and derive metrics/sources from grouped COUNT queries.
+    const funnelRows = await db.query.funnels.findMany({
+      where: eq(funnels.organizationId, orgId),
+      with: { steps: { orderBy: (s, { asc }) => [asc(s.sortOrder)] } },
+    });
+
+    const ids = funnelRows.map((f) => f.id);
+    type StatusRow = { funnelId: string; status: string; n: number };
+    type SourceRow = { funnelId: string; sourceType: string; n: number };
+    let statusRows: StatusRow[] = [];
+    let sourceRows: SourceRow[] = [];
+    let memberRows: { funnelId: string; userId: string; role: string; createdAt: Date }[] = [];
+
+    if (ids.length > 0) {
+      statusRows = await db
+        .select({ funnelId: leads.funnelId, status: leads.status, n: count() })
+        .from(leads)
+        .where(inArray(leads.funnelId, ids))
+        .groupBy(leads.funnelId, leads.status);
+      sourceRows = await db
+        .select({ funnelId: leads.funnelId, sourceType: leads.sourceType, n: count() })
+        .from(leads)
+        .where(inArray(leads.funnelId, ids))
+        .groupBy(leads.funnelId, leads.sourceType);
+      memberRows = await db
         .select()
         .from(funnelMembers)
         .where(inArray(funnelMembers.funnelId, ids));
-      const byFunnel = new Map<string, { teamMemberId: string; role: string; addedAt: string }[]>();
-      for (const m of rows) {
-        const list = byFunnel.get(m.funnelId) ?? [];
-        list.push({ teamMemberId: m.userId, role: m.role, addedAt: m.createdAt.toISOString() });
-        byFunnel.set(m.funnelId, list);
-      }
-      for (const payload of data as any[]) {
-        payload.members = byFunnel.get(payload.id) ?? [];
-      }
     }
+
+    // Index the count rows by funnel.
+    const statusByFunnel = new Map<string, Record<string, number>>();
+    for (const r of statusRows) {
+      const m = statusByFunnel.get(r.funnelId) ?? {};
+      m[r.status] = r.n;
+      statusByFunnel.set(r.funnelId, m);
+    }
+    const sourceByFunnel = new Map<string, Record<string, number>>();
+    for (const r of sourceRows) {
+      const m = sourceByFunnel.get(r.funnelId) ?? {};
+      m[r.sourceType] = r.n;
+      sourceByFunnel.set(r.funnelId, m);
+    }
+    const membersByFunnel = new Map<string, { teamMemberId: string; role: string; addedAt: string }[]>();
+    for (const m of memberRows) {
+      const list = membersByFunnel.get(m.funnelId) ?? [];
+      list.push({ teamMemberId: m.userId, role: m.role, addedAt: m.createdAt.toISOString() });
+      membersByFunnel.set(m.funnelId, list);
+    }
+
+    const webhookBase = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
+
+    const data = funnelRows.map((f) => {
+      const byStatus = statusByFunnel.get(f.id) ?? {};
+      const total = Object.values(byStatus).reduce((a, n) => a + n, 0);
+      const replied = byStatus["replied"] ?? 0;
+      const bounced = byStatus["bounced"] ?? 0;
+      const completed = byStatus["completed"] ?? 0;
+      const terminal = Object.entries(byStatus).reduce(
+        (a, [st, n]) => a + (TERMINAL_STATUSES.has(st) ? n : 0),
+        0,
+      );
+
+      const bySource = sourceByFunnel.get(f.id) ?? {};
+      const sources = [...ALLOWED_SOURCE_TYPES]
+        .filter((t) => (bySource[t] ?? 0) > 0)
+        .map((t) => ({ type: t, label: sourceLabel(t), count: bySource[t] }));
+
+      return {
+        id: f.id,
+        name: f.name,
+        description: f.description,
+        status: f.status,
+        visibility: f.visibility,
+        config: f.config || {},
+        steps: f.steps.map((s) => ({
+          id: s.id,
+          channel: s.channel,
+          label: s.label,
+          dayOffset: s.dayOffset,
+          subject: s.subject,
+          emailBody: s.emailBody,
+          action: s.action,
+        })),
+        metrics: {
+          total,
+          active: total - terminal,
+          replied,
+          replyRate: formatPct(replied, total),
+          bounced,
+          completed,
+        },
+        sources,
+        members: membersByFunnel.get(f.id) ?? [],
+        webhookToken: f.webhookToken,
+        webhookEnabled: f.webhookEnabled,
+        webhookFieldMap: f.webhookFieldMap || {},
+        webhookUrl: f.webhookToken && webhookBase ? `${webhookBase}/webhooks/funnels/${f.id}/leads?token=${f.webhookToken}` : null,
+        createdAt: f.createdAt.toISOString(),
+      };
+    });
 
     res.json({ data });
   }),
