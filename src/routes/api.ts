@@ -1126,6 +1126,15 @@ router.post(
     }
 
     await db.transaction(async (tx) => {
+      // Insert the import record FIRST — leads carry a FK to imports.id, and
+      // Postgres checks foreign keys per-statement, so the parent row must
+      // already exist before the leads that reference it are inserted.
+      await tx.insert(imports).values({
+        id: importId, funnelId: funnel.id, fileName: normalizedFileName,
+        totalRows: rows.length, importedRows, skippedRows,
+        mappings: fieldMappings, errors: errors.slice(0, 100), createdAt: new Date(now),
+      });
+
       // Upsert master companies so "company already exists" works across imports.
       for (const c of companies) {
         if (c.existing) {
@@ -1157,11 +1166,6 @@ router.post(
       for (let i = 0; i < newEvents.length; i += INSERT_CHUNK) {
         await tx.insert(leadEvents).values(newEvents.slice(i, i + INSERT_CHUNK));
       }
-      await tx.insert(imports).values({
-        id: importId, funnelId: funnel.id, fileName: normalizedFileName,
-        totalRows: rows.length, importedRows, skippedRows,
-        mappings: fieldMappings, errors: errors.slice(0, 100), createdAt: new Date(now),
-      });
     });
 
     // Push leads to Smartlead if campaign exists
