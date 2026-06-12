@@ -56,8 +56,10 @@ app.use(
 app.use("/webhooks/clerk", express.raw({ type: "application/json" }));
 app.use("/webhooks/stripe", express.raw({ type: "application/json" }));
 
-app.use(express.json({ limit: "8mb" }));
-app.use(express.urlencoded({ extended: false, limit: "8mb" }));
+// Large enough for bulk CSV lead imports (tens of thousands of rows arrive as
+// one JSON body). The frontend also trims each row to only the mapped columns.
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: false, limit: "50mb" }));
 
 // Clerk session parsing (does NOT block unauthenticated requests)
 app.use(clerkMiddleware());
