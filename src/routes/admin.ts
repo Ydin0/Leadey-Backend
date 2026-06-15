@@ -1742,15 +1742,20 @@ const ZERO_CALL: CallAgg = {
   transcribedCount: 0,
 };
 
+// Durations are clamped to a sane 0..86400s (1 day) and summed as float8 — a
+// past frontend bug logged epoch-seconds (~1.78e9) into `duration`, which both
+// overflowed `::int` ("integer out of range") and would wildly inflate minutes.
+const SANE_DURATION = sql`CASE WHEN ${callRecords.duration} BETWEEN 0 AND 86400 THEN ${callRecords.duration} ELSE 0 END`;
+const SANE_REC = sql`CASE WHEN ${callRecords.recordingDuration} BETWEEN 0 AND 86400 THEN ${callRecords.recordingDuration} ELSE 0 END`;
 function callSelect() {
   return {
-    actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)`,
+    actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
     syncedCount: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.twilioPrice} IS NOT NULL)::int`,
     totalCount: sql<number>`COUNT(*)::int`,
-    totalSeconds: sql<number>`COALESCE(SUM(${callRecords.duration}), 0)::int`,
-    unsyncedSeconds: sql<number>`COALESCE(SUM(${callRecords.duration}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::int`,
-    recordingSeconds: sql<number>`COALESCE(SUM(${callRecords.recordingDuration}), 0)::int`,
-    transcribedSeconds: sql<number>`COALESCE(SUM(${callRecords.recordingDuration}) FILTER (WHERE ${callRecords.transcript} IS NOT NULL), 0)::int`,
+    totalSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}), 0)::float8`,
+    unsyncedSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::float8`,
+    recordingSeconds: sql<number>`COALESCE(SUM(${SANE_REC}), 0)::float8`,
+    transcribedSeconds: sql<number>`COALESCE(SUM(${SANE_REC}) FILTER (WHERE ${callRecords.transcript} IS NOT NULL), 0)::float8`,
     transcribedCount: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.transcript} IS NOT NULL)::int`,
   };
 }
@@ -1989,8 +1994,8 @@ router.get(
     const lineRows = await db
       .select({
         lineId: callRecords.lineId,
-        actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)`,
-        seconds: sql<number>`COALESCE(SUM(${callRecords.duration}), 0)::int`,
+        actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
+        seconds: sql<number>`COALESCE(SUM(${SANE_DURATION}), 0)::float8`,
         calls: sql<number>`COUNT(*)::int`,
       })
       .from(callRecords)

@@ -580,25 +580,39 @@ router.post("/twilio/bundle-status", async (req: Request, res: Response) => {
 // Twilio sends recording metadata when a call recording is complete
 
 router.post("/twilio/recording", async (req: Request, res: Response) => {
-  try {
-    const callSid = req.body?.CallSid as string | undefined;
-    const recordingSid = req.body?.RecordingSid as string | undefined;
-    const recordingUrl = req.body?.RecordingUrl as string | undefined;
-    const recordingDuration = parseInt(req.body?.RecordingDuration || "0", 10);
+  const callSid = req.body?.CallSid as string | undefined;
+  const recordingSid = req.body?.RecordingSid as string | undefined;
+  const recordingUrl = req.body?.RecordingUrl as string | undefined;
+  const recordingDuration = parseInt(req.body?.RecordingDuration || "0", 10);
 
-    console.log(`[Twilio Recording] CallSid=${callSid} RecordingSid=${recordingSid} Duration=${recordingDuration}s`);
+  console.log(`[Twilio Recording] CallSid=${callSid} RecordingSid=${recordingSid} Duration=${recordingDuration}s`);
 
-    if (!callSid || !recordingUrl) {
-      res.status(200).send("OK");
-      return;
-    }
+  // ACK Twilio immediately — the match/update/transcribe runs in the background
+  // so we never approach Twilio's ~15s webhook timeout while retrying.
+  res.status(200).send("OK");
+  if (!callSid || !recordingUrl) return;
 
-    // Find the call record by Twilio CallSid
-    const record = await db.query.callRecords.findFirst({
-      where: eq(callRecords.twilioCallSid, callSid),
-    });
+  void (async () => {
+    try {
+      // Find the call record by Twilio CallSid. The recording-complete callback
+      // and the browser's call-record POST race at call-end — when the callback
+      // wins, the record doesn't exist yet. Retry for a while so we don't drop
+      // the recording (the cause of "No recording" on real connected calls).
+      let record = await db.query.callRecords.findFirst({
+        where: eq(callRecords.twilioCallSid, callSid),
+      });
+      for (let attempt = 0; !record && attempt < 20; attempt++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        record = await db.query.callRecords.findFirst({
+          where: eq(callRecords.twilioCallSid, callSid),
+        });
+      }
 
-    if (record) {
+      if (!record) {
+        console.log(`[Twilio Recording] No call record found for CallSid=${callSid} after retries`);
+        return;
+      }
+
       await db
         .update(callRecords)
         .set({
@@ -620,29 +634,20 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
         });
       } catch {}
 
-      // Auto-transcribe & summarize in the background so the recordings page
-      // shows the transcript without the rep having to click "Summarize".
-      // Fire-and-forget — failures are logged inside the service and must not
-      // block the webhook ACK to Twilio.
-      void (async () => {
-        try {
-          const { transcribeAndSummarize } = await import(
-            "../lib/transcription-service"
-          );
-          await transcribeAndSummarize(record.id, `${recordingUrl}.mp3`);
-        } catch (e) {
-          console.error("[Twilio Recording] Auto-transcribe failed:", e);
-        }
-      })();
-    } else {
-      console.log(`[Twilio Recording] No call record found for CallSid=${callSid}`);
+      // Auto-transcribe & summarize so the recordings page shows the transcript
+      // without the rep having to click "Summarize".
+      try {
+        const { transcribeAndSummarize } = await import(
+          "../lib/transcription-service"
+        );
+        await transcribeAndSummarize(record.id, `${recordingUrl}.mp3`);
+      } catch (e) {
+        console.error("[Twilio Recording] Auto-transcribe failed:", e);
+      }
+    } catch (err) {
+      console.error("[Twilio Recording] Error:", err);
     }
-
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error("[Twilio Recording] Error:", err);
-    res.status(200).send("OK");
-  }
+  })();
 });
 
 // ─── POST /webhooks/twilio/amd ───────────────────────────────────────────

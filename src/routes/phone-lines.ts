@@ -694,6 +694,13 @@ router.post(
     // with a placeholder is far better than losing it from the activity log.
     const safeFrom = (fromNumber && String(fromNumber).trim()) || "Unknown";
     const safeTo = (toNumber && String(toNumber).trim()) || "Unknown";
+    // Backstop against corrupt durations (a client bug once logged epoch-seconds
+    // here, overflowing int columns + aggregates). Clamp to 0..86400s (1 day).
+    const rawDuration = Number(duration);
+    const safeDuration =
+      Number.isFinite(rawDuration) && rawDuration > 0
+        ? Math.min(Math.round(rawDuration), 86400)
+        : 0;
 
     // Always attribute the call to the authenticated user — never trust the
     // client for this. We look up the display name from the users table so the
@@ -728,7 +735,7 @@ router.post(
         companyName: companyName || null,
         leadId: leadId || null,
         funnelId: funnelId || null,
-        duration: duration ?? 0,
+        duration: safeDuration,
         disposition: disposition || "completed",
         userId,
         userName,
