@@ -1,13 +1,21 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, sql, like, or, and, gte, desc } from "drizzle-orm";
+import { eq, sql, like, or, and, gte, lt, desc } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { phoneLines } from "../db/schema/phone-lines";
+import { callRecords } from "../db/schema/call-records";
+import { smsMessages } from "../db/schema/sms";
 import { adminAuditLog } from "../db/schema/admin-audit-log";
 import { ApiError } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
+import {
+  runCostSync,
+  getAccountCurrency,
+  getLastSyncedAt,
+  isSyncInProgress,
+} from "../lib/twilio-cost-sync";
 import { inviteEmailToOrganization, invitePlatformAdmin } from "../lib/invitations";
 import { alias } from "drizzle-orm/pg-core";
 
@@ -1663,6 +1671,414 @@ router.get(
     }));
 
     res.json({ data: { items, total, limit, offset } });
+  }),
+);
+
+// ─── Twilio cost reporting ────────────────────────────────────────────────
+// Exact per-org Twilio spend: voice + SMS come from the real billed `price`
+// synced onto call_records/sms_messages; number rentals from phone_lines'
+// monthly_cost (refreshed from the Pricing API). Recording-storage and AI
+// (Whisper + gpt-4o-mini) lines are clearly-flagged estimates. Compared to the
+// org's MRR to show real per-org margin.
+
+/** Tunable estimate rates (amounts in the Twilio account currency). Voice/SMS/
+ *  rentals are REAL; these only cover the estimated lines + un-synced fallback. */
+const COST_RATES = {
+  voicePerMinFallback: 0.014, // used only for calls not yet price-synced
+  smsPerMsgFallback: 0.0079, // used only for messages not yet price-synced
+  recordingStoragePerMin: 0.0005, // Twilio recording storage, /min/month (est.)
+  whisperPerMin: 0.006, // OpenAI transcription, per audio minute (est.)
+  aiSummaryPerCall: 0.0015, // OpenAI gpt-4o-mini summary, per call (est.)
+};
+// 1 GBP ≈ this many USD — only used to express GBP MRR in a USD-billed Twilio
+// account so margin is comparable. Flagged `fxApprox` whenever applied.
+const GBP_TO_USD = 1.27;
+const COST_STALE_MS = 6 * 60 * 60 * 1000; // auto-sync if data older than 6h
+
+interface MonthRange {
+  start: Date;
+  end: Date;
+  period: string;
+}
+function monthRange(period?: string): MonthRange {
+  const now = new Date();
+  let y = now.getUTCFullYear();
+  let m = now.getUTCMonth(); // 0-indexed
+  if (period && /^\d{4}-\d{2}$/.test(period)) {
+    const [py, pm] = period.split("-").map(Number);
+    y = py;
+    m = pm - 1;
+  }
+  const start = new Date(Date.UTC(y, m, 1));
+  const end = new Date(Date.UTC(y, m + 1, 1));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return { start, end, period: `${y}-${pad(m + 1)}` };
+}
+
+interface CallAgg {
+  actual: number;
+  syncedCount: number;
+  totalCount: number;
+  totalSeconds: number;
+  unsyncedSeconds: number;
+  recordingSeconds: number;
+  transcribedSeconds: number;
+  transcribedCount: number;
+}
+interface SmsAgg {
+  actual: number;
+  syncedCount: number;
+  totalCount: number;
+}
+
+const ZERO_CALL: CallAgg = {
+  actual: 0,
+  syncedCount: 0,
+  totalCount: 0,
+  totalSeconds: 0,
+  unsyncedSeconds: 0,
+  recordingSeconds: 0,
+  transcribedSeconds: 0,
+  transcribedCount: 0,
+};
+
+function callSelect() {
+  return {
+    actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)`,
+    syncedCount: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.twilioPrice} IS NOT NULL)::int`,
+    totalCount: sql<number>`COUNT(*)::int`,
+    totalSeconds: sql<number>`COALESCE(SUM(${callRecords.duration}), 0)::int`,
+    unsyncedSeconds: sql<number>`COALESCE(SUM(${callRecords.duration}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::int`,
+    recordingSeconds: sql<number>`COALESCE(SUM(${callRecords.recordingDuration}), 0)::int`,
+    transcribedSeconds: sql<number>`COALESCE(SUM(${callRecords.recordingDuration}) FILTER (WHERE ${callRecords.transcript} IS NOT NULL), 0)::int`,
+    transcribedCount: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.transcript} IS NOT NULL)::int`,
+  };
+}
+function smsSelect() {
+  return {
+    actual: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}), 0)`,
+    syncedCount: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NOT NULL)::int`,
+    totalCount: sql<number>`COUNT(*)::int`,
+  };
+}
+
+/** Turn raw aggregates + rentals into the cost breakdown returned to the UI. */
+function buildBreakdown(call: CallAgg, sms: SmsAgg, rentals: number, lineCount: number) {
+  const voiceEstimated = (call.unsyncedSeconds / 60) * COST_RATES.voicePerMinFallback;
+  const voiceCost = call.actual + voiceEstimated;
+  const smsEstimated =
+    (sms.totalCount - sms.syncedCount) * COST_RATES.smsPerMsgFallback;
+  const smsCost = sms.actual + smsEstimated;
+  const recordingCost = (call.recordingSeconds / 60) * COST_RATES.recordingStoragePerMin;
+  const aiCost =
+    (call.transcribedSeconds / 60) * COST_RATES.whisperPerMin +
+    call.transcribedCount * COST_RATES.aiSummaryPerCall;
+  const total = voiceCost + smsCost + rentals + recordingCost + aiCost;
+  const round = (n: number) => Math.round(n * 10000) / 10000;
+  return {
+    voice: {
+      cost: round(voiceCost),
+      actual: round(call.actual),
+      estimated: round(voiceEstimated),
+      actualPct: call.totalCount ? Math.round((call.syncedCount / call.totalCount) * 100) : 100,
+      calls: call.totalCount,
+      minutes: Math.round((call.totalSeconds / 60) * 10) / 10,
+    },
+    sms: {
+      cost: round(smsCost),
+      actual: round(sms.actual),
+      estimated: round(smsEstimated),
+      actualPct: sms.totalCount ? Math.round((sms.syncedCount / sms.totalCount) * 100) : 100,
+      count: sms.totalCount,
+    },
+    rentals: { cost: round(rentals), lines: lineCount, isEstimate: false },
+    recording: {
+      cost: round(recordingCost),
+      minutes: Math.round((call.recordingSeconds / 60) * 10) / 10,
+      isEstimate: true,
+    },
+    ai: { cost: round(aiCost), transcribedCalls: call.transcribedCount, isEstimate: true },
+    total: round(total),
+  };
+}
+
+/** Express GBP-pence MRR in the Twilio billing currency + compute margin. */
+function marginFor(mrrPence: number, totalCost: number, currency: string) {
+  const mrrGbp = mrrPence / 100;
+  const fxApprox = currency !== "GBP";
+  const mrrInCurrency = currency === "USD" ? mrrGbp * GBP_TO_USD : mrrGbp;
+  const margin = mrrInCurrency - totalCost;
+  const marginPct = mrrInCurrency > 0 ? Math.round((margin / mrrInCurrency) * 100) : null;
+  return {
+    mrrPence,
+    mrrInCurrency: Math.round(mrrInCurrency * 100) / 100,
+    margin: Math.round(margin * 100) / 100,
+    marginPct,
+    fxApprox,
+  };
+}
+
+/** Fire-and-forget sync when cost data is stale, so the overview self-freshens. */
+function maybeAutoSync(range: MonthRange): boolean {
+  const last = getLastSyncedAt();
+  const stale = !last || Date.now() - last.getTime() > COST_STALE_MS;
+  if (stale && !isSyncInProgress()) {
+    void runCostSync({ since: range.start, until: range.end }).catch((err) =>
+      console.error("[costs] auto-sync failed", err),
+    );
+    return true;
+  }
+  return false;
+}
+
+// ─── GET /twilio-costs — cross-org overview for a period ──────────────────
+router.get(
+  "/twilio-costs",
+  asyncHandler(async (req, res) => {
+    const range = monthRange(req.query.period as string | undefined);
+    const currency = await getAccountCurrency();
+    const syncing = maybeAutoSync(range) || isSyncInProgress();
+
+    const where = and(gte(callRecords.calledAt, range.start), lt(callRecords.calledAt, range.end));
+    const callRows = await db
+      .select({ orgId: callRecords.organizationId, ...callSelect() })
+      .from(callRecords)
+      .where(where)
+      .groupBy(callRecords.organizationId);
+    const callByOrg = new Map(callRows.map((r) => [r.orgId, r as unknown as CallAgg & { orgId: string }]));
+
+    const smsRows = await db
+      .select({ orgId: smsMessages.organizationId, ...smsSelect() })
+      .from(smsMessages)
+      .where(and(gte(smsMessages.createdAt, range.start), lt(smsMessages.createdAt, range.end)))
+      .groupBy(smsMessages.organizationId);
+    const smsByOrg = new Map(smsRows.map((r) => [r.orgId, r as unknown as SmsAgg & { orgId: string }]));
+
+    const rentalRows = await db
+      .select({
+        orgId: phoneLines.organizationId,
+        rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)`,
+        lineCount: sql<number>`COUNT(*)::int`,
+      })
+      .from(phoneLines)
+      .where(eq(phoneLines.status, "active"))
+      .groupBy(phoneLines.organizationId);
+    const rentalByOrg = new Map(rentalRows.map((r) => [r.orgId, r]));
+
+    const orgs = await db
+      .select({
+        id: organizations.id,
+        name: organizations.name,
+        plan: organizations.plan,
+        seatsIncluded: organizations.seatsIncluded,
+      })
+      .from(organizations);
+
+    const rows = orgs
+      .map((o) => {
+        const call = (callByOrg.get(o.id) as CallAgg) ?? ZERO_CALL;
+        const sms = (smsByOrg.get(o.id) as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 };
+        const rental = rentalByOrg.get(o.id);
+        const breakdown = buildBreakdown(call, sms, rental?.rentals ?? 0, rental?.lineCount ?? 0);
+        const mrrPence = computeMrrPence(o.plan, o.seatsIncluded || 0);
+        const margin = marginFor(mrrPence, breakdown.total, currency);
+        return {
+          orgId: o.id,
+          name: o.name,
+          plan: o.plan,
+          ...breakdown,
+          ...margin,
+        };
+      })
+      // Only surface orgs that actually have telephony activity or cost.
+      .filter((r) => r.total > 0 || r.voice.calls > 0 || r.sms.count > 0 || r.rentals.lines > 0)
+      .sort((a, b) => b.total - a.total);
+
+    const totals = rows.reduce(
+      (acc, r) => {
+        acc.total += r.total;
+        acc.voice += r.voice.cost;
+        acc.sms += r.sms.cost;
+        acc.rentals += r.rentals.cost;
+        acc.ai += r.ai.cost;
+        acc.margin += r.margin;
+        return acc;
+      },
+      { total: 0, voice: 0, sms: 0, rentals: 0, ai: 0, margin: 0 },
+    );
+
+    res.json({
+      data: {
+        period: range.period,
+        currency,
+        lastSyncedAt: getLastSyncedAt()?.toISOString() ?? null,
+        syncing,
+        totals: Object.fromEntries(
+          Object.entries(totals).map(([k, v]) => [k, Math.round(v * 100) / 100]),
+        ),
+        rows,
+      },
+    });
+  }),
+);
+
+// ─── GET /organizations/:id/twilio-costs — per-org breakdown + trend ──────
+router.get(
+  "/organizations/:id/twilio-costs",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const orgId = req.params.id;
+    const range = monthRange(req.query.period as string | undefined);
+    const months = Math.min(Math.max(Number(req.query.months) || 6, 1), 12);
+    const currency = await getAccountCurrency();
+
+    const [org] = await db
+      .select({ id: organizations.id, name: organizations.name, plan: organizations.plan, seatsIncluded: organizations.seatsIncluded })
+      .from(organizations)
+      .where(eq(organizations.id, orgId))
+      .limit(1);
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const orgCallWhere = (s: Date, e: Date) =>
+      and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, s), lt(callRecords.calledAt, e));
+    const orgSmsWhere = (s: Date, e: Date) =>
+      and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, s), lt(smsMessages.createdAt, e));
+
+    const [call] = await db.select(callSelect()).from(callRecords).where(orgCallWhere(range.start, range.end));
+    const [sms] = await db.select(smsSelect()).from(smsMessages).where(orgSmsWhere(range.start, range.end));
+    const [rental] = await db
+      .select({
+        rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)`,
+        lineCount: sql<number>`COUNT(*)::int`,
+      })
+      .from(phoneLines)
+      .where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.status, "active")));
+
+    const breakdown = buildBreakdown(
+      (call as unknown as CallAgg) ?? ZERO_CALL,
+      (sms as unknown as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 },
+      rental?.rentals ?? 0,
+      rental?.lineCount ?? 0,
+    );
+    const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0);
+    const margin = marginFor(mrrPence, breakdown.total, currency);
+
+    // Monthly trend (cost per month over the trailing window).
+    const trend: { period: string; total: number; voice: number; sms: number; rentals: number }[] = [];
+    for (let i = months - 1; i >= 0; i--) {
+      const s = new Date(Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth() - i, 1));
+      const e = new Date(Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth() - i + 1, 1));
+      const [c] = await db.select(callSelect()).from(callRecords).where(orgCallWhere(s, e));
+      const [m] = await db.select(smsSelect()).from(smsMessages).where(orgSmsWhere(s, e));
+      const b = buildBreakdown(
+        (c as unknown as CallAgg) ?? ZERO_CALL,
+        (m as unknown as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 },
+        rental?.rentals ?? 0,
+        rental?.lineCount ?? 0,
+      );
+      const pad = (n: number) => String(n).padStart(2, "0");
+      trend.push({
+        period: `${s.getUTCFullYear()}-${pad(s.getUTCMonth() + 1)}`,
+        total: b.total,
+        voice: b.voice.cost,
+        sms: b.sms.cost,
+        rentals: b.rentals.cost,
+      });
+    }
+
+    // Per-line breakdown for the period.
+    const lineRows = await db
+      .select({
+        lineId: callRecords.lineId,
+        actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)`,
+        seconds: sql<number>`COALESCE(SUM(${callRecords.duration}), 0)::int`,
+        calls: sql<number>`COUNT(*)::int`,
+      })
+      .from(callRecords)
+      .where(orgCallWhere(range.start, range.end))
+      .groupBy(callRecords.lineId);
+    const lines = await db
+      .select()
+      .from(phoneLines)
+      .where(eq(phoneLines.organizationId, orgId));
+    const lineMeta = new Map(lines.map((l) => [l.id, l]));
+    const perLine = lineRows
+      .filter((r) => r.lineId)
+      .map((r) => {
+        const meta = lineMeta.get(r.lineId!);
+        return {
+          lineId: r.lineId,
+          number: meta?.number ?? "—",
+          friendlyName: meta?.friendlyName ?? null,
+          monthlyCost: meta ? Math.round(meta.monthlyCost * 10000) / 10000 : 0,
+          voiceCost: Math.round(r.actual * 10000) / 10000,
+          calls: r.calls,
+          minutes: Math.round((r.seconds / 60) * 10) / 10,
+        };
+      })
+      .sort((a, b) => b.voiceCost - a.voiceCost);
+
+    // Most expensive calls for the period.
+    const topCallRows = await db
+      .select({
+        id: callRecords.id,
+        toNumber: callRecords.toNumber,
+        fromNumber: callRecords.fromNumber,
+        direction: callRecords.direction,
+        duration: callRecords.duration,
+        price: callRecords.twilioPrice,
+        calledAt: callRecords.calledAt,
+      })
+      .from(callRecords)
+      .where(orgCallWhere(range.start, range.end))
+      .orderBy(desc(callRecords.twilioPrice), desc(callRecords.duration))
+      .limit(10);
+    const topCalls = topCallRows.map((c) => ({
+      id: c.id,
+      direction: c.direction,
+      number: c.direction === "inbound" ? c.fromNumber : c.toNumber,
+      duration: c.duration,
+      price: c.price != null ? Math.round(c.price * 10000) / 10000 : null,
+      calledAt: c.calledAt?.toISOString() ?? null,
+    }));
+
+    res.json({
+      data: {
+        orgId,
+        name: org.name,
+        period: range.period,
+        currency,
+        lastSyncedAt: getLastSyncedAt()?.toISOString() ?? null,
+        ...breakdown,
+        ...margin,
+        trend,
+        perLine,
+        topCalls,
+      },
+    });
+  }),
+);
+
+// ─── POST /twilio-costs/sync — pull real prices from Twilio ───────────────
+router.post(
+  "/twilio-costs/sync",
+  asyncHandler(async (req, res) => {
+    const range = monthRange(req.query.period as string | undefined);
+    const full = req.query.full === "1" || req.query.full === "true";
+    // Full backfill widens to the last 90 days; otherwise just this period.
+    const since = full ? new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) : range.start;
+    const until = full ? new Date() : range.end;
+
+    const result = await runCostSync({ since, until, full });
+
+    await recordAudit({
+      actorUserId: getActorId(req),
+      action: "costs.sync",
+      targetType: "organization",
+      targetId: "*",
+      metadata: { period: range.period, full, ...result },
+    });
+
+    res.json({ data: result });
   }),
 );
 

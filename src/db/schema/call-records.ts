@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, jsonb, real } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 import { phoneLines } from "./phone-lines";
 
@@ -58,6 +58,12 @@ export const callRecords = pgTable("call_records", {
   // Rep who made/received the call
   userId: text("user_id"),
   userName: text("user_name"),
+  // Exact Twilio cost — the billed `price` on the Twilio Call resource, synced
+  // from the Twilio API (positive amount). Null until synced; `priceUnit` is the
+  // account billing currency (e.g. "USD"). Used for per-org cost reporting.
+  twilioPrice: real("twilio_price"),
+  twilioPriceUnit: text("twilio_price_unit"),
+  twilioPriceSyncedAt: timestamp("twilio_price_synced_at", { withTimezone: true }),
   calledAt: timestamp("called_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

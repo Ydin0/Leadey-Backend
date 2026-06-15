@@ -25,7 +25,9 @@ export type AuditAction =
   | "user.platform_role.change"
   | "user.suspend"
   | "user.unsuspend"
-  | "user.impersonate";
+  | "user.impersonate"
+  // platform actions
+  | "costs.sync";
 
 export type AuditTargetType = "organization" | "user" | "invoice" | "subscription";
 
