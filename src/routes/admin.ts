@@ -1935,6 +1935,9 @@ router.get(
     const range = monthRange(req.query.period as string | undefined);
     const months = Math.min(Math.max(Number(req.query.months) || 6, 1), 12);
     const currency = await getAccountCurrency();
+    // Self-freshen: pull real Twilio prices in the background when stale, so
+    // the tab fills in actual figures without the rep clicking Sync.
+    maybeAutoSync(range);
 
     const [org] = await db
       .select({ id: organizations.id, name: organizations.name, plan: organizations.plan, seatsIncluded: organizations.seatsIncluded })
@@ -1996,6 +1999,7 @@ router.get(
         lineId: callRecords.lineId,
         actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
         seconds: sql<number>`COALESCE(SUM(${SANE_DURATION}), 0)::float8`,
+        unsyncedSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::float8`,
         calls: sql<number>`COUNT(*)::int`,
       })
       .from(callRecords)
@@ -2010,12 +2014,15 @@ router.get(
       .filter((r) => r.lineId)
       .map((r) => {
         const meta = lineMeta.get(r.lineId!);
+        // Real synced cost + a fallback estimate for any calls not yet priced,
+        // so the column reflects spend instead of $0 before the first sync.
+        const voiceCost = r.actual + (r.unsyncedSeconds / 60) * COST_RATES.voicePerMinFallback;
         return {
           lineId: r.lineId,
           number: meta?.number ?? "—",
           friendlyName: meta?.friendlyName ?? null,
           monthlyCost: meta ? Math.round(meta.monthlyCost * 10000) / 10000 : 0,
-          voiceCost: Math.round(r.actual * 10000) / 10000,
+          voiceCost: Math.round(voiceCost * 10000) / 10000,
           calls: r.calls,
           minutes: Math.round((r.seconds / 60) * 10) / 10,
         };

@@ -28,7 +28,9 @@ const client = twilioSdk(
 );
 
 // Cap a single sync pass so an admin click can't fan out unbounded API calls.
-const MAX_RESOURCES = 5000;
+// The call list is account-wide and includes child (PSTN) legs, so this must
+// comfortably exceed a month's total legs across all orgs.
+const MAX_RESOURCES = 20000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 let cachedCurrency: string | null = null;
@@ -72,28 +74,45 @@ export async function syncCallPrices(since: Date, until: Date): Promise<number> 
   if (ourSids.size === 0) return 0;
 
   // Pad the Twilio query window by a day each side to absorb start-time vs
-  // logged-at skew, then build a price map and update only our rows.
+  // logged-at skew.
   const calls = await client.calls.list({
     startTimeAfter: new Date(since.getTime() - DAY_MS),
     startTimeBefore: new Date(until.getTime() + DAY_MS),
     limit: MAX_RESOURCES,
   });
-  const priceBySid = new Map<string, { price: number; unit: string | null }>();
+
+  // The REAL cost of a browser-placed outbound call lives on the CHILD leg:
+  // we dial via <Dial><Number>, so the parent (client) leg we store as
+  // twilioCallSid is ~$0 and the per-minute PSTN charge sits on the child leg
+  // (child.parentCallSid === our SID). So we sum each leg's price onto the
+  // parent SID we own — the parent's own price PLUS all its children's.
+  // Only legs whose price Twilio has FINALIZED (non-null) are counted; calls
+  // still settling are skipped and picked up on the next sync (rather than
+  // stamping a premature $0).
+  const totalBySid = new Map<string, { price: number; unit: string | null }>();
+  const add = (key: string, price: number, unit: string | null) => {
+    const cur = totalBySid.get(key) || { price: 0, unit: null };
+    cur.price += price;
+    if (!cur.unit && unit) cur.unit = unit;
+    totalBySid.set(key, cur);
+  };
   for (const c of calls) {
     if (c.price == null || c.price === "") continue;
     const price = Math.abs(Number(c.price));
     if (!Number.isFinite(price)) continue;
-    priceBySid.set(c.sid, { price, unit: c.priceUnit || null });
+    // Attribute this leg to the parent SID we own — either this leg IS ours,
+    // or it's a child of one of ours.
+    if (ourSids.has(c.sid)) add(c.sid, price, c.priceUnit || null);
+    else if (c.parentCallSid && ourSids.has(c.parentCallSid))
+      add(c.parentCallSid, price, c.priceUnit || null);
   }
 
   let updated = 0;
   const now = new Date();
-  for (const sid of ourSids) {
-    const p = priceBySid.get(sid);
-    if (!p) continue;
+  for (const [sid, { price, unit }] of totalBySid) {
     const rows = await db
       .update(callRecords)
-      .set({ twilioPrice: p.price, twilioPriceUnit: p.unit, twilioPriceSyncedAt: now })
+      .set({ twilioPrice: price, twilioPriceUnit: unit, twilioPriceSyncedAt: now })
       .where(eq(callRecords.twilioCallSid, sid))
       .returning({ id: callRecords.id });
     updated += rows.length;
