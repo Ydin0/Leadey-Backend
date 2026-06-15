@@ -878,40 +878,71 @@ router.get(
   asyncHandler(async (req, res) => {
     const s = await loadSessionOr404(req, req.params.id as string);
 
-    // Pull current item (in_progress or awaiting_disposition) and the next
-    // 5 pending items.
-    const rows = await db
+    // Self-heal: a session should have exactly ONE in_progress item while leads
+    // remain. Find it directly (no positional window — the in_progress lead can
+    // sit anywhere, e.g. when the session opened past a few busy leads). Collapse
+    // any duplicate in_progress rows, and if none is in_progress but pending
+    // remain, promote the lowest-position pending — so a session can never get
+    // stuck reporting "complete" while it still has leads to dial.
+    const live = await db
       .select()
       .from(dialerQueueItems)
       .where(
         and(
           eq(dialerQueueItems.sessionId, s.id),
-          sql`${dialerQueueItems.status} IN ('in_progress', 'awaiting_disposition', 'pending')`,
+          inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
         ),
       )
-      .orderBy(asc(dialerQueueItems.position))
-      .limit(6);
+      .orderBy(asc(dialerQueueItems.position));
 
-    const leadIds = rows.map((r) => r.leadId);
-    const masterIds = rows.map((r) => r.masterContactId).filter(Boolean) as string[];
+    let currentItem: typeof dialerQueueItems.$inferSelect | null = live[0] ?? null;
+    if (live.length > 1) {
+      const extra = live.slice(1).filter((r) => r.status === "in_progress").map((r) => r.id);
+      if (extra.length) {
+        await db.update(dialerQueueItems).set({ status: "pending" }).where(inArray(dialerQueueItems.id, extra));
+      }
+    }
+    if (!currentItem) {
+      const [firstPending] = await db
+        .select()
+        .from(dialerQueueItems)
+        .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
+        .orderBy(asc(dialerQueueItems.position))
+        .limit(1);
+      if (firstPending) {
+        await db.update(dialerQueueItems).set({ status: "in_progress" }).where(eq(dialerQueueItems.id, firstPending.id));
+        currentItem = { ...firstPending, status: "in_progress" };
+      }
+    }
 
-    const leadRows = leadIds.length
-      ? await db.select().from(leads).where(inArray(leads.id, leadIds))
+    const upcoming = currentItem
+      ? await db
+          .select()
+          .from(dialerQueueItems)
+          .where(
+            and(
+              eq(dialerQueueItems.sessionId, s.id),
+              eq(dialerQueueItems.status, "pending"),
+              sql`${dialerQueueItems.position} > ${currentItem.position}`,
+            ),
+          )
+          .orderBy(asc(dialerQueueItems.position))
+          .limit(5)
       : [];
+
+    const allItems = [...(currentItem ? [currentItem] : []), ...upcoming];
+    const leadIds = allItems.map((r) => r.leadId);
+    const masterIds = allItems.map((r) => r.masterContactId).filter(Boolean) as string[];
+    const leadRows = leadIds.length ? await db.select().from(leads).where(inArray(leads.id, leadIds)) : [];
     const leadById = new Map(leadRows.map((l) => [l.id, l]));
-    const masterRows = masterIds.length
-      ? await db.select().from(masterContacts).where(inArray(masterContacts.id, masterIds))
-      : [];
+    const masterRows = masterIds.length ? await db.select().from(masterContacts).where(inArray(masterContacts.id, masterIds)) : [];
     const masterById = new Map(masterRows.map((m) => [m.id, m]));
-
-    const current = rows.find((r) => r.status === "in_progress" || r.status === "awaiting_disposition");
-    const upcoming = rows.filter((r) => r.status === "pending").slice(0, 5);
 
     res.json({
       data: {
         session: serializeSession(s),
-        current: current
-          ? serializeQueueItem(current, leadById.get(current.leadId), current.masterContactId ? masterById.get(current.masterContactId) : null)
+        current: currentItem
+          ? serializeQueueItem(currentItem, leadById.get(currentItem.leadId), currentItem.masterContactId ? masterById.get(currentItem.masterContactId) : null)
           : null,
         upcoming: upcoming.map((u) =>
           serializeQueueItem(u, leadById.get(u.leadId), u.masterContactId ? masterById.get(u.masterContactId) : null),
@@ -1134,12 +1165,23 @@ router.post(
       if (collidedLeadIds.length) {
         nextConds.push(notInArray(dialerQueueItems.leadId, collidedLeadIds));
       }
-      const [next] = await tx
+      let [next] = await tx
         .select()
         .from(dialerQueueItems)
         .where(and(...nextConds))
         .orderBy(asc(dialerQueueItems.position))
         .limit(1);
+      // If every remaining lead is momentarily collided, still continue with the
+      // next pending one — never strand the rep / falsely "complete" the session.
+      // Avoiding the same person twice is best-effort, not a hard stop.
+      if (!next) {
+        [next] = await tx
+          .select()
+          .from(dialerQueueItems)
+          .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
+          .orderBy(asc(dialerQueueItems.position))
+          .limit(1);
+      }
       if (next) {
         await tx
           .update(dialerQueueItems)
