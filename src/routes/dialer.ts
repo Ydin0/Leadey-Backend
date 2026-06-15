@@ -703,24 +703,12 @@ router.post(
       );
     }
 
-    // Realtime claim — which of these leads is another rep actively on right
-    // now (in_progress in another live session)? Open this session on the first
-    // lead that's free, so two reps sharing a campaign don't both start on the
-    // same contact. (Recently-completed leads were already filtered out above.)
-    const busyRows = await db
-      .select({ leadId: dialerQueueItems.leadId })
-      .from(dialerQueueItems)
-      .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
-      .where(
-        and(
-          eq(dialerSessions.organizationId, orgId),
-          inArray(dialerSessions.status, ["active", "paused"]),
-          inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
-        ),
-      );
-    const busyLeadIds = new Set(busyRows.map((r) => r.leadId));
-    const firstClean = queue.findIndex((q) => !busyLeadIds.has(q.lead.id));
-    const inProgressIdx = firstClean === -1 ? 0 : firstClean;
+    // Open on the first lead and progress strictly forward by position. Two
+    // reps sharing a campaign are de-conflicted at advance time (the next-lead
+    // pick skips whoever another rep is currently on) — opening at position 0
+    // keeps the in_progress item always at the front, which the current/advance/
+    // skip logic relies on.
+    const inProgressIdx = 0;
 
     // Insert session + queue items in a transaction. The partial unique
     // index on (user_id) WHERE status='active' will reject if the user has
@@ -1241,17 +1229,28 @@ router.post(
     const s = await loadSessionOr404(req, req.params.id as string);
     const { reason } = req.body as { reason?: string };
     const result = await db.transaction(async (tx) => {
-      const [current] = await tx
+      // Skip the lead the rep is actually on — the in_progress/awaiting item,
+      // NOT the lowest-position pending (which would skip the wrong contact).
+      // Fall back to the first pending only if nothing is open (self-heal).
+      let [current] = await tx
         .select()
         .from(dialerQueueItems)
         .where(
           and(
             eq(dialerQueueItems.sessionId, s.id),
-            sql`${dialerQueueItems.status} IN ('in_progress', 'awaiting_disposition', 'pending')`,
+            sql`${dialerQueueItems.status} IN ('in_progress', 'awaiting_disposition')`,
           ),
         )
         .orderBy(asc(dialerQueueItems.position))
         .limit(1);
+      if (!current) {
+        [current] = await tx
+          .select()
+          .from(dialerQueueItems)
+          .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
+          .orderBy(asc(dialerQueueItems.position))
+          .limit(1);
+      }
       if (!current) throw new ApiError(400, "No queue item to skip");
 
       await tx
