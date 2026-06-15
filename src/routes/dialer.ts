@@ -23,6 +23,7 @@ import {
   saveVoicemailFile,
   deleteVoicemailFile,
 } from "../lib/voicemail-storage";
+import { getMergedLeadStatuses } from "../lib/lead-status-config";
 
 const router = Router();
 const upload = multer({
@@ -522,6 +523,10 @@ router.post(
       filters?: {
         excludeDoNotCall?: boolean;
         excludeRecentlyCalled?: boolean;
+        /** Don't re-queue anyone called within the last N days (default 2). */
+        recentlyCalledDays?: number;
+        /** Skip leads in a terminal status (Not Interested, DNC, Qualified…). */
+        excludeClosed?: boolean;
         respectTimezone?: boolean;
         maxAttempts?: number | null;
       };
@@ -533,6 +538,11 @@ router.post(
     const resolvedFilters = {
       excludeDoNotCall: filters?.excludeDoNotCall ?? true,
       excludeRecentlyCalled: filters?.excludeRecentlyCalled ?? true,
+      recentlyCalledDays:
+        filters?.recentlyCalledDays && filters.recentlyCalledDays > 0
+          ? Math.min(Math.floor(filters.recentlyCalledDays), 30)
+          : 2,
+      excludeClosed: filters?.excludeClosed ?? true,
       respectTimezone: filters?.respectTimezone ?? false,
       maxAttempts: filters?.maxAttempts ?? 3,
     };
@@ -621,19 +631,44 @@ router.post(
     }
 
     const now = Date.now();
-    const RECENT_MS = 24 * 60 * 60 * 1000;
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const RECENT_MS = DAY_MS; // 24h — the window for "max attempts per contact"
+    const recentMs = resolvedFilters.recentlyCalledDays * DAY_MS; // "recently called" floor
 
-    // Per-lead dialer attempts in the last 24h, keyed by leadId. The
-    // master-contact counters above only work for leads with an email /
-    // LinkedIn URL; cold-call CSV lists are usually phone-only with no master,
-    // so we count the dialer's OWN completed calls per lead instead. This drives
-    // both "exclude recently called" (≥1 attempt) and "max attempts per contact
-    // (last 24h)" (≥N attempts) — org-wide so two reps don't double-dial.
+    // Terminal lead statuses (Not Interested, DNC, Qualified, Bounced, …) — used
+    // to skip closed leads so the dialer only works new & follow-up contacts.
+    const terminalStatusKeys = new Set(
+      (await getMergedLeadStatuses(orgId)).filter((s) => s.isTerminal).map((s) => s.key),
+    );
+
+    // Disposition rules (retryAfterDays + outcomeBucket) keyed by id, so a lead's
+    // LAST outcome decides whether its retry window has elapsed.
+    const dispoRows = await db
+      .select({
+        id: callDispositions.id,
+        retryAfterDays: callDispositions.retryAfterDays,
+        outcomeBucket: callDispositions.outcomeBucket,
+      })
+      .from(callDispositions)
+      .where(eq(callDispositions.organizationId, orgId));
+    const dispoById = new Map(dispoRows.map((d) => [d.id, d]));
+
+    // One pass over recent completed calls (org-wide) gives us both:
+    //   • the LAST disposition + when, per lead (recency + retry-window check)
+    //   • the count in the last 24h, per lead (max-attempts check)
+    // Look back far enough to cover any retry window (capped) and the recency
+    // floor — retry windows are 1–3 days, so 30 days is generous.
+    const lookbackMs = Math.max(recentMs, 30 * DAY_MS);
+    const lastCallByLead = new Map<string, { calledAt: number; dispositionId: string | null }>();
     const recentAttemptsByLead = new Map<string, number>();
-    if (resolvedFilters.excludeRecentlyCalled || resolvedFilters.maxAttempts !== null) {
-      const since = new Date(now - RECENT_MS);
+    {
+      const since = new Date(now - lookbackMs);
       const calledRows = await db
-        .select({ leadId: dialerQueueItems.leadId, n: count() })
+        .select({
+          leadId: dialerQueueItems.leadId,
+          calledAt: dialerQueueItems.calledAt,
+          dispositionId: dialerQueueItems.dispositionId,
+        })
         .from(dialerQueueItems)
         .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
         .where(
@@ -643,13 +678,25 @@ router.post(
             gte(dialerQueueItems.calledAt, since),
           ),
         )
-        .groupBy(dialerQueueItems.leadId);
-      for (const r of calledRows) recentAttemptsByLead.set(r.leadId, r.n);
+        .orderBy(desc(dialerQueueItems.calledAt));
+      for (const r of calledRows) {
+        if (!r.calledAt) continue;
+        const t = r.calledAt.getTime();
+        // Rows are newest-first, so the first one seen per lead is the latest.
+        if (!lastCallByLead.has(r.leadId)) {
+          lastCallByLead.set(r.leadId, { calledAt: t, dispositionId: r.dispositionId });
+        }
+        if (now - t < RECENT_MS) {
+          recentAttemptsByLead.set(r.leadId, (recentAttemptsByLead.get(r.leadId) ?? 0) + 1);
+        }
+      }
     }
 
     type QueueEntry = { lead: typeof leads.$inferSelect; master: typeof masterContacts.$inferSelect | null };
     const queue: QueueEntry[] = [];
     let excludedDnc = 0;
+    let excludedClosed = 0;
+    let excludedRetry = 0;
     let excludedRecent = 0;
     let excludedAttempts = 0;
     let excludedTimezone = 0;
@@ -664,11 +711,39 @@ router.post(
         excludedDnc++;
         continue;
       }
+      // Closed/terminal lead (Not Interested, DNC, Qualified, Bounced, …) —
+      // never re-dial unless the rep explicitly opts to include closed leads.
+      if (resolvedFilters.excludeClosed && terminalStatusKeys.has(lead.status)) {
+        excludedClosed++;
+        continue;
+      }
+
+      const lastCall = lastCallByLead.get(lead.id);
+      // Per-disposition retry window: a lead whose last outcome was negative
+      // (e.g. Not Interested) stays out for good; one with a retry delay
+      // (No Answer 1d, Voicemail 2d, Gatekeeper 3d, …) waits out that window.
+      if (lastCall?.dispositionId) {
+        const dispo = dispoById.get(lastCall.dispositionId);
+        if (dispo) {
+          if (dispo.outcomeBucket === "negative") {
+            excludedRetry++;
+            continue;
+          }
+          if (
+            dispo.retryAfterDays != null &&
+            now - lastCall.calledAt < dispo.retryAfterDays * DAY_MS
+          ) {
+            excludedRetry++;
+            continue;
+          }
+        }
+      }
+
       const recentAttempts = recentAttemptsByLead.get(lead.id) ?? 0;
       if (
         resolvedFilters.excludeRecentlyCalled &&
-        ((master?.lastCalledAt && now - master.lastCalledAt.getTime() < RECENT_MS) ||
-          recentAttempts >= 1)
+        ((master?.lastCalledAt && now - master.lastCalledAt.getTime() < recentMs) ||
+          (lastCall && now - lastCall.calledAt < recentMs))
       ) {
         excludedRecent++;
         continue;
@@ -699,7 +774,7 @@ router.post(
     if (queue.length === 0) {
       throw new ApiError(
         400,
-        `No dialable leads found. Excluded — DNC:${excludedDnc} recent:${excludedRecent} attempts:${excludedAttempts} timezone:${excludedTimezone}`,
+        `No dialable leads found. Excluded — DNC:${excludedDnc} closed:${excludedClosed} retry:${excludedRetry} recent:${excludedRecent} attempts:${excludedAttempts} timezone:${excludedTimezone}`,
       );
     }
 
