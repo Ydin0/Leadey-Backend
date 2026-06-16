@@ -5,6 +5,8 @@ import { scraperSignals } from "../db/schema/scrapers";
 import { discoveryRuns, scraperContacts } from "../db/schema/contacts";
 import { funnels, funnelSteps } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
+import { masterContacts, masterCompanies } from "../db/schema/master";
+import { callRecords } from "../db/schema/call-records";
 import { ApifyClient, mapSeniorityLevels, type ApifyProfileItem } from "../lib/apify-client";
 import { BetterContactClient, type BetterContactInput } from "../lib/bettercontact-client";
 import { SmartleadClient, type SmartleadLeadInput } from "../lib/smartlead-client";
@@ -772,6 +774,198 @@ router.post(
       data: {
         status: allFinished ? "finished" : "processing",
         enrichedCount: totalEnriched,
+      },
+    });
+  }),
+);
+
+// ─── GET /contacts/:id/profile ──────────────────────────────────────
+// Full standalone profile for a discovered contact — works whether or not the
+// contact has been added to a campaign. Merges the org-wide master_contacts
+// record (DNC / enrichment), the campaigns the person is in (leads matched by
+// LinkedIn or email), and their call activity. Powers /dashboard/contacts/[id].
+router.get(
+  "/contacts/:id/profile",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = req.params.id as string;
+
+    const [c] = await db
+      .select()
+      .from(scraperContacts)
+      .where(and(eq(scraperContacts.id, id), eq(scraperContacts.organizationId, orgId)))
+      .limit(1);
+    if (!c) throw new ApiError(404, "Contact not found");
+
+    // Org-wide master record (DNC, timezone, best enrichment) by LinkedIn URL.
+    const master = c.linkedinUrl
+      ? (await db
+          .select()
+          .from(masterContacts)
+          .where(and(eq(masterContacts.organizationId, orgId), eq(masterContacts.linkedinUrl, c.linkedinUrl)))
+          .limit(1))[0]
+      : undefined;
+
+    const email = (c.email || master?.email || "").toLowerCase();
+    const phone = c.phone || master?.phone || null;
+    const digits = (phone || "").replace(/[^0-9]/g, "");
+
+    // Campaigns this person is in — leads matched by LinkedIn URL or email.
+    const matchConds = [];
+    if (c.linkedinUrl) matchConds.push(eq(leads.linkedinUrl, c.linkedinUrl));
+    if (email) matchConds.push(sql`LOWER(${leads.email}) = ${email}`);
+    const campaigns = matchConds.length
+      ? await db
+          .select({
+            leadId: leads.id,
+            funnelId: leads.funnelId,
+            funnelName: funnels.name,
+            status: leads.status,
+            currentStep: leads.currentStep,
+            totalSteps: leads.totalSteps,
+          })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.organizationId, orgId), or(...matchConds)))
+      : [];
+
+    // Call activity (org-wide, by phone) — most recent first.
+    const calls = digits.length > 5
+      ? await db
+          .select({
+            id: callRecords.id,
+            direction: callRecords.direction,
+            toNumber: callRecords.toNumber,
+            fromNumber: callRecords.fromNumber,
+            duration: callRecords.duration,
+            disposition: callRecords.disposition,
+            calledAt: callRecords.calledAt,
+          })
+          .from(callRecords)
+          .where(
+            and(
+              eq(callRecords.organizationId, orgId),
+              sql`regexp_replace(COALESCE(${callRecords.toNumber}, ''), '[^0-9]', '', 'g') = ${digits}`,
+            ),
+          )
+          .orderBy(desc(callRecords.calledAt))
+          .limit(25)
+      : [];
+
+    res.json({
+      data: {
+        id: c.id,
+        assignmentId: c.assignmentId,
+        fullName: c.fullName,
+        firstName: c.firstName,
+        lastName: c.lastName,
+        headline: c.headline,
+        title: c.currentTitle,
+        company: c.currentCompany || c.companyName,
+        companyDomain: c.companyDomain,
+        companyLinkedinUrl: c.companyLinkedinUrl || c.currentCompanyLinkedinUrl,
+        linkedinUrl: c.linkedinUrl,
+        location: c.location || master?.location || null,
+        profileImageUrl: c.profileImageUrl || master?.profileImageUrl || null,
+        email: c.email || master?.email || null,
+        emailStatus: c.emailStatus || master?.emailStatus || null,
+        phone,
+        phoneStatus: c.phoneStatus || master?.phoneStatus || null,
+        enrichmentStatus: c.enrichmentStatus,
+        status: c.status,
+        doNotCall: master?.doNotCall ?? false,
+        callsTotal: calls.length,
+        campaigns,
+        calls: calls.map((cr) => ({
+          id: cr.id,
+          direction: cr.direction,
+          number: cr.direction === "inbound" ? cr.fromNumber : cr.toNumber,
+          duration: cr.duration,
+          disposition: cr.disposition,
+          calledAt: cr.calledAt?.toISOString() ?? null,
+        })),
+      },
+    });
+  }),
+);
+
+// ─── GET /companies/profile ─────────────────────────────────────────
+// Standalone company profile keyed by domain or LinkedIn URL — the master
+// company record, the discovered contacts at that company, and any campaign
+// leads there. Powers /dashboard/companies/[key].
+router.get(
+  "/companies/profile",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const key = (req.query.key as string | undefined)?.trim();
+    if (!key) throw new ApiError(400, "key (domain or linkedin url) is required");
+    const isUrl = key.includes("linkedin.com");
+
+    const [company] = await db
+      .select()
+      .from(masterCompanies)
+      .where(
+        and(
+          eq(masterCompanies.organizationId, orgId),
+          isUrl ? eq(masterCompanies.linkedinUrl, key) : eq(masterCompanies.domain, key),
+        ),
+      )
+      .limit(1);
+
+    // Discovered contacts at this company (by linkedin url or name).
+    const contactConds = [eq(scraperContacts.organizationId, orgId)];
+    if (isUrl) contactConds.push(eq(scraperContacts.companyLinkedinUrl, key));
+    else if (company) contactConds.push(ilike(scraperContacts.companyName, `%${company.name}%`));
+    else contactConds.push(ilike(scraperContacts.companyDomain, `%${key}%`));
+    const contacts = await db
+      .select({
+        id: scraperContacts.id,
+        fullName: scraperContacts.fullName,
+        title: scraperContacts.currentTitle,
+        linkedinUrl: scraperContacts.linkedinUrl,
+        email: scraperContacts.email,
+        phone: scraperContacts.phone,
+        status: scraperContacts.status,
+      })
+      .from(scraperContacts)
+      .where(and(...contactConds))
+      .limit(200);
+
+    // Campaign leads at this company.
+    const companyLeads = company
+      ? await db
+          .select({
+            leadId: leads.id,
+            funnelId: leads.funnelId,
+            name: leads.name,
+            title: leads.title,
+            status: leads.status,
+          })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.organizationId, orgId), ilike(leads.company, `%${company.name}%`)))
+          .limit(200)
+      : [];
+
+    res.json({
+      data: {
+        company: company
+          ? {
+              id: company.id,
+              name: company.name,
+              domain: company.domain,
+              linkedinUrl: company.linkedinUrl,
+              industry: company.industry,
+              employeeCount: company.employeeCount,
+              fundingStage: company.fundingStage,
+              country: company.country,
+              city: company.city,
+              logo: company.logo,
+              description: company.description,
+            }
+          : { name: key, domain: isUrl ? null : key, linkedinUrl: isUrl ? key : null },
+        contacts,
+        leads: companyLeads,
       },
     });
   }),

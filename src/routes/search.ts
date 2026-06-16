@@ -257,11 +257,9 @@ router.get(
           id: c.id,
           title: c.fullName || c.email || "Unknown contact",
           subtitle: joinParts([c.title, c.company]) || "Contact",
-          href: match
-            ? leadHref(match)
-            : c.assignmentId
-              ? `/dashboard/scrapers/${c.assignmentId}`
-              : `/dashboard/companies`,
+          // Prefer the campaign lead if they're in one; otherwise the standalone
+          // contact profile (works even when not added to a campaign).
+          href: match ? leadHref(match) : `/dashboard/contacts/${c.id}`,
           domain: emailDomain(c.email),
         };
       }),
