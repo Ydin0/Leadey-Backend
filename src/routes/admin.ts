@@ -7,9 +7,11 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
 import { adminAuditLog } from "../db/schema/admin-audit-log";
+import { creditTransactions } from "../db/schema/credits";
 import { ApiError } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
+import { getBalance, setOrgBalance } from "../lib/credits";
 import {
   runCostSync,
   getAccountCurrency,
@@ -299,6 +301,7 @@ router.get(
         seatsIncluded: org.seatsIncluded,
         creditsIncluded: org.creditsIncluded,
         creditsUsed: org.creditsUsed,
+        creditBalance: org.creditBalance,
         enrichmentCreditsIncluded:
           planConfig.enrichmentCredits * (org.seatsIncluded || 1),
         funnelsAllowed: planConfig.funnels,
@@ -787,6 +790,88 @@ router.patch(
     });
 
     res.json({ data: { plan, planStatus: nextStatus, priceId: newPriceId, stripeSynced } });
+  }),
+);
+
+// ─── GET /organizations/:id/credits ──────────────────────────────────────
+// Current wallet balance + recent ledger entries for the admin credits panel.
+router.get(
+  "/organizations/:id/credits",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const [org] = await db
+      .select({ id: organizations.id, creditBalance: organizations.creditBalance })
+      .from(organizations)
+      .where(eq(organizations.id, req.params.id));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const recent = await db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.organizationId, req.params.id))
+      .orderBy(desc(creditTransactions.createdAt))
+      .limit(20);
+
+    res.json({
+      data: {
+        balance: org.creditBalance,
+        transactions: recent.map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          action: t.action,
+          credits: t.credits,
+          balanceAfter: t.balanceAfter,
+          description: t.description,
+          createdAt: t.createdAt.toISOString(),
+        })),
+      },
+    });
+  }),
+);
+
+// ─── POST /organizations/:id/credits ─────────────────────────────────────
+// Admin override of an org's credit wallet. Full control: add, remove, or set
+// an exact balance. Writes an admin_adjustment ledger row + audit entry.
+router.post(
+  "/organizations/:id/credits",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const actor = getActorId(req);
+    const { action, amount, reason } = req.body as {
+      action?: "add" | "remove" | "set";
+      amount?: number;
+      reason?: string;
+    };
+
+    const value = Math.floor(Number(amount));
+    if (!action || !["add", "remove", "set"].includes(action)) {
+      throw new ApiError(400, "action must be add, remove or set");
+    }
+    if (!Number.isFinite(value) || value < 0) {
+      throw new ApiError(400, "amount must be a non-negative number");
+    }
+
+    const current = await getBalance(req.params.id);
+    const newBalance =
+      action === "add" ? current + value : action === "remove" ? current - value : value;
+
+    const { balance, delta } = await setOrgBalance({
+      orgId: req.params.id,
+      newBalance,
+      userId: actor,
+      description: reason?.trim()
+        ? `Admin ${action}: ${reason.trim()}`
+        : `Admin ${action} ${value.toLocaleString()} credits`,
+    });
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.credits.adjust",
+      targetType: "organization",
+      targetId: req.params.id,
+      before: { balance: current },
+      after: { balance, delta, action, amount: value },
+    });
+
+    res.json({ data: { balance, delta } });
   }),
 );
 

@@ -171,6 +171,52 @@ export async function addCredits(args: AddArgs): Promise<number> {
 }
 
 /**
+ * Admin override: set an org's wallet to an exact balance (clamped ≥ 0) and
+ * record the signed delta as an `admin_adjustment` ledger row. Used by the
+ * admin panel to add / remove / set credits with full control. Returns the new
+ * balance and the applied delta.
+ */
+export async function setOrgBalance(args: {
+  orgId: string;
+  newBalance: number;
+  userId?: string | null;
+  description?: string;
+}): Promise<{ balance: number; delta: number }> {
+  const target = Math.max(0, Math.round(args.newBalance));
+  return db.transaction(async (tx) => {
+    const [org] = await tx
+      .select({ balance: organizations.creditBalance })
+      .from(organizations)
+      .where(eq(organizations.id, args.orgId))
+      .limit(1);
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const delta = target - org.balance;
+    if (delta === 0) return { balance: org.balance, delta: 0 };
+
+    await tx
+      .update(organizations)
+      .set({ creditBalance: target, updatedAt: new Date() })
+      .where(eq(organizations.id, args.orgId));
+
+    await tx.insert(creditTransactions).values({
+      id: createId("ctx"),
+      organizationId: args.orgId,
+      userId: args.userId ?? null,
+      kind: "adjustment",
+      action: "admin_adjustment",
+      credits: delta,
+      quantity: 1,
+      unitCredits: Math.abs(delta),
+      balanceAfter: target,
+      description: args.description ?? "Admin balance adjustment",
+    });
+
+    return { balance: target, delta };
+  });
+}
+
+/**
  * Bill the credit cost of completed BetterContact enrichment results. Charges
  * 33 credits per phone found and 3 per email found. Idempotent and race-safe:
  * it claims each contact by atomically stamping `credits_billed_at` (only when
