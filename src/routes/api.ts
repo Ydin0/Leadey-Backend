@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { eq, and, or, inArray, isNull, sql, count, asc } from "drizzle-orm";
 import { db } from "../db/index";
 import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
+import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
 import { leads, leadEvents } from "../db/schema/leads";
 import { scraperSignals } from "../db/schema/scrapers";
@@ -135,24 +136,58 @@ async function loadFunnel(
     focusedEvents.set(fullLeadId, evs as unknown as EventRow[]);
   }
 
-  // Per-lead call/email activity totals — one cheap aggregate so the lite leads
-  // table shows real counts without shipping every event. Mirrors the frontend's
-  // computeActivityCounts exactly (call: 'call'/step_outcome+channel=call/
-  // outcome=call_completed; email: smartlead_webhook/email_sent/reply_handled/
-  // step_outcome+channel=email).
-  const leadIds = result.leads.map((l) => l.id);
-  const countsByLead = new Map<string, { calls: number; emails: number }>();
-  if (leadIds.length) {
-    const rows = await db
+  // Activity totals shown in the leads table reflect TOTAL contact across the
+  // WHOLE ORG — every rep and every campaign — not just events on this one lead
+  // row (the same person can exist as several lead rows in different campaigns).
+  // Calls come from the authoritative call_records log matched by PHONE; emails
+  // from email events matched by ADDRESS. So a contact called 3× anywhere shows
+  // 3 on every campaign they're in.
+  const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
+  const phoneSet = new Set(result.leads.map((l) => normPhone(l.phone)).filter((p) => p.length > 5));
+  const emailSet = new Set(result.leads.map((l) => (l.email || "").toLowerCase()).filter(Boolean));
+  const callsByPhone = new Map<string, number>();
+  const emailsByAddr = new Map<string, number>();
+  if (phoneSet.size) {
+    // Telephony log (authoritative) by phone…
+    const callRows = await db
       .select({
-        leadId: leadEvents.leadId,
-        calls: sql<number>`COUNT(*) FILTER (WHERE ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
-        emails: sql<number>`COUNT(*) FILTER (WHERE ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+        phone: sql<string>`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`,
+        n: sql<number>`count(*)::int`,
+      })
+      .from(callRecords)
+      .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
+      .groupBy(sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`);
+    for (const r of callRows) if (r.phone && phoneSet.has(r.phone)) callsByPhone.set(r.phone, r.n);
+    // …and logged call events by phone (catches calls recorded only as an event,
+    // not in call_records). Take the MAX so no real call is ever under-counted.
+    const leCallRows = await db
+      .select({
+        phone: sql<string>`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`,
+        n: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
       })
       .from(leadEvents)
-      .where(inArray(leadEvents.leadId, leadIds))
-      .groupBy(leadEvents.leadId);
-    for (const r of rows) countsByLead.set(r.leadId, { calls: r.calls, emails: r.emails });
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), sql`${leads.phone} <> ''`))
+      .groupBy(sql`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`);
+    for (const r of leCallRows) {
+      if (r.phone && phoneSet.has(r.phone)) {
+        callsByPhone.set(r.phone, Math.max(callsByPhone.get(r.phone) ?? 0, r.n));
+      }
+    }
+  }
+  if (emailSet.size) {
+    const emailRows = await db
+      .select({
+        email: sql<string>`lower(${leads.email})`,
+        n: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+      })
+      .from(leadEvents)
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), sql`${leads.email} <> ''`))
+      .groupBy(sql`lower(${leads.email})`);
+    for (const r of emailRows) if (r.email && emailSet.has(r.email)) emailsByAddr.set(r.email, r.n);
   }
 
   return {
@@ -210,8 +245,8 @@ async function loadFunnel(
       customFields: customFieldsByLead.get(l.id) ?? [],
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
-      callCount: countsByLead.get(l.id)?.calls ?? 0,
-      emailCount: countsByLead.get(l.id)?.emails ?? 0,
+      callCount: callsByPhone.get(normPhone(l.phone)) ?? 0,
+      emailCount: emailsByAddr.get((l.email || "").toLowerCase()) ?? 0,
       events: (withEvents ? ((l as { events?: EventRow[] }).events ?? []) : (focusedEvents.get(l.id) ?? [])).map((e) => ({
         id: e.id,
         type: e.type,

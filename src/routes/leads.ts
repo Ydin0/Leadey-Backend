@@ -4,6 +4,7 @@ import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
+import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, dedupeKey } from "../lib/helpers";
 
@@ -140,6 +141,7 @@ router.get(
         industry: sql<string | null>`max(${leads.companyIndustry})`.as("industry"),
         location: sql<string | null>`max(${leads.companyLocation})`.as("location"),
         employees: sql<number | null>`max(${leads.companyEmployeeCount})`.as("employees"),
+        statuses: sql<string[]>`array_agg(distinct ${leads.status})`.as("statuses"),
       })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
@@ -156,6 +158,66 @@ router.get(
       .limit(pageSize)
       .offset((page - 1) * pageSize);
 
+    // Activity totals for this page's companies. Calls come from call_records
+    // matched by PHONE (every rep + channel, org-wide), emails from email events
+    // — the same "total times contacted" basis as the per-lead counter.
+    const norm = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
+    const pageCompanies = rows.map((r) => r.company).filter(Boolean) as string[];
+    const activityByCompany = new Map<string, { calls: number; emails: number }>();
+    if (pageCompanies.length) {
+      // Phones per company (for the call-by-phone match).
+      const leadPhones = await db
+        .select({ company: leads.company, phone: leads.phone })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), inArray(leads.company, pageCompanies)));
+      const phonesByCompany = new Map<string, Set<string>>();
+      const allPhones = new Set<string>();
+      for (const lp of leadPhones) {
+        const d = norm(lp.phone);
+        if (d.length <= 5) continue;
+        if (!phonesByCompany.has(lp.company)) phonesByCompany.set(lp.company, new Set());
+        phonesByCompany.get(lp.company)!.add(d);
+        allPhones.add(d);
+      }
+      // Org calls grouped by normalized phone.
+      const callsByPhone = new Map<string, number>();
+      if (allPhones.size) {
+        const callRows = await db
+          .select({
+            phone: sql<string>`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`,
+            n: sql<number>`count(*)::int`,
+          })
+          .from(callRecords)
+          .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
+          .groupBy(sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`);
+        for (const r of callRows) if (r.phone && allPhones.has(r.phone)) callsByPhone.set(r.phone, r.n);
+      }
+      // Email events per company (matched on the company's lead rows).
+      const emailRows = await db
+        .select({
+          company: leads.company,
+          emails: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+        })
+        .from(leadEvents)
+        .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), inArray(leads.company, pageCompanies)))
+        .groupBy(leads.company);
+      const emailByCompany = new Map(emailRows.map((e) => [e.company, e.emails]));
+      for (const company of pageCompanies) {
+        let calls = 0;
+        for (const d of phonesByCompany.get(company) ?? []) calls += callsByPhone.get(d) ?? 0;
+        activityByCompany.set(company, { calls, emails: emailByCompany.get(company) ?? 0 });
+      }
+    }
+
+    // Representative status: first non-new/pending status, else any, else "new".
+    const repStatus = (statuses: string[] | null): string => {
+      const list = (statuses || []).filter(Boolean);
+      return list.find((s) => s !== "new" && s !== "pending") || list[0] || "new";
+    };
+
     res.json({
       data: rows.map((r) => ({
         company: r.company,
@@ -167,9 +229,30 @@ router.get(
         industry: r.industry,
         location: r.location,
         employees: r.employees,
+        status: repStatus(r.statuses),
+        callCount: activityByCompany.get(r.company)?.calls ?? 0,
+        emailCount: activityByCompany.get(r.company)?.emails ?? 0,
       })),
       meta: { page, pageSize, totalCount: Number(total), totalPages: Math.ceil(Number(total) / pageSize) },
     });
+  }),
+);
+
+// ─── GET /leads/:id/funnel — resolve a lead's campaign id (standalone profile)
+// Lets the org-wide Leads page open a lead's full profile without already
+// knowing which campaign owns it (e.g. a pasted /dashboard/leads/:id link).
+router.get(
+  "/leads/:id/funnel",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [row] = await db
+      .select({ funnelId: leads.funnelId })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(leads.id, req.params.id as string), eq(funnels.organizationId, orgId)))
+      .limit(1);
+    if (!row) throw new ApiError(404, "Lead not found");
+    res.json({ data: { funnelId: row.funnelId } });
   }),
 );
 
