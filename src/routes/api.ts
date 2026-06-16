@@ -46,6 +46,7 @@ import {
   type MappingEntry,
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
+import { getUserRole, canViewFunnel } from "../lib/permissions";
 import {
   buildFunnelPayload,
   computeNextStepSchedule,
@@ -390,7 +391,17 @@ router.get(
       };
     });
 
-    res.json({ data });
+    // Visibility gate: reps/viewers only see PUBLIC campaigns + PRIVATE ones
+    // they're assigned to. Admins/managers see all. This is what the campaign
+    // Private/Public selector controls.
+    const auth = getAuth(req);
+    const role = auth?.userId ? await getUserRole(auth.userId) : "rep";
+    const myFunnelIds = new Set(
+      memberRows.filter((m) => m.userId === auth?.userId).map((m) => m.funnelId),
+    );
+    const visible = data.filter((f) => canViewFunnel(role, f.visibility, myFunnelIds.has(f.id)));
+
+    res.json({ data: visible });
   }),
 );
 
@@ -413,6 +424,14 @@ router.get(
     // Fetch real members
     const members = await db.select().from(funnelMembers)
       .where(eq(funnelMembers.funnelId, req.params.funnelId));
+
+    // Visibility gate: a non-member rep can't open a PRIVATE campaign directly.
+    const auth = getAuth(req as unknown as Request);
+    const role = auth?.userId ? await getUserRole(auth.userId) : "rep";
+    const isMember = !!auth?.userId && members.some((m) => m.userId === auth.userId);
+    if (!canViewFunnel(role, funnel.visibility, isMember)) {
+      throw new ApiError(403, "You do not have access to this campaign");
+    }
     const memberData = [];
     for (const m of members) {
       const [user] = await db.select().from(users).where(eq(users.id, m.userId));

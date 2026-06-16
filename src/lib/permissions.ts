@@ -36,6 +36,26 @@ export async function getUserRole(userId: string): Promise<string> {
 }
 
 /**
+ * Whether a user can see a campaign given its visibility.
+ *
+ * - Admins & managers see every campaign in the org.
+ * - Otherwise (reps/viewers): a PUBLIC campaign is visible to everyone on the
+ *   team; a PRIVATE campaign is visible only to its assigned members.
+ *
+ * This is what makes the create-campaign Private/Public selector actually do
+ * something — private campaigns are hidden from non-members.
+ */
+export function canViewFunnel(
+  role: string,
+  visibility: string | null | undefined,
+  isMember: boolean,
+): boolean {
+  if (role === "admin" || role === "manager") return true;
+  if ((visibility ?? "private") === "public") return true;
+  return isMember;
+}
+
+/**
  * Middleware: require the user to have one of the specified platform roles.
  * Usage: requireRole("admin", "manager")
  */
