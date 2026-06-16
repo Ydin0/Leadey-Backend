@@ -245,23 +245,26 @@ webhookRouter.post(
       dialOptions.amdStatusCallbackMethod = "POST";
     }
 
-    if (to && /^[\d+\-() ]+$/.test(to)) {
+    // Normalise the destination to a dialable E.164-ish number: keep digits and
+    // a single leading "+", dropping spaces, brackets and CSV junk like a leading
+    // apostrophe ('+44 77…). Without this, a number such as "'+44 77 6522 0866"
+    // failed the phone test, was treated as a Twilio CLIENT identity, and the
+    // call cut instantly — which the dialer then re-fired in a storm.
+    const cleanedTo = (to || "").replace(/[^\d+]/g, "").replace(/(?!^)\+/g, "");
+    const looksLikePhone = /^\+?\d{7,15}$/.test(cleanedTo);
+    if (to && looksLikePhone) {
       // DNC backstop: if the destination matches a master_contact in this
       // call's org with doNotCall=true, refuse to dial. The dialer's queue
       // creation already excludes DNC contacts, so this catches ad-hoc
       // dials from elsewhere in the app (lead row click, dial-pad type-in).
-      // We can't easily know the org from the TwiML webhook (Twilio carries
-      // no auth), so we check globally — any DNC row matching this number
-      // blocks. False-positive risk is low (DNC is sticky and rare).
       try {
         const { db } = await import("../db");
         const { masterContacts } = await import("../db/schema/master");
         const { and: a, eq: e } = await import("drizzle-orm");
-        const normalized = to.replace(/[^\d+]/g, "");
         const [dnc] = await db
           .select({ id: masterContacts.id })
           .from(masterContacts)
-          .where(a(e(masterContacts.doNotCall, true), e(masterContacts.phone, normalized)))
+          .where(a(e(masterContacts.doNotCall, true), e(masterContacts.phone, cleanedTo)))
           .limit(1);
         if (dnc) {
           response.say(
@@ -274,12 +277,11 @@ webhookRouter.post(
       } catch (err) {
         console.warn("[Twilio Voice] DNC check failed (allowing call):", err);
       }
-      // Outbound call to a phone number
+      // Outbound call to a phone number (cleaned).
       const dial = response.dial(dialOptions as any);
-      dial.number(to);
-    } else if (to) {
-      // Outbound call to a Twilio client identity (browser-to-browser).
-      // AMD doesn't make sense for client-to-client calls; omit it.
+      dial.number(cleanedTo);
+    } else if (to && to.replace(/[^\d+]/g, "") === "") {
+      // Genuine client identity (browser-to-browser) — no digits at all.
       const dial = response.dial({
         callerId: callerId || from || undefined,
         record: "record-from-answer-dual" as any,
@@ -288,7 +290,9 @@ webhookRouter.post(
       });
       dial.client(to);
     } else {
-      response.say("No destination specified.");
+      // Has digits but isn't a valid phone (e.g. "nan", too short) — don't dial.
+      response.say("The number dialed is not valid.");
+      response.hangup();
     }
 
     res.type("text/xml").send(response.toString());
