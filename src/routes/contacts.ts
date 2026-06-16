@@ -7,6 +7,7 @@ import { funnels, funnelSteps } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
 import { masterContacts, masterCompanies } from "../db/schema/master";
 import { callRecords } from "../db/schema/call-records";
+import { leadHiringRoles } from "../db/schema/hiring-roles";
 import { ApifyClient, mapSeniorityLevels, type ApifyProfileItem } from "../lib/apify-client";
 import { BetterContactClient, type BetterContactInput } from "../lib/bettercontact-client";
 import { SmartleadClient, type SmartleadLeadInput } from "../lib/smartlead-client";
@@ -64,6 +65,73 @@ function buildContactConditions(orgId: string, q: ContactFilterQuery) {
   if (q.hasPhone === "true") conditions.push(isNotNull(scraperContacts.phone));
   else if (q.hasPhone === "false") conditions.push(isNull(scraperContacts.phone));
   return conditions;
+}
+
+/** "3 days ago" / "2 weeks ago" label from a posted-at timestamp. */
+function relTime(d: Date | null): string {
+  if (!d) return "";
+  const days = Math.floor((Date.now() - new Date(d).getTime()) / 86400000);
+  if (days <= 0) return "today";
+  if (days === 1) return "1 day ago";
+  if (days < 7) return `${days} days ago`;
+  if (days < 30) { const w = Math.floor(days / 7); return `${w} week${w > 1 ? "s" : ""} ago`; }
+  const m = Math.floor(days / 30);
+  return `${m} month${m > 1 ? "s" : ""} ago`;
+}
+
+export interface DerivedHiringRole {
+  title: string;
+  description: string;
+  salaryRange: string;
+  location: string;
+  postedAgo: string;
+  seniority: string;
+  url: string;
+}
+
+/** The company's scraped JOB POSTS, mapped to hiring-role shape and grouped by
+ *  lower(company). This is how scraped jobs become a lead's hiring roles — both
+ *  when sending to a funnel and on the standalone contact profile. */
+async function loadCompanyJobs(
+  orgId: string,
+  assignmentIds: string[],
+): Promise<Map<string, DerivedHiringRole[]>> {
+  const out = new Map<string, DerivedHiringRole[]>();
+  if (!assignmentIds.length) return out;
+  const rows = await db
+    .select({
+      company: scraperSignals.company,
+      jobTitle: scraperSignals.jobTitle,
+      salary: scraperSignals.salary,
+      location: scraperSignals.location,
+      jobUrl: scraperSignals.jobUrl,
+      description: scraperSignals.description,
+      postedAt: scraperSignals.postedAt,
+      seniority: scraperSignals.seniority,
+    })
+    .from(scraperSignals)
+    .where(and(eq(scraperSignals.organizationId, orgId), inArray(scraperSignals.assignmentId, assignmentIds)));
+  for (const s of rows) {
+    const key = (s.company || "").toLowerCase();
+    const title = (s.jobTitle || "").trim();
+    if (!key || !title) continue;
+    const arr = out.get(key) ?? [];
+    if (arr.length >= 15 || arr.some((r) => r.title.toLowerCase() === title.toLowerCase())) {
+      out.set(key, arr);
+      continue;
+    }
+    arr.push({
+      title,
+      description: (s.description || "").slice(0, 800),
+      salaryRange: s.salary || "",
+      location: s.location || "",
+      postedAgo: relTime(s.postedAt),
+      seniority: s.seniority || "",
+      url: s.jobUrl || "",
+    });
+    out.set(key, arr);
+  }
+  return out;
 }
 
 function getApifyClient(): ApifyClient {
@@ -859,9 +927,18 @@ router.get(
           .limit(25)
       : [];
 
+    // Hiring roles inherited from the company's scraped job posts.
+    const jobsMap = await loadCompanyJobs(orgId, c.assignmentId ? [c.assignmentId] : []);
+    const companyKey = (c.companyName || c.currentCompany || "").toLowerCase();
+    const hiringRoles = (jobsMap.get(companyKey) ?? []).map((r, i) => ({
+      id: `${c.id}:role:${i}`,
+      ...r,
+    }));
+
     res.json({
       data: {
         id: c.id,
+        hiringRoles,
         assignmentId: c.assignmentId,
         fullName: c.fullName,
         firstName: c.firstName,
@@ -1097,10 +1174,16 @@ router.post(
       }
     }
 
+    // The companies' scraped JOB POSTS → hiring roles, so each lead inherits the
+    // jobs data from the scrape. Keyed by lower(company) from the contacts' runs.
+    const assignmentIds = [...new Set(contacts.map((c) => c.assignmentId).filter(Boolean) as string[])];
+    const companyJobs = await loadCompanyJobs(orgId, assignmentIds);
+
     const now = Date.now();
     const firstStep = steps[0];
     const newLeads: Array<typeof leads.$inferInsert> = [];
     const newEvents: Array<typeof leadEvents.$inferInsert> = [];
+    const newHiringRoles: Array<typeof leadHiringRoles.$inferInsert> = [];
     let skipped = 0;
 
     for (const c of contacts) {
@@ -1118,6 +1201,8 @@ router.post(
       const leadId = createId("lead");
       const initialDue = new Date(now + firstStep.dayOffset * DAY_MS);
       const meta = companyMeta.get(company.toLowerCase());
+      // Inherit the company's scraped job posts as this lead's hiring roles.
+      const jobs = companyJobs.get((c.companyName || company).toLowerCase()) ?? [];
 
       newLeads.push({
         id: leadId,
@@ -1140,9 +1225,26 @@ router.post(
         companyIndustry: meta?.industry || null,
         companyEmployeeCount: meta?.employeeCount || null,
         companyLocation: meta?.location || null,
+        companyHiringRoles: jobs.length ? jobs.map((j) => j.title) : null,
         createdAt: new Date(now),
         updatedAt: new Date(now),
       });
+
+      for (const j of jobs) {
+        newHiringRoles.push({
+          id: createId("hrole"),
+          organizationId: orgId,
+          funnelId,
+          leadId,
+          title: j.title,
+          description: j.description,
+          salaryRange: j.salaryRange,
+          location: j.location,
+          postedAgo: j.postedAgo,
+          seniority: j.seniority,
+          url: j.url,
+        });
+      }
 
       newEvents.push({
         id: createId("event"),
@@ -1165,6 +1267,9 @@ router.post(
         }
         for (let i = 0; i < newEvents.length; i += INSERT_CHUNK) {
           await tx.insert(leadEvents).values(newEvents.slice(i, i + INSERT_CHUNK));
+        }
+        for (let i = 0; i < newHiringRoles.length; i += INSERT_CHUNK) {
+          await tx.insert(leadHiringRoles).values(newHiringRoles.slice(i, i + INSERT_CHUNK));
         }
       });
 
