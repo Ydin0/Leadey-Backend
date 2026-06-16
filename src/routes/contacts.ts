@@ -949,7 +949,13 @@ router.get(
           .where(
             and(
               eq(callRecords.organizationId, orgId),
-              sql`regexp_replace(COALESCE(${callRecords.toNumber}, ''), '[^0-9]', '', 'g') = ${digits}`,
+              // The contact's number is the COUNTERPARTY: toNumber on outbound,
+              // fromNumber on inbound. Match either column so inbound calls
+              // (where the caller is in fromNumber) also show on the profile.
+              sql`(
+                regexp_replace(COALESCE(${callRecords.toNumber}, ''), '[^0-9]', '', 'g') = ${digits}
+                OR regexp_replace(COALESCE(${callRecords.fromNumber}, ''), '[^0-9]', '', 'g') = ${digits}
+              )`,
             ),
           )
           .orderBy(desc(callRecords.calledAt))

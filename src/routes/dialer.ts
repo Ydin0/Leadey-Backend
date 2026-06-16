@@ -695,7 +695,7 @@ router.post(
     {
       const since = new Date(now - Math.max(recentMs, RECENT_MS));
       const crRows = await db
-        .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, calledAt: callRecords.calledAt })
+        .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, fromNumber: callRecords.fromNumber, calledAt: callRecords.calledAt })
         .from(callRecords)
         .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, since)));
       for (const r of crRows) {
@@ -705,10 +705,18 @@ router.post(
           if ((recentCallByLead.get(r.leadId) ?? 0) < t) recentCallByLead.set(r.leadId, t);
           if (now - t < RECENT_MS) attempts24hByLead.set(r.leadId, (attempts24hByLead.get(r.leadId) ?? 0) + 1);
         }
+        // A lead's number is the counterparty — toNumber on outbound,
+        // fromNumber on inbound — so register BOTH columns. (Our own line in
+        // the other column is harmless: no lead has it as their number.)
         const d = normPhone(r.toNumber);
+        const df = normPhone(r.fromNumber);
         if (d) {
           if ((recentCallByPhone.get(d) ?? 0) < t) recentCallByPhone.set(d, t);
           if (now - t < RECENT_MS) attempts24hByPhone.set(d, (attempts24hByPhone.get(d) ?? 0) + 1);
+        }
+        if (df && df !== d) {
+          if ((recentCallByPhone.get(df) ?? 0) < t) recentCallByPhone.set(df, t);
+          if (now - t < RECENT_MS) attempts24hByPhone.set(df, (attempts24hByPhone.get(df) ?? 0) + 1);
         }
       }
     }
@@ -976,7 +984,7 @@ async function findNextDialable(
   {
     const since = new Date(now - Math.max(recentMs, DAY));
     const crRows = await tx
-      .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, calledAt: callRecords.calledAt })
+      .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, fromNumber: callRecords.fromNumber, calledAt: callRecords.calledAt })
       .from(callRecords)
       .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, since)));
     for (const r of crRows) {
@@ -986,10 +994,16 @@ async function findNextDialable(
         if ((recentByLead.get(r.leadId) ?? 0) < t) recentByLead.set(r.leadId, t);
         if (now - t < DAY) attemptsByLead.set(r.leadId, (attemptsByLead.get(r.leadId) ?? 0) + 1);
       }
+      // Counterparty number = toNumber (outbound) or fromNumber (inbound).
       const d = norm(r.toNumber);
+      const df = norm(r.fromNumber);
       if (d) {
         if ((recentByPhone.get(d) ?? 0) < t) recentByPhone.set(d, t);
         if (now - t < DAY) attemptsByPhone.set(d, (attemptsByPhone.get(d) ?? 0) + 1);
+      }
+      if (df && df !== d) {
+        if ((recentByPhone.get(df) ?? 0) < t) recentByPhone.set(df, t);
+        if (now - t < DAY) attemptsByPhone.set(df, (attemptsByPhone.get(df) ?? 0) + 1);
       }
     }
   }

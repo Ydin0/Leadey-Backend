@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
-import { eq, and, sql, isNull } from "drizzle-orm";
+import { eq, and, sql, isNull, inArray } from "drizzle-orm";
+import twilioSdk from "twilio";
 import { Webhook } from "svix";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -620,6 +621,31 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
         record = await db.query.callRecords.findFirst({
           where: eq(callRecords.twilioCallSid, callSid),
         });
+      }
+
+      // Inbound calls: the recording is on the PSTN parent leg, but the browser
+      // saved the record with the CHILD <Client> leg's SID — so a direct match
+      // never finds it. Bridge them: look up this call's child legs via the
+      // Twilio API and match the record by a child SID (retry for the save race).
+      if (!record && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+        try {
+          const twClient = twilioSdk(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+          for (let attempt = 0; !record && attempt < 10; attempt++) {
+            const children = await twClient.calls.list({ parentCallSid: callSid, limit: 5 });
+            const childSids = children.map((c) => c.sid).filter(Boolean);
+            if (childSids.length > 0) {
+              record = await db.query.callRecords.findFirst({
+                where: inArray(callRecords.twilioCallSid, childSids),
+              });
+            }
+            if (!record) await new Promise((r) => setTimeout(r, 1500));
+          }
+          if (record) {
+            console.log(`[Twilio Recording] Matched recording (parent ${callSid}) to record ${record.id} via child leg`);
+          }
+        } catch (e) {
+          console.error("[Twilio Recording] child-leg lookup failed:", e);
+        }
       }
 
       if (!record) {
