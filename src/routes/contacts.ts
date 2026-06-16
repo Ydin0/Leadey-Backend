@@ -38,6 +38,9 @@ interface ContactFilterQuery {
   status?: string;
   enrichmentStatus?: string;
   company?: string;
+  /** Comma-joined LinkedIn company URLs to match against searched_company_url —
+   *  the reliable, naming-independent way to scope to the searched companies. */
+  companyUrls?: string;
   title?: string;
   location?: string;
   hasEmail?: string;
@@ -52,23 +55,33 @@ function buildContactConditions(orgId: string, q: ContactFilterQuery) {
   if (q.assignmentId) conditions.push(eq(scraperContacts.assignmentId, q.assignmentId));
   if (q.status) conditions.push(eq(scraperContacts.status, q.status));
   if (q.enrichmentStatus) conditions.push(eq(scraperContacts.enrichmentStatus, q.enrichmentStatus));
+  // Scope to specific companies. Two matchers, OR'd together:
+  //  1. searched_company_url (reliable) — the exact URL the contact was
+  //     discovered under, compared by normalised /company/<slug>.
+  //  2. company name (fallback for older/untagged contacts) — normalised,
+  //     bidirectional, so "Kensa" ↔ "Kensa Heat Pumps" etc. still match.
+  const companyConds: (ReturnType<typeof ilike> | ReturnType<typeof sql>)[] = [];
+  if (q.companyUrls) {
+    const urlSlugs = q.companyUrls
+      .split(",")
+      .map((u) => normCompany(slugFromUrl(u.trim())))
+      .filter((s) => s.length >= 2);
+    if (urlSlugs.length > 0) {
+      const searchedSlug = sql`lower(regexp_replace(regexp_replace(coalesce(${scraperContacts.searchedCompanyUrl}, ''), '^.*/company/([^/?#]+).*$', '\\1'), '[^a-zA-Z0-9]', '', 'g'))`;
+      for (const s of urlSlugs) companyConds.push(sql`${searchedSlug} = ${s}`);
+    }
+  }
   if (q.company) {
     const companies = q.company.split(",").map((c) => c.trim()).filter(Boolean);
-    // Company names from the job scraper (e.g. "Kensa", "OXB") rarely match the
-    // names LinkedIn returns for discovered contacts (e.g. "Kensa Heat Pumps",
-    // "Activate Group Limited") on a plain substring test. Match on a NORMALISED
-    // form (alphanumerics only, lowercased) in BOTH directions so legal suffixes
-    // and formatting differences don't hide the people we just discovered.
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const contactNorm = sql`lower(regexp_replace(coalesce(${scraperContacts.companyName}, ''), '[^a-zA-Z0-9]', '', 'g'))`;
-    const perCompany = companies.map((c) => {
-      const n = norm(c);
-      if (n.length < 3) return ilike(scraperContacts.companyName, `%${c}%`);
-      return sql`(${contactNorm} LIKE ${`%${n}%`} OR (length(${contactNorm}) >= 3 AND ${n} LIKE '%' || ${contactNorm} || '%'))`;
-    });
-    if (perCompany.length === 1) conditions.push(perCompany[0]);
-    else if (perCompany.length > 1) conditions.push(or(...perCompany)!);
+    for (const c of companies) {
+      const n = normCompany(c);
+      if (n.length < 3) companyConds.push(ilike(scraperContacts.companyName, `%${c}%`));
+      else companyConds.push(sql`(${contactNorm} LIKE ${`%${n}%`} OR (length(${contactNorm}) >= 3 AND ${n} LIKE '%' || ${contactNorm} || '%'))`);
+    }
   }
+  if (companyConds.length === 1) conditions.push(companyConds[0]);
+  else if (companyConds.length > 1) conditions.push(or(...companyConds)!);
   if (q.title) conditions.push(ilike(scraperContacts.currentTitle, `%${q.title}%`));
   if (q.location) conditions.push(ilike(scraperContacts.location, `%${q.location}%`));
   if (q.hasEmail === "true") conditions.push(isNotNull(scraperContacts.email));
@@ -76,6 +89,55 @@ function buildContactConditions(orgId: string, q: ContactFilterQuery) {
   if (q.hasPhone === "true") conditions.push(isNotNull(scraperContacts.phone));
   else if (q.hasPhone === "false") conditions.push(isNull(scraperContacts.phone));
   return conditions;
+}
+
+/** Lowercased alphanumerics only — the canonical form for fuzzy company name /
+ *  slug comparison ("Oxford Biomedica" / "oxford-biomedica" → "oxfordbiomedica"). */
+function normCompany(s: string): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** The `/company/<slug>` segment of a LinkedIn company URL. */
+function slugFromUrl(url: string): string {
+  const m = /\/company\/([^/?#]+)/i.exec(url || "");
+  return m ? m[1] : "";
+}
+
+/**
+ * Pick the exact searched company URL a discovered contact belongs to, from the
+ * discovery query stored in the Apify result's `_meta`. We match the contact's
+ * current-company name against the searched company SLUGS (which are derived
+ * from the real LinkedIn name), constrained to the ≤10 companies in the
+ * contact's own batch — so this is reliable even when the scraper's display
+ * name is an abbreviation (e.g. "OXB" → slug "oxford-biomedica" → name
+ * "Oxford Biomedica").
+ */
+function pickSearchedCompanyUrl(rawItem: Record<string, unknown>): string | null {
+  const meta = rawItem._meta as { query?: { currentCompanies?: unknown } } | undefined;
+  const searched = meta?.query?.currentCompanies;
+  if (!Array.isArray(searched) || searched.length === 0) return null;
+  const urls = searched.filter((u): u is string => typeof u === "string" && !!u);
+  if (urls.length === 0) return null;
+  if (urls.length === 1) return urls[0];
+
+  const positions = Array.isArray(rawItem.currentPositions) ? rawItem.currentPositions : [];
+  const pos = positions[0] as Record<string, unknown> | undefined;
+  const compId = String(pos?.companyId || "");
+  const compNorm = normCompany((pos?.companyName as string) || (rawItem.companyName as string) || "");
+
+  let best: { url: string; score: number } | null = null;
+  for (const url of urls) {
+    const slugRaw = slugFromUrl(url);
+    if (compId && slugRaw === compId) return url; // exact numeric company-id match
+    const slug = normCompany(slugRaw);
+    if (!slug || !compNorm) continue;
+    let score = 0;
+    if (slug === compNorm) score = 1000;
+    else if (slug.includes(compNorm)) score = compNorm.length;
+    else if (compNorm.includes(slug)) score = slug.length;
+    if (score > 0 && (!best || score > best.score)) best = { url, score };
+  }
+  return best?.url ?? null;
 }
 
 /** "3 days ago" / "2 weeks ago" label from a posted-at timestamp. */
@@ -541,6 +603,7 @@ router.post(
         companyName,
         companyLinkedinUrl: companyLinkedinUrlVal,
         companyDomain: companyWebsite || null,
+        searchedCompanyUrl: pickSearchedCompanyUrl(rawItem),
         status: "discovered",
         rawData: rawItem,
       });
@@ -625,6 +688,7 @@ router.get(
     const status = req.query.status as string | undefined;
     const enrichmentStatus = req.query.enrichmentStatus as string | undefined;
     const company = req.query.company as string | undefined;
+    const companyUrls = req.query.companyUrls as string | undefined;
     const title = req.query.title as string | undefined;
     const location = req.query.location as string | undefined;
     const hasEmail = req.query.hasEmail as string | undefined;
@@ -637,6 +701,7 @@ router.get(
       status,
       enrichmentStatus,
       company,
+      companyUrls,
       title,
       location,
       hasEmail,

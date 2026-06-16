@@ -54,6 +54,12 @@ export const scraperContacts = pgTable("scraper_contacts", {
   companyName: text("company_name"),
   companyDomain: text("company_domain"),
   companyLinkedinUrl: text("company_linkedin_url"),
+  /** The exact LinkedIn company URL this contact was DISCOVERED under (from the
+   *  discovery query in the Apify result's _meta). Lets the leads view match
+   *  contacts back to the searched companies by URL — reliable even when the
+   *  scraper's company name differs from LinkedIn's (e.g. "OXB" vs
+   *  "Oxford Biomedica"). */
+  searchedCompanyUrl: text("searched_company_url"),
 
   // Enrichment (from BetterContact)
   email: text("email"),
