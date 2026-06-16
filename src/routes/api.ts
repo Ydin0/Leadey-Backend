@@ -61,6 +61,8 @@ import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads } from "../lib/custom-fields-service";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
+import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
+import { leadHiringRoles } from "../db/schema/hiring-roles";
 
 const router = Router();
 
@@ -1970,6 +1972,172 @@ router.post(
 
     console.log(`[Backfill] Updated ${updated}/${leadsToFix.length} leads with company data`);
     res.json({ data: { total: leadsToFix.length, updated } });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/enrich-job-posts ───────────────────────────
+// "Magic Enrich → Find job posts": for each selected company, search TheirStack
+// for its recent open jobs and add them as hiring roles on every lead at that
+// company in this funnel. Idempotent (dedupes by role title per lead).
+function jobRelTime(d: string | null): string {
+  if (!d) return "";
+  const t = new Date(d).getTime();
+  if (!Number.isFinite(t)) return "";
+  const days = Math.floor((Date.now() - t) / DAY_MS);
+  if (days <= 0) return "today";
+  if (days === 1) return "1 day ago";
+  if (days < 7) return `${days} days ago`;
+  if (days < 30) { const w = Math.floor(days / 7); return `${w} week${w > 1 ? "s" : ""} ago`; }
+  const m = Math.floor(days / 30);
+  return `${m} month${m > 1 ? "s" : ""} ago`;
+}
+
+function jobToRole(job: TheirStackJob) {
+  let salary = job.salary_string || "";
+  if (!salary && (job.min_annual_salary_usd || job.max_annual_salary_usd)) {
+    const min = job.min_annual_salary_usd ? `$${Math.round(job.min_annual_salary_usd / 1000)}k` : "";
+    const max = job.max_annual_salary_usd ? `$${Math.round(job.max_annual_salary_usd / 1000)}k` : "";
+    salary = min && max ? `${min} - ${max}` : min || max;
+  }
+  return {
+    title: (job.job_title || "").trim(),
+    description: (job.description || "").slice(0, 800),
+    salaryRange: salary,
+    location: job.short_location || job.location || job.long_location || "",
+    postedAgo: jobRelTime(job.date_posted || null),
+    seniority: job.seniority || "",
+    url: job.final_url || job.url || "",
+  };
+}
+
+router.post(
+  "/funnels/:funnelId/enrich-job-posts",
+  asyncHandler<{ funnelId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+    const body = req.body as { companies?: { name: string; domain?: string | null; linkedinUrl?: string | null }[] };
+    const companies = (body.companies || []).filter((c) => c && c.name).slice(0, 50);
+    if (companies.length === 0) throw new ApiError(400, "companies is required");
+
+    const [funnel] = await db
+      .select({ id: funnels.id })
+      .from(funnels)
+      .where(and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)))
+      .limit(1);
+    if (!funnel) throw new ApiError(404, "Campaign not found");
+
+    const token = process.env.THEIRSTACK_API_KEY;
+    if (!token) throw new ApiError(500, "THEIRSTACK_API_KEY is not configured");
+    const client = new TheirStackClient(token);
+    const userId = getAuth(req)?.userId || null;
+
+    // Search each company (small concurrency cap) → recent open jobs.
+    const CONCURRENCY = 5;
+    const jobsByCompany = new Map<string, TheirStackJob[]>();
+    for (let i = 0; i < companies.length; i += CONCURRENCY) {
+      const batch = companies.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((c) => {
+          const params: Record<string, unknown> = { posted_at_max_age_days: 30, limit: 20 };
+          const domain = (c.domain || "").trim();
+          if (domain) params.company_domain_or = [domain];
+          else if (c.linkedinUrl) params.company_linkedin_url_or = [c.linkedinUrl];
+          else params.company_name_or = [c.name];
+          return client
+            .searchJobs(params)
+            .then((r) => ({ name: c.name, jobs: r.data || [] }))
+            .catch((err) => {
+              console.warn(`[enrich-job-posts] ${c.name} failed:`, err instanceof Error ? err.message : err);
+              return { name: c.name, jobs: [] as TheirStackJob[] };
+            });
+        }),
+      );
+      for (const r of results) jobsByCompany.set(r.name.toLowerCase(), r.jobs);
+    }
+
+    let jobsFound = 0;
+    let rolesCreated = 0;
+    const leadsEnriched = new Set<string>();
+    const newRoles: Array<typeof leadHiringRoles.$inferInsert> = [];
+
+    for (const c of companies) {
+      const jobs = jobsByCompany.get(c.name.toLowerCase()) || [];
+      if (jobs.length === 0) continue;
+      jobsFound += jobs.length;
+
+      // Leads at this company in the funnel (by name, or domain).
+      const domain = (c.domain || "").trim();
+      const companyLeads = await db
+        .select({ id: leads.id })
+        .from(leads)
+        .where(
+          and(
+            eq(leads.funnelId, funnelId),
+            domain
+              ? or(sql`lower(${leads.company}) = lower(${c.name})`, eq(leads.companyDomain, domain))!
+              : sql`lower(${leads.company}) = lower(${c.name})`,
+          ),
+        );
+      if (companyLeads.length === 0) continue;
+
+      // Distinct roles from the jobs.
+      const roles = jobs.map(jobToRole).filter((r) => r.title);
+      const titleSet = new Set<string>();
+      const distinctRoles = roles.filter((r) => {
+        const k = r.title.toLowerCase();
+        if (titleSet.has(k)) return false;
+        titleSet.add(k);
+        return true;
+      });
+      if (distinctRoles.length === 0) continue;
+
+      for (const lead of companyLeads) {
+        // Dedupe against existing role titles for this lead.
+        const existing = await db
+          .select({ title: leadHiringRoles.title })
+          .from(leadHiringRoles)
+          .where(eq(leadHiringRoles.leadId, lead.id));
+        const have = new Set(existing.map((e) => e.title.toLowerCase()));
+        for (const r of distinctRoles) {
+          if (have.has(r.title.toLowerCase())) continue;
+          have.add(r.title.toLowerCase());
+          newRoles.push({
+            id: createId("hrole"),
+            organizationId: orgId,
+            funnelId,
+            leadId: lead.id,
+            title: r.title,
+            description: r.description,
+            salaryRange: r.salaryRange,
+            location: r.location,
+            postedAgo: r.postedAgo,
+            seniority: r.seniority,
+            url: r.url,
+            createdBy: userId,
+          });
+        }
+        leadsEnriched.add(lead.id);
+        // Keep the lead's simple hiring-roles title list in sync.
+        await db
+          .update(leads)
+          .set({ companyHiringRoles: distinctRoles.map((r) => r.title), updatedAt: new Date() })
+          .where(eq(leads.id, lead.id));
+      }
+    }
+
+    for (let i = 0; i < newRoles.length; i += 500) {
+      await db.insert(leadHiringRoles).values(newRoles.slice(i, i + 500));
+    }
+    rolesCreated = newRoles.length;
+
+    res.json({
+      data: {
+        companiesSearched: companies.length,
+        jobsFound,
+        rolesCreated,
+        leadsEnriched: leadsEnriched.size,
+      },
+    });
   }),
 );
 
