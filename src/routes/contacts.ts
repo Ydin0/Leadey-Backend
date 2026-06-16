@@ -54,11 +54,20 @@ function buildContactConditions(orgId: string, q: ContactFilterQuery) {
   if (q.enrichmentStatus) conditions.push(eq(scraperContacts.enrichmentStatus, q.enrichmentStatus));
   if (q.company) {
     const companies = q.company.split(",").map((c) => c.trim()).filter(Boolean);
-    if (companies.length === 1) {
-      conditions.push(ilike(scraperContacts.companyName, `%${companies[0]}%`));
-    } else if (companies.length > 1) {
-      conditions.push(or(...companies.map((c) => ilike(scraperContacts.companyName, `%${c}%`)))!);
-    }
+    // Company names from the job scraper (e.g. "Kensa", "OXB") rarely match the
+    // names LinkedIn returns for discovered contacts (e.g. "Kensa Heat Pumps",
+    // "Activate Group Limited") on a plain substring test. Match on a NORMALISED
+    // form (alphanumerics only, lowercased) in BOTH directions so legal suffixes
+    // and formatting differences don't hide the people we just discovered.
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const contactNorm = sql`lower(regexp_replace(coalesce(${scraperContacts.companyName}, ''), '[^a-zA-Z0-9]', '', 'g'))`;
+    const perCompany = companies.map((c) => {
+      const n = norm(c);
+      if (n.length < 3) return ilike(scraperContacts.companyName, `%${c}%`);
+      return sql`(${contactNorm} LIKE ${`%${n}%`} OR (length(${contactNorm}) >= 3 AND ${n} LIKE '%' || ${contactNorm} || '%'))`;
+    });
+    if (perCompany.length === 1) conditions.push(perCompany[0]);
+    else if (perCompany.length > 1) conditions.push(or(...perCompany)!);
   }
   if (q.title) conditions.push(ilike(scraperContacts.currentTitle, `%${q.title}%`));
   if (q.location) conditions.push(ilike(scraperContacts.location, `%${q.location}%`));
