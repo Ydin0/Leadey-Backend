@@ -585,25 +585,32 @@ router.post(
   "/contacts/enrich",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { contactIds } = req.body as { contactIds: string[] };
+    const { contactIds, allMatching, filters } = req.body as {
+      contactIds?: string[];
+      allMatching?: boolean;
+      filters?: ContactFilterQuery;
+    };
 
-    if (!contactIds?.length) {
-      throw new ApiError(400, "contactIds is required");
+    // Resolve the target contacts — either an explicit id list, or EVERY contact
+    // matching the current filters ("select all matching"), restricted to the
+    // not-yet-enriched ones so we never re-bill already-enriched people.
+    let contacts;
+    if (allMatching) {
+      const conds = buildContactConditions(orgId, { ...(filters || {}), enrichmentStatus: "none" });
+      contacts = await db.select().from(scraperContacts).where(and(...conds)).limit(5000);
+    } else {
+      if (!contactIds?.length) {
+        throw new ApiError(400, "contactIds or allMatching+filters is required");
+      }
+      contacts = await db
+        .select()
+        .from(scraperContacts)
+        .where(and(eq(scraperContacts.organizationId, orgId), inArray(scraperContacts.id, contactIds)));
     }
 
-    // Fetch contacts
-    const contacts = await db
-      .select()
-      .from(scraperContacts)
-      .where(
-        and(
-          eq(scraperContacts.organizationId, orgId),
-          inArray(scraperContacts.id, contactIds),
-        ),
-      );
-
     if (contacts.length === 0) {
-      throw new ApiError(404, "No contacts found");
+      res.json({ data: { requestIds: [], contactCount: 0 } });
+      return;
     }
 
     // Look up missing company domains from scraper signals
