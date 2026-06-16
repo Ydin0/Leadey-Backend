@@ -1451,19 +1451,22 @@ router.post(
   asyncHandler(async (req, res) => {
     const s = await loadSessionOr404(req, req.params.id as string);
     const result = await db.transaction(async (tx) => {
-      // Find the most recently-completed item
+      // Find the lead the rep LAST ACTUALLY WORKED — by when it was handled
+      // (calledAt), not by position. Exclude auto-skipped items (recency / DNC /
+      // closed / attempts, flagged `auto:…`) so Previous lands on a real prior
+      // lead rather than a machine-skipped one.
       const [prev] = await tx
         .select()
         .from(dialerQueueItems)
         .where(
           and(
             eq(dialerQueueItems.sessionId, s.id),
-            sql`${dialerQueueItems.status} IN ('completed', 'skipped')`,
+            sql`(${dialerQueueItems.status} = 'completed' OR (${dialerQueueItems.status} = 'skipped' AND (${dialerQueueItems.notes} IS NULL OR ${dialerQueueItems.notes} NOT LIKE 'auto:%')))`,
           ),
         )
-        .orderBy(desc(dialerQueueItems.position))
+        .orderBy(sql`${dialerQueueItems.calledAt} DESC NULLS LAST`, desc(dialerQueueItems.position))
         .limit(1);
-      if (!prev) throw new ApiError(400, "No completed item to back to");
+      if (!prev) throw new ApiError(400, "No previous lead to go back to");
 
       // Demote the current in-progress item back to pending.
       await tx
