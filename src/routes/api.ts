@@ -709,7 +709,10 @@ router.patch(
     const hasVisibility = body.visibility !== undefined;
     const hasMembers = Array.isArray(body.members);
     const hasConfig =
-      body.audience !== undefined || body.exit !== undefined || body.emailAutomation !== undefined;
+      body.audience !== undefined ||
+      body.exit !== undefined ||
+      body.emailAutomation !== undefined ||
+      body.leadFilters !== undefined;
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
@@ -747,6 +750,9 @@ router.patch(
       if (body.audience !== undefined) cfg.audience = body.audience;
       if (body.exit !== undefined) cfg.exit = body.exit;
       if (body.emailAutomation !== undefined) cfg.emailAutomation = body.emailAutomation;
+      // Shared per-campaign lead filters — persisted so the filtered view is the
+      // same for every rep and survives a page refresh.
+      if (body.leadFilters !== undefined) cfg.leadFilters = body.leadFilters;
       funnelUpdates.config = cfg;
     }
 
