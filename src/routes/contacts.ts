@@ -215,9 +215,11 @@ router.post(
     const client = getApifyClient();
     const maxItemsPerBatch = Math.ceil(maxTotal / batches.length);
 
-    // Fire all batches in parallel
+    // Fire all batches in parallel. Tolerate partial failures (e.g. an Apify
+    // rate-limit on one batch) so the discovery still runs for the rest — only
+    // fail outright if EVERY batch failed, surfacing the real Apify error.
     console.log(`[Discovery] Starting ${batches.length} parallel Apify runs for ${companyUrls.length} companies`);
-    const runResponses = await Promise.all(
+    const settled = await Promise.allSettled(
       batches.map((batch) =>
         client.startRun({
           companies: batch,
@@ -229,6 +231,14 @@ router.post(
         }),
       ),
     );
+    const runResponses = settled
+      .filter((s): s is PromiseFulfilledResult<Awaited<ReturnType<typeof client.startRun>>> => s.status === "fulfilled")
+      .map((s) => s.value);
+    if (runResponses.length === 0) {
+      const firstErr = settled.find((s) => s.status === "rejected") as PromiseRejectedResult | undefined;
+      const detail = firstErr?.reason instanceof Error ? firstErr.reason.message : "Apify run failed to start";
+      throw new ApiError(502, `Could not start contact discovery: ${detail}`);
+    }
 
     // Store all run IDs and dataset IDs as JSON arrays in the existing text columns
     const apifyRunIds = runResponses.map((r) => r.data.id);
