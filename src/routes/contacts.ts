@@ -15,6 +15,8 @@ import { getSmartleadApiKey } from "../lib/settings-service";
 import { ApiError, createId, DAY_MS, scoreLead, dedupeKey } from "../lib/helpers";
 import { getOrgId } from "../lib/auth";
 import { upsertMasterContact } from "../lib/master-db";
+import { getAuth } from "@clerk/express";
+import { CREDIT_COSTS, getBalance, billEnrichmentResults, InsufficientCreditsError } from "../lib/credits";
 
 const router = Router();
 
@@ -681,6 +683,15 @@ router.post(
       return;
     }
 
+    // Credit pre-flight (hard block): reserve the worst-case cost — every
+    // contact could return both a phone (33) and an email (3) = 36 credits.
+    // Actuals are billed per result, so the wallet never goes negative.
+    const worstCase = contacts.length * (CREDIT_COSTS.phone_enrichment + CREDIT_COSTS.email_enrichment);
+    {
+      const bal = await getBalance(orgId);
+      if (bal < worstCase) throw new InsufficientCreditsError(worstCase, bal);
+    }
+
     // Look up missing company domains from scraper signals
     const missingDomainCompanies = contacts
       .filter((c) => !c.companyDomain && c.companyName)
@@ -843,6 +854,24 @@ router.post(
           totalEnriched++;
         }
       }
+    }
+
+    // Bill any contacts that are now enriched but not yet charged for these
+    // batches (33/phone, 3/email). Idempotent — the webhook path bills the same
+    // way, and billEnrichmentResults claims each contact exactly once.
+    const toBill = await db
+      .select({ id: scraperContacts.id })
+      .from(scraperContacts)
+      .where(
+        and(
+          eq(scraperContacts.organizationId, orgId),
+          inArray(scraperContacts.bettercontactRequestId, requestIds),
+          eq(scraperContacts.enrichmentStatus, "enriched"),
+          isNull(scraperContacts.creditsBilledAt),
+        ),
+      );
+    if (toBill.length > 0) {
+      await billEnrichmentResults(orgId, toBill.map((c) => c.id), getAuth(req)?.userId ?? null);
     }
 
     res.json({

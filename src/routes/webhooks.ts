@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, isNull } from "drizzle-orm";
 import { Webhook } from "svix";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -11,7 +11,8 @@ import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { createId, scoreLead } from "../lib/helpers";
 import { setLeadCustomFields } from "../lib/custom-fields-service";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
-import { stripe, getPlanFromPriceId, getPlanConfig } from "../lib/stripe";
+import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
+import { addCredits, billEnrichmentResults } from "../lib/credits";
 
 const router = Router();
 
@@ -333,6 +334,19 @@ router.post("/clerk", async (req: Request, res: Response) => {
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
+        // Seed the credit wallet with a trial grant so the team can try
+        // enrichment / scraping out of the box (writes a signup_grant ledger row).
+        try {
+          await addCredits({
+            orgId: data.id,
+            kind: "grant",
+            action: "signup_grant",
+            credits: 1000,
+            description: "Trial credits",
+          });
+        } catch (err) {
+          console.error("[org.created] credit grant failed:", err);
+        }
         // Seed dialer system dispositions so the power-dialer is usable from
         // day one without manual setup.
         try {
@@ -922,6 +936,31 @@ router.post("/bettercontact", async (req: Request, res: Response) => {
         );
     }
 
+    // Bill newly-enriched contacts for this batch (33/phone, 3/email).
+    // Idempotent — the poll route bills the same way; billEnrichmentResults
+    // claims each contact exactly once via credits_billed_at.
+    const toBill = await db
+      .select({ id: scraperContacts.id, organizationId: scraperContacts.organizationId })
+      .from(scraperContacts)
+      .where(
+        and(
+          eq(scraperContacts.bettercontactRequestId, requestId),
+          eq(scraperContacts.enrichmentStatus, "enriched"),
+          isNull(scraperContacts.creditsBilledAt),
+        ),
+      );
+    if (toBill.length > 0) {
+      const byOrg = new Map<string, string[]>();
+      for (const c of toBill) {
+        const list = byOrg.get(c.organizationId) ?? [];
+        list.push(c.id);
+        byOrg.set(c.organizationId, list);
+      }
+      for (const [billOrg, ids] of byOrg) {
+        await billEnrichmentResults(billOrg, ids, null);
+      }
+    }
+
     res.status(200).json({ ok: true, action: updated > 0 ? "updated" : "acknowledged", count: updated, status });
   } catch (err) {
     console.error("[BetterContact Webhook] Error:", err);
@@ -966,6 +1005,25 @@ router.post("/stripe", async (req: Request, res: Response) => {
           const [org] = await db.select({ id: organizations.id }).from(organizations)
             .where(eq(organizations.stripeCustomerId, customerId as string));
           if (org) orgId = org.id;
+        }
+
+        // Credit top-up (one-time payment) — add to the wallet, idempotent on
+        // the session id. Distinct from subscription checkouts below.
+        if (session.mode === "payment" && session.metadata?.type === "credit_topup" && orgId) {
+          const credits = parseInt(session.metadata.credits || "0", 10);
+          if (credits > 0) {
+            const balance = await addCredits({
+              orgId,
+              kind: "topup",
+              action: "topup",
+              credits,
+              amountUsdCents: session.amount_total ?? credits,
+              stripeSessionId: session.id,
+              description: `Credit top-up — ${credits.toLocaleString()} credits`,
+            });
+            console.log(`[Stripe] Org ${orgId} topped up ${credits} credits → balance ${balance}`);
+          }
+          break;
         }
 
         console.log(`[Stripe Checkout] orgId=${orgId} subscriptionId=${subscriptionId} customerId=${customerId}`);
@@ -1061,7 +1119,6 @@ router.post("/stripe", async (req: Request, res: Response) => {
         const invoice = event.data.object;
         const customerId = invoice.customer;
 
-        // Reset monthly credits on successful payment
         const [org] = await db
           .select()
           .from(organizations)
@@ -1070,8 +1127,26 @@ router.post("/stripe", async (req: Request, res: Response) => {
         if (org) {
           await db
             .update(organizations)
-            .set({ creditsUsed: 0, planStatus: "active", updatedAt: new Date() })
+            .set({ planStatus: "active", updatedAt: new Date() })
             .where(eq(organizations.id, org.id));
+
+          // Grant the plan's monthly credits into the unified wallet on every
+          // paid invoice (initial + renewals). Idempotent per invoice id, so a
+          // re-delivered webhook never double-grants. Skip subscriptions tied
+          // only to a credit top-up (those have no recurring plan grant).
+          if (org.plan && org.plan !== "cancelled" && invoice.subscription) {
+            const grant = getPlanGrantCredits(org.plan, org.seatsIncluded || 1);
+            if (grant > 0) {
+              await addCredits({
+                orgId: org.id,
+                kind: "grant",
+                action: "plan_grant",
+                credits: grant,
+                stripeSessionId: invoice.id,
+                description: `Monthly plan credits — ${org.plan}`,
+              });
+            }
+          }
         }
         break;
       }

@@ -143,6 +143,54 @@ export async function createCheckoutSession(
   return session.url!;
 }
 
+/** Monthly credit grant for a plan (per seat × seats) — fed into the unified
+ *  wallet on subscription start/renewal. Mirrors the legacy creditsIncluded. */
+export function getPlanGrantCredits(plan: string, seats: number): number {
+  const config = getPlanConfig(plan);
+  return config.scraperCredits * Math.max(1, seats);
+}
+
+/**
+ * One-time Stripe Checkout to top up the credit wallet. Strict $0.01/credit:
+ * unit_amount = 1 cent, quantity = credits → total = credits cents (USD).
+ */
+export async function createCreditCheckoutSession(
+  orgId: string,
+  orgName: string,
+  email: string,
+  credits: number,
+  successUrl: string,
+  cancelUrl: string,
+): Promise<string> {
+  const customerId = await getOrCreateStripeCustomer(orgId, orgName, email);
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: "payment",
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: 1, // 1 cent per credit
+          product_data: {
+            name: "Leadey credits",
+            description: `${credits.toLocaleString()} credits ($0.01 each)`,
+          },
+        },
+        quantity: credits,
+      },
+    ],
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: { type: "credit_topup", orgId, credits: String(credits) },
+    payment_intent_data: {
+      metadata: { type: "credit_topup", orgId, credits: String(credits) },
+    },
+  });
+
+  return session.url!;
+}
+
 export async function createPortalSession(
   orgId: string,
   returnUrl: string,

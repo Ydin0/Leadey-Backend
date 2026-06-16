@@ -47,6 +47,7 @@ import {
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getUserRole, canViewFunnel } from "../lib/permissions";
+import { getBalance, deductCredits, InsufficientCreditsError } from "../lib/credits";
 import {
   buildFunnelPayload,
   computeNextStepSchedule,
@@ -2056,6 +2057,13 @@ router.post(
     const client = new TheirStackClient(token);
     const userId = getAuth(req)?.userId || null;
 
+    // Credit pre-flight: job scraping costs 1 credit per job found. Block up
+    // front if the org has no credits at all (actuals billed after the search).
+    {
+      const bal = await getBalance(orgId);
+      if (bal < 1) throw new InsufficientCreditsError(1, bal);
+    }
+
     // Search each company (small concurrency cap) → recent open jobs.
     const CONCURRENCY = 5;
     const jobsByCompany = new Map<string, TheirStackJob[]>();
@@ -2078,6 +2086,20 @@ router.post(
         }),
       );
       for (const r of results) jobsByCompany.set(r.name.toLowerCase(), r.jobs);
+    }
+
+    // Bill 1 credit per job found (across all companies), before any DB writes
+    // so an out-of-credits org is hard-blocked rather than getting free roles.
+    const totalJobsFound = [...jobsByCompany.values()].reduce((s, arr) => s + arr.length, 0);
+    if (totalJobsFound > 0) {
+      await deductCredits({
+        orgId,
+        action: "job_scraping",
+        quantity: totalJobsFound,
+        userId,
+        description: "Magic Enrich — find job posts",
+        metadata: { funnelId },
+      });
     }
 
     let jobsFound = 0;

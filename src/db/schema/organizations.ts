@@ -16,6 +16,10 @@ export const organizations = pgTable("organizations", {
   seatsIncluded: integer("seats_included").notNull().default(5),
   creditsIncluded: integer("credits_included").notNull().default(10000),
   creditsUsed: integer("credits_used").notNull().default(0),
+  /** Unified prepaid credit wallet — the single source of truth for spendable
+   *  credits (enrichment / scraping draw from it; top-ups & plan grants add to
+   *  it). 1 credit = $0.01. Seeded from remaining plan credits on migration. */
+  creditBalance: integer("credit_balance").notNull().default(0),
   // Platform admin assigned to manage this account
   accountManagerId: text("account_manager_id").references(
     (): AnyPgColumn => users.id,

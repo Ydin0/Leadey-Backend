@@ -11,6 +11,8 @@ import { scoreSignal, type NormalizedJob } from "../lib/signal-scoring";
 import { ApiError, createId } from "../lib/helpers";
 import { getOrgId } from "../lib/auth";
 import { upsertMasterCompany } from "../lib/master-db";
+import { getAuth } from "@clerk/express";
+import { getBalance, deductCredits, InsufficientCreditsError } from "../lib/credits";
 
 const router = Router();
 
@@ -334,6 +336,14 @@ router.post(
       const requestedTotal = assignment.maxSignalsPerRun || searchParams.limit || 100;
       const actualLimit = Math.min(availableResults, requestedTotal);
 
+      // Credit pre-flight: a scrape costs 1 credit per signal created. Block up
+      // front if the org can't afford the upper bound (actualLimit) so we never
+      // create signals we can't bill for. Charged for real (per signal) below.
+      if (actualLimit > 0) {
+        const bal = await getBalance(orgId);
+        if (bal < actualLimit) throw new InsufficientCreditsError(actualLimit, bal);
+      }
+
       let jobs: typeof countResponse.data = [];
       let response = countResponse;
 
@@ -496,6 +506,20 @@ router.post(
 
       console.log(`[Run ${runId}] TheirStack returned ${jobs.length} jobs, created ${signalsCreated} signals. Skipped: ${skippedNoTitle} no-title, ${skippedDedupe} dedupe, ${skippedScore} low-score. dedupeCompanies=${assignment.dedupeCompanies}, minSignalScore=${assignment.minSignalScore}`);
 
+      // Bill 1 credit per signal actually created (pre-flight above guarantees
+      // the org can afford it).
+      let creditBalance: number | undefined;
+      if (signalsCreated > 0) {
+        creditBalance = await deductCredits({
+          orgId,
+          action: "job_scraping",
+          quantity: signalsCreated,
+          userId: getAuth(req as unknown as Request)?.userId ?? null,
+          description: `Job scrape — ${assignment.scraperName}`,
+          metadata: { runId, assignmentId: id },
+        });
+      }
+
       res.json({
         data: {
           assignmentId: id,
@@ -504,6 +528,7 @@ router.post(
           itemsReturned: jobs.length,
           signalsCreated,
           companiesFound: seenCompanies.size,
+          creditBalance,
           debug: {
             skippedNoTitle,
             skippedDedupe,
@@ -531,6 +556,9 @@ router.post(
         .set({ status: "idle", updatedAt: new Date() })
         .where(eq(scraperAssignments.id, id));
 
+      // Surface insufficient-credits (402) as-is so the client can prompt a
+      // top-up, instead of masking it as a generic 502.
+      if (err instanceof ApiError && err.status === 402) throw err;
       throw new ApiError(502, `Scraper run failed: ${errorMessage}`);
     }
   }),

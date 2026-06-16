@@ -63,6 +63,9 @@ export const scraperContacts = pgTable("scraper_contacts", {
   enrichmentStatus: text("enrichment_status").notNull().default("none"),
   bettercontactRequestId: text("bettercontact_request_id"),
   enrichedAt: timestamp("enriched_at", { withTimezone: true }),
+  /** Set once this contact's enrichment result has been billed, so the poll
+   *  route and the BetterContact webhook never double-charge for it. */
+  creditsBilledAt: timestamp("credits_billed_at", { withTimezone: true }),
 
   // Status management
   status: text("status").notNull().default("discovered"),
