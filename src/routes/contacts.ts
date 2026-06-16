@@ -696,12 +696,43 @@ router.get(
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize as string) || 25));
 
+    // When scoping by company NAMES within an assignment, also resolve those
+    // names to the assignment's company LinkedIn URLs (via signals) so we can
+    // match contacts by their reliable searched_company_url — a discovered
+    // contact's stored company name ("Kensa Group") often differs from the
+    // scraper's ("Kensa Heat Pumps") and would otherwise be hidden.
+    let resolvedCompanyUrls = companyUrls;
+    if (company && assignmentId && !companyUrls) {
+      const names = company.split(",").map((c) => c.trim()).filter(Boolean);
+      const nameNorms = names.map((n) => normCompany(n)).filter((n) => n.length >= 2);
+      if (nameNorms.length > 0) {
+        const sigs = await db
+          .selectDistinct({ company: scraperSignals.company, url: scraperSignals.companyLinkedinUrl })
+          .from(scraperSignals)
+          .where(
+            and(
+              eq(scraperSignals.assignmentId, assignmentId),
+              eq(scraperSignals.organizationId, orgId),
+              sql`${scraperSignals.companyLinkedinUrl} ~ '/company/'`,
+            ),
+          );
+        const urls = sigs
+          .filter((s) => {
+            const cn = normCompany(s.company || "");
+            return cn.length >= 2 && nameNorms.some((n) => cn === n || cn.includes(n) || n.includes(cn));
+          })
+          .map((s) => s.url as string)
+          .filter(Boolean);
+        if (urls.length > 0) resolvedCompanyUrls = urls.join(",");
+      }
+    }
+
     const conditions = buildContactConditions(orgId, {
       assignmentId,
       status,
       enrichmentStatus,
       company,
-      companyUrls,
+      companyUrls: resolvedCompanyUrls,
       title,
       location,
       hasEmail,
