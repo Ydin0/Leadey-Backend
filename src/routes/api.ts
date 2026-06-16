@@ -135,6 +135,26 @@ async function loadFunnel(
     focusedEvents.set(fullLeadId, evs as unknown as EventRow[]);
   }
 
+  // Per-lead call/email activity totals — one cheap aggregate so the lite leads
+  // table shows real counts without shipping every event. Mirrors the frontend's
+  // computeActivityCounts exactly (call: 'call'/step_outcome+channel=call/
+  // outcome=call_completed; email: smartlead_webhook/email_sent/reply_handled/
+  // step_outcome+channel=email).
+  const leadIds = result.leads.map((l) => l.id);
+  const countsByLead = new Map<string, { calls: number; emails: number }>();
+  if (leadIds.length) {
+    const rows = await db
+      .select({
+        leadId: leadEvents.leadId,
+        calls: sql<number>`COUNT(*) FILTER (WHERE ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
+        emails: sql<number>`COUNT(*) FILTER (WHERE ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+      })
+      .from(leadEvents)
+      .where(inArray(leadEvents.leadId, leadIds))
+      .groupBy(leadEvents.leadId);
+    for (const r of rows) countsByLead.set(r.leadId, { calls: r.calls, emails: r.emails });
+  }
+
   return {
     id: result.id,
     name: result.name,
@@ -190,6 +210,8 @@ async function loadFunnel(
       customFields: customFieldsByLead.get(l.id) ?? [],
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
+      callCount: countsByLead.get(l.id)?.calls ?? 0,
+      emailCount: countsByLead.get(l.id)?.emails ?? 0,
       events: (withEvents ? ((l as { events?: EventRow[] }).events ?? []) : (focusedEvents.get(l.id) ?? [])).map((e) => ({
         id: e.id,
         type: e.type,

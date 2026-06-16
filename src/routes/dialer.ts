@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, or, desc, asc, inArray, notInArray, isNull, sql, gte, count } from "drizzle-orm";
+import { eq, and, or, desc, asc, inArray, isNull, sql, gte, count } from "drizzle-orm";
 import multer from "multer";
 import twilioSdk from "twilio";
 import { getAuth } from "@clerk/express";
@@ -653,16 +653,12 @@ router.post(
       .where(eq(callDispositions.organizationId, orgId));
     const dispoById = new Map(dispoRows.map((d) => [d.id, d]));
 
-    // One pass over recent completed calls (org-wide) gives us both:
-    //   • the LAST disposition + when, per lead (recency + retry-window check)
-    //   • the count in the last 24h, per lead (max-attempts check)
-    // Look back far enough to cover any retry window (capped) and the recency
-    // floor — retry windows are 1–3 days, so 30 days is generous.
-    const lookbackMs = Math.max(recentMs, 30 * DAY_MS);
-    const lastCallByLead = new Map<string, { calledAt: number; dispositionId: string | null }>();
-    const recentAttemptsByLead = new Map<string, number>();
+    // Last DIALER disposition per lead (dispositions live on queue items, not
+    // call_records) — drives the per-disposition retry window. Look back far
+    // enough to cover any retry window; retry windows are 1–3 days, 30 is ample.
+    const lastDispoByLead = new Map<string, { calledAt: number; dispositionId: string | null }>();
     {
-      const since = new Date(now - lookbackMs);
+      const since = new Date(now - Math.max(recentMs, 30 * DAY_MS));
       const calledRows = await db
         .select({
           leadId: dialerQueueItems.leadId,
@@ -681,13 +677,38 @@ router.post(
         .orderBy(desc(dialerQueueItems.calledAt));
       for (const r of calledRows) {
         if (!r.calledAt) continue;
-        const t = r.calledAt.getTime();
-        // Rows are newest-first, so the first one seen per lead is the latest.
-        if (!lastCallByLead.has(r.leadId)) {
-          lastCallByLead.set(r.leadId, { calledAt: t, dispositionId: r.dispositionId });
+        if (!lastDispoByLead.has(r.leadId)) {
+          lastDispoByLead.set(r.leadId, { calledAt: r.calledAt.getTime(), dispositionId: r.dispositionId });
         }
-        if (now - t < RECENT_MS) {
-          recentAttemptsByLead.set(r.leadId, (recentAttemptsByLead.get(r.leadId) ?? 0) + 1);
+      }
+    }
+
+    // call_records is the SUPERSET of every call (dialer auto-dials AND manual
+    // dial-pad / lead-row calls), so it is the authoritative "recently called"
+    // signal. Bucket recent org calls by leadId AND by normalized phone so a
+    // contact is recognised however the call was placed.
+    const normPhone = (p: string | null | undefined) => (p || "").replace(/[^\d]/g, "");
+    const recentCallByLead = new Map<string, number>(); // leadId -> latest calledAt ms
+    const recentCallByPhone = new Map<string, number>(); // digits -> latest calledAt ms
+    const attempts24hByLead = new Map<string, number>();
+    const attempts24hByPhone = new Map<string, number>();
+    {
+      const since = new Date(now - Math.max(recentMs, RECENT_MS));
+      const crRows = await db
+        .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, calledAt: callRecords.calledAt })
+        .from(callRecords)
+        .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, since)));
+      for (const r of crRows) {
+        if (!r.calledAt) continue;
+        const t = r.calledAt.getTime();
+        if (r.leadId) {
+          if ((recentCallByLead.get(r.leadId) ?? 0) < t) recentCallByLead.set(r.leadId, t);
+          if (now - t < RECENT_MS) attempts24hByLead.set(r.leadId, (attempts24hByLead.get(r.leadId) ?? 0) + 1);
+        }
+        const d = normPhone(r.toNumber);
+        if (d) {
+          if ((recentCallByPhone.get(d) ?? 0) < t) recentCallByPhone.set(d, t);
+          if (now - t < RECENT_MS) attempts24hByPhone.set(d, (attempts24hByPhone.get(d) ?? 0) + 1);
         }
       }
     }
@@ -718,12 +739,12 @@ router.post(
         continue;
       }
 
-      const lastCall = lastCallByLead.get(lead.id);
+      const lastDispo = lastDispoByLead.get(lead.id);
       // Per-disposition retry window: a lead whose last outcome was negative
       // (e.g. Not Interested) stays out for good; one with a retry delay
       // (No Answer 1d, Voicemail 2d, Gatekeeper 3d, …) waits out that window.
-      if (lastCall?.dispositionId) {
-        const dispo = dispoById.get(lastCall.dispositionId);
+      if (lastDispo?.dispositionId) {
+        const dispo = dispoById.get(lastDispo.dispositionId);
         if (dispo) {
           if (dispo.outcomeBucket === "negative") {
             excludedRetry++;
@@ -731,7 +752,7 @@ router.post(
           }
           if (
             dispo.retryAfterDays != null &&
-            now - lastCall.calledAt < dispo.retryAfterDays * DAY_MS
+            now - lastDispo.calledAt < dispo.retryAfterDays * DAY_MS
           ) {
             excludedRetry++;
             continue;
@@ -739,25 +760,24 @@ router.post(
         }
       }
 
-      const recentAttempts = recentAttemptsByLead.get(lead.id) ?? 0;
-      if (
-        resolvedFilters.excludeRecentlyCalled &&
-        ((master?.lastCalledAt && now - master.lastCalledAt.getTime() < recentMs) ||
-          (lastCall && now - lastCall.calledAt < recentMs))
-      ) {
+      // Recency + attempts from call_records (every call, any channel) plus the
+      // master-contact mirror — the lead is "recently called" if ANY source saw
+      // a call within the window.
+      const digits = normPhone(lead.phone);
+      const lastCalledMs = Math.max(
+        master?.lastCalledAt ? master.lastCalledAt.getTime() : 0,
+        recentCallByLead.get(lead.id) ?? 0,
+        digits ? recentCallByPhone.get(digits) ?? 0 : 0,
+      );
+      const attempts24h = Math.max(
+        attempts24hByLead.get(lead.id) ?? 0,
+        digits ? attempts24hByPhone.get(digits) ?? 0 : 0,
+      );
+      if (resolvedFilters.excludeRecentlyCalled && lastCalledMs && now - lastCalledMs < recentMs) {
         excludedRecent++;
         continue;
       }
-      if (
-        resolvedFilters.maxAttempts !== null &&
-        // Real dialer attempts on this lead in the last 24h (works for every
-        // lead) — OR the master-contact counter for cross-source dedup.
-        (recentAttempts >= resolvedFilters.maxAttempts ||
-          (master !== null &&
-            master.callAttempts >= resolvedFilters.maxAttempts &&
-            master.lastCalledAt !== null &&
-            now - master.lastCalledAt.getTime() < RECENT_MS))
-      ) {
+      if (resolvedFilters.maxAttempts !== null && attempts24h >= resolvedFilters.maxAttempts) {
         excludedAttempts++;
         continue;
       }
@@ -891,6 +911,143 @@ async function loadSessionOr404(
   return row;
 }
 
+type DialerTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * The single source of truth for "what to dial next" — used by advance, skip and
+ * getCurrent. Walks the session's pending queue in position order and LIVE-checks
+ * each candidate against the authoritative call_records recency log (every
+ * channel: dialer + manual), DNC, closed status and max-attempts. Blocked items
+ * are marked `skipped` (with a reason) so a stale snapshot can NEVER re-dial
+ * someone already called or skip the wrong people. A lead another rep is actively
+ * on right now is passed over (left pending), not skipped. Returns the chosen item
+ * (now in_progress), or null when nothing dialable remains.
+ */
+async function findNextDialable(
+  tx: DialerTx,
+  session: typeof dialerSessions.$inferSelect,
+): Promise<typeof dialerQueueItems.$inferSelect | null> {
+  const orgId = session.organizationId;
+  const f = (session.filtersJson as {
+    excludeDoNotCall?: boolean;
+    excludeClosed?: boolean;
+    excludeRecentlyCalled?: boolean;
+    recentlyCalledDays?: number;
+    maxAttempts?: number | null;
+  } | null) || {};
+  const excludeDoNotCall = f.excludeDoNotCall !== false;
+  const excludeClosed = f.excludeClosed !== false;
+  const excludeRecentlyCalled = f.excludeRecentlyCalled !== false;
+  const recentlyCalledDays = f.recentlyCalledDays && f.recentlyCalledDays > 0 ? f.recentlyCalledDays : 2;
+  const maxAttempts = f.maxAttempts === undefined ? 3 : f.maxAttempts;
+
+  const now = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+  const recentMs = recentlyCalledDays * DAY;
+  const norm = (p: string | null | undefined) => (p || "").replace(/[^\d]/g, "");
+
+  const pending = await tx
+    .select({
+      id: dialerQueueItems.id,
+      leadId: dialerQueueItems.leadId,
+      leadPhone: dialerQueueItems.leadPhone,
+      position: dialerQueueItems.position,
+    })
+    .from(dialerQueueItems)
+    .where(and(eq(dialerQueueItems.sessionId, session.id), eq(dialerQueueItems.status, "pending")))
+    .orderBy(asc(dialerQueueItems.position));
+  if (pending.length === 0) return null;
+
+  const leadIds = [...new Set(pending.map((p) => p.leadId))];
+  const leadRows = leadIds.length
+    ? await tx.select({ id: leads.id, status: leads.status, doNotCall: leads.doNotCall }).from(leads).where(inArray(leads.id, leadIds))
+    : [];
+  const leadById = new Map(leadRows.map((l) => [l.id, l]));
+
+  const terminalKeys = excludeClosed
+    ? new Set((await getMergedLeadStatuses(orgId)).filter((s) => s.isTerminal).map((s) => s.key))
+    : new Set<string>();
+
+  // Recency + 24h attempts from call_records (every channel), by leadId + phone.
+  const recentByLead = new Map<string, number>();
+  const recentByPhone = new Map<string, number>();
+  const attemptsByLead = new Map<string, number>();
+  const attemptsByPhone = new Map<string, number>();
+  {
+    const since = new Date(now - Math.max(recentMs, DAY));
+    const crRows = await tx
+      .select({ leadId: callRecords.leadId, toNumber: callRecords.toNumber, calledAt: callRecords.calledAt })
+      .from(callRecords)
+      .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, since)));
+    for (const r of crRows) {
+      if (!r.calledAt) continue;
+      const t = r.calledAt.getTime();
+      if (r.leadId) {
+        if ((recentByLead.get(r.leadId) ?? 0) < t) recentByLead.set(r.leadId, t);
+        if (now - t < DAY) attemptsByLead.set(r.leadId, (attemptsByLead.get(r.leadId) ?? 0) + 1);
+      }
+      const d = norm(r.toNumber);
+      if (d) {
+        if ((recentByPhone.get(d) ?? 0) < t) recentByPhone.set(d, t);
+        if (now - t < DAY) attemptsByPhone.set(d, (attemptsByPhone.get(d) ?? 0) + 1);
+      }
+    }
+  }
+
+  // Leads another rep is ACTIVELY on right now — pass over (don't double-ring).
+  const collidedRows = await tx
+    .select({ leadId: dialerQueueItems.leadId })
+    .from(dialerQueueItems)
+    .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+    .where(
+      and(
+        eq(dialerSessions.organizationId, orgId),
+        sql`${dialerQueueItems.sessionId} <> ${session.id}`,
+        inArray(dialerSessions.status, ["active", "paused"]),
+        inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+      ),
+    );
+  const collided = new Set(collidedRows.map((r) => r.leadId));
+
+  const skipByReason = new Map<string, string[]>();
+  const skip = (id: string, reason: string) => {
+    const arr = skipByReason.get(reason) ?? [];
+    arr.push(id);
+    skipByReason.set(reason, arr);
+  };
+
+  let chosen: (typeof pending)[number] | null = null;
+  for (const item of pending) {
+    const lead = leadById.get(item.leadId);
+    const digits = norm(item.leadPhone);
+    if (excludeDoNotCall && lead?.doNotCall) { skip(item.id, "dnc"); continue; }
+    if (excludeClosed && lead && terminalKeys.has(lead.status)) { skip(item.id, "closed"); continue; }
+    if (excludeRecentlyCalled) {
+      const last = Math.max(recentByLead.get(item.leadId) ?? 0, digits ? recentByPhone.get(digits) ?? 0 : 0);
+      if (last && now - last < recentMs) { skip(item.id, "recently_called"); continue; }
+    }
+    if (maxAttempts != null) {
+      const attempts = Math.max(attemptsByLead.get(item.leadId) ?? 0, digits ? attemptsByPhone.get(digits) ?? 0 : 0);
+      if (attempts >= maxAttempts) { skip(item.id, "max_attempts"); continue; }
+    }
+    if (collided.has(item.leadId)) continue; // another rep on it now — try later
+    chosen = item;
+    break;
+  }
+
+  for (const [reason, ids] of skipByReason) {
+    await tx
+      .update(dialerQueueItems)
+      .set({ status: "skipped", notes: `auto:${reason}`, calledAt: new Date() })
+      .where(inArray(dialerQueueItems.id, ids));
+  }
+
+  if (!chosen) return null;
+  await tx.update(dialerQueueItems).set({ status: "in_progress" }).where(eq(dialerQueueItems.id, chosen.id));
+  const [fresh] = await tx.select().from(dialerQueueItems).where(eq(dialerQueueItems.id, chosen.id));
+  return fresh ?? null;
+}
+
 router.post(
   "/dialer/sessions/:id/pause",
   asyncHandler(async (req, res) => {
@@ -966,16 +1123,9 @@ router.get(
       }
     }
     if (!currentItem) {
-      const [firstPending] = await db
-        .select()
-        .from(dialerQueueItems)
-        .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
-        .orderBy(asc(dialerQueueItems.position))
-        .limit(1);
-      if (firstPending) {
-        await db.update(dialerQueueItems).set({ status: "in_progress" }).where(eq(dialerQueueItems.id, firstPending.id));
-        currentItem = { ...firstPending, status: "in_progress" };
-      }
+      // Promote the next LIVE-vetted pending lead (recency / DNC / closed /
+      // attempts / collision) — never re-surface someone already called.
+      currentItem = await db.transaction(async (tx) => findNextDialable(tx, s));
     }
 
     const upcoming = currentItem
@@ -1184,73 +1334,11 @@ router.post(
         });
       }
 
-      // Find the next dialable lead, skipping any another rep is currently on
-      // (in_progress in another live session) or — when this session excludes
-      // recently-called — one another session already completed in the last 24h.
-      // Collided leads are left PENDING (retried on a later advance once the
-      // collision clears), so two reps sharing a campaign split the leads
-      // dynamically instead of double-dialing the same people.
-      const recentSkip =
-        (s.filtersJson as { excludeRecentlyCalled?: boolean } | null)?.excludeRecentlyCalled !== false;
-      const collidedRows = await tx
-        .select({ leadId: dialerQueueItems.leadId })
-        .from(dialerQueueItems)
-        .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
-        .where(
-          and(
-            eq(dialerSessions.organizationId, s.organizationId),
-            sql`${dialerQueueItems.sessionId} <> ${s.id}`,
-            or(
-              and(
-                inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
-                inArray(dialerSessions.status, ["active", "paused"]),
-              ),
-              ...(recentSkip
-                ? [
-                    and(
-                      eq(dialerQueueItems.status, "completed"),
-                      gte(dialerQueueItems.calledAt, new Date(Date.now() - 24 * 60 * 60 * 1000)),
-                    ),
-                  ]
-                : []),
-            ),
-          ),
-        );
-      const collidedLeadIds = [...new Set(collidedRows.map((r) => r.leadId))];
-
-      // First pending lead that isn't collided. Collided leads are simply not
-      // picked now — they stay pending and get retried on a later advance once
-      // the other rep is off them.
-      const nextConds = [
-        eq(dialerQueueItems.sessionId, s.id),
-        eq(dialerQueueItems.status, "pending"),
-      ];
-      if (collidedLeadIds.length) {
-        nextConds.push(notInArray(dialerQueueItems.leadId, collidedLeadIds));
-      }
-      let [next] = await tx
-        .select()
-        .from(dialerQueueItems)
-        .where(and(...nextConds))
-        .orderBy(asc(dialerQueueItems.position))
-        .limit(1);
-      // If every remaining lead is momentarily collided, still continue with the
-      // next pending one — never strand the rep / falsely "complete" the session.
-      // Avoiding the same person twice is best-effort, not a hard stop.
-      if (!next) {
-        [next] = await tx
-          .select()
-          .from(dialerQueueItems)
-          .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
-          .orderBy(asc(dialerQueueItems.position))
-          .limit(1);
-      }
-      if (next) {
-        await tx
-          .update(dialerQueueItems)
-          .set({ status: "in_progress" })
-          .where(eq(dialerQueueItems.id, next.id));
-      }
+      // Pick the next dialable lead — LIVE-checked against call_records recency
+      // (any channel), DNC, closed status, max-attempts and cross-rep collision.
+      // This is what guarantees the dialer never re-dials someone already called
+      // and never serves a stale snapshot lead. Blocked items are auto-skipped.
+      const next = await findNextDialable(tx, s);
 
       // Update session counters
       const newDispoCounts = { ...(s.dispositionsJson || {}) };
@@ -1333,18 +1421,8 @@ router.post(
         .set({ status: "skipped", notes: reason || null, calledAt: new Date() })
         .where(eq(dialerQueueItems.id, current.id));
 
-      const [next] = await tx
-        .select()
-        .from(dialerQueueItems)
-        .where(and(eq(dialerQueueItems.sessionId, s.id), eq(dialerQueueItems.status, "pending")))
-        .orderBy(asc(dialerQueueItems.position))
-        .limit(1);
-      if (next) {
-        await tx
-          .update(dialerQueueItems)
-          .set({ status: "in_progress" })
-          .where(eq(dialerQueueItems.id, next.id));
-      }
+      // Live-vetted next lead (recency / DNC / closed / attempts / collision).
+      const next = await findNextDialable(tx, s);
       await tx
         .update(dialerSessions)
         .set({

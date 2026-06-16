@@ -742,6 +742,42 @@ router.post(
       })
       .returning();
 
+    // Keep recency in sync for EVERY outbound call (manual dial-pad / lead-row
+    // click as well as the dialer) so the power dialer's "recently called"
+    // filters see it. Resolve the master contact via the lead's identifiers,
+    // else by phone, and bump lastCalledAt + callAttempts. Best-effort.
+    if (direction === "outbound") {
+      try {
+        let leadRow: { linkedinUrl: string | null; email: string | null } | undefined;
+        if (leadId) {
+          [leadRow] = await db
+            .select({ linkedinUrl: leads.linkedinUrl, email: leads.email })
+            .from(leads)
+            .where(eq(leads.id, leadId))
+            .limit(1);
+        }
+        const li = leadRow?.linkedinUrl || null;
+        const em = leadRow?.email ? leadRow.email.toLowerCase() : null;
+        const digits = (record.toNumber || "").replace(/[^\d]/g, "");
+        const idConds = [];
+        if (li) idConds.push(eq(masterContacts.linkedinUrl, li));
+        if (em) idConds.push(sql`LOWER(${masterContacts.email}) = ${em}`);
+        if (digits) idConds.push(sql`regexp_replace(COALESCE(${masterContacts.phone}, ''), '[^0-9]', '', 'g') = ${digits}`);
+        if (idConds.length) {
+          await db
+            .update(masterContacts)
+            .set({
+              lastCalledAt: new Date(),
+              callAttempts: sql`${masterContacts.callAttempts} + 1`,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(masterContacts.organizationId, orgId), or(...idConds)));
+        }
+      } catch (err) {
+        console.warn("[call-records] master recency sync failed", err);
+      }
+    }
+
     res.status(201).json({
       data: {
         id: record.id,

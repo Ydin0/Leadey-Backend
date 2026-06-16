@@ -61,6 +61,10 @@ export interface Lead {
   createdAt: Date;
   updatedAt: Date;
   events: LeadEvent[];
+  /** Per-lead activity totals computed server-side (so the lite leads table
+   *  shows real call/email counts without shipping every event). */
+  callCount?: number;
+  emailCount?: number;
 }
 
 export interface Funnel {
@@ -116,6 +120,8 @@ function serializeLead(lead: Lead, lite = false) {
     customFields: lite ? [] : (lead.customFields ?? []),
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),
+    callCount: lead.callCount ?? 0,
+    emailCount: lead.emailCount ?? 0,
     events: lite
       ? []
       : (lead.events ?? []).map((e) => ({
