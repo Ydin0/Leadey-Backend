@@ -1031,8 +1031,54 @@ router.get(
           .limit(200)
       : [];
 
+    // The company's scraped JOB POSTS → hiring roles. Matched org-wide by company
+    // name (or domain) so a company that has only jobs (no discovered contacts)
+    // still surfaces its open roles on the profile's Hiring Roles section.
+    const companyName = company?.name || (isUrl ? "" : key);
+    const jobConds = [eq(scraperSignals.organizationId, orgId)];
+    const jobMatch = [];
+    if (companyName) jobMatch.push(sql`lower(${scraperSignals.company}) = lower(${companyName})`);
+    if (!isUrl) jobMatch.push(ilike(scraperSignals.companyDomain, `%${key}%`));
+    if (isUrl) jobMatch.push(eq(scraperSignals.companyLinkedinUrl, key));
+    if (jobMatch.length) jobConds.push(or(...jobMatch)!);
+    const jobRows = jobMatch.length
+      ? await db
+          .select({
+            jobTitle: scraperSignals.jobTitle,
+            salary: scraperSignals.salary,
+            location: scraperSignals.location,
+            jobUrl: scraperSignals.jobUrl,
+            description: scraperSignals.description,
+            postedAt: scraperSignals.postedAt,
+            seniority: scraperSignals.seniority,
+          })
+          .from(scraperSignals)
+          .where(and(...jobConds))
+          .orderBy(desc(scraperSignals.postedAt))
+          .limit(60)
+      : [];
+    const seenTitles = new Set<string>();
+    const hiringRoles: Array<{ id: string } & DerivedHiringRole> = [];
+    for (const s of jobRows) {
+      const title = (s.jobTitle || "").trim();
+      const tk = title.toLowerCase();
+      if (!title || seenTitles.has(tk) || hiringRoles.length >= 15) continue;
+      seenTitles.add(tk);
+      hiringRoles.push({
+        id: `${key}:role:${hiringRoles.length}`,
+        title,
+        description: (s.description || "").slice(0, 800),
+        salaryRange: s.salary || "",
+        location: s.location || "",
+        postedAgo: relTime(s.postedAt),
+        seniority: s.seniority || "",
+        url: s.jobUrl || "",
+      });
+    }
+
     res.json({
       data: {
+        hiringRoles,
         company: company
           ? {
               id: company.id,
