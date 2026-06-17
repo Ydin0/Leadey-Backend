@@ -126,16 +126,29 @@ async function loadFunnel(
   // filter on them. Returns empty cheaply for orgs with no custom fields.
   const customFieldsByLead = await getCustomFieldsForLeads(result.leads.map((l) => l.id));
 
-  // Events for the focused lead only, when this is a lite load.
-  type EventRow = { id: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
+  // Events for the focused lead — and every other contact of the SAME COMPANY —
+  // when this is a lite load. The lead profile shows one company with all its
+  // contacts, so its activity timeline aggregates the whole company's history
+  // (not just the clicked contact). Falls back to the single lead when it has
+  // no company name.
+  type EventRow = { id: string; leadId: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
   const focusedEvents = new Map<string, EventRow[]>();
   if (!withEvents && fullLeadId) {
+    const focusLead = result.leads.find((l) => l.id === fullLeadId);
+    const companyKey = (focusLead?.company || "").trim().toLowerCase();
+    const groupIds = companyKey
+      ? result.leads.filter((l) => (l.company || "").trim().toLowerCase() === companyKey).map((l) => l.id)
+      : [fullLeadId];
     const evs = await db
       .select()
       .from(leadEvents)
-      .where(eq(leadEvents.leadId, fullLeadId))
+      .where(inArray(leadEvents.leadId, groupIds))
       .orderBy(asc(leadEvents.timestamp));
-    focusedEvents.set(fullLeadId, evs as unknown as EventRow[]);
+    for (const e of evs as unknown as EventRow[]) {
+      const arr = focusedEvents.get(e.leadId);
+      if (arr) arr.push(e);
+      else focusedEvents.set(e.leadId, [e]);
+    }
   }
 
   // Activity totals shown in the leads table reflect TOTAL contact across the
