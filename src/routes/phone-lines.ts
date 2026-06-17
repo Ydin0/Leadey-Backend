@@ -607,34 +607,53 @@ router.get(
       .limit(limit)
       .offset(offset);
 
-    // Resolve a contact name/company for any record that doesn't already have
-    // one by matching the dialed number against the org's leads. If the number
-    // isn't linked to a lead we leave it blank and the UI shows the raw number.
-    const needsLookup = rows.some((r) => !r.contactName);
-    const leadByPhone = new Map<string, { name: string; company: string }>();
-    if (needsLookup) {
+    // Resolve a contact name/company AND a clickable lead link for each record.
+    // Prefer the stored leadId (outbound dialer calls); else match the
+    // counterpart number against the org's leads (inbound / manual calls).
+    type LeadInfo = { leadId: string; funnelId: string; name: string; company: string };
+    const storedLeadIds = [...new Set(rows.map((r) => r.leadId).filter(Boolean) as string[])];
+    const byLeadId = new Map<string, LeadInfo>();
+    if (storedLeadIds.length) {
+      const ls = await db
+        .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), inArray(leads.id, storedLeadIds)));
+      for (const l of ls) byLeadId.set(l.id, { leadId: l.id, funnelId: l.funnelId, name: l.name, company: l.company });
+    }
+    const byPhone = new Map<string, LeadInfo>();
+    if (rows.some((r) => !r.leadId)) {
       const orgLeads = await db
-        .select({ name: leads.name, company: leads.company, phone: leads.phone })
+        .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company, phone: leads.phone })
         .from(leads)
         .innerJoin(funnels, eq(leads.funnelId, funnels.id))
         .where(eq(funnels.organizationId, orgId));
       for (const l of orgLeads) {
         const key = phoneKey(l.phone);
-        if (key && !leadByPhone.has(key)) {
-          leadByPhone.set(key, { name: l.name, company: l.company });
-        }
+        if (key && !byPhone.has(key)) byPhone.set(key, { leadId: l.id, funnelId: l.funnelId, name: l.name, company: l.company });
       }
     }
 
     const data = rows.map((r) => {
       let contactName = r.contactName;
       let companyName = r.companyName;
-      if (!contactName) {
+      let leadId: string | null = r.leadId ?? null;
+      let funnelId: string | null = null;
+      // Stored lead (outbound dialer) — get its funnel + fill name if missing.
+      if (leadId) {
+        const info = byLeadId.get(leadId);
+        if (info) {
+          funnelId = info.funnelId;
+          if (!contactName) { contactName = info.name; companyName = companyName || info.company; }
+        }
+      } else {
+        // Match by the counterpart number (inbound caller / manual dial target).
         const counterpart = r.direction === "outbound" ? r.toNumber : r.fromNumber;
-        const match = phoneKey(counterpart) ? leadByPhone.get(phoneKey(counterpart)!) : undefined;
+        const match = phoneKey(counterpart) ? byPhone.get(phoneKey(counterpart)!) : undefined;
         if (match) {
-          contactName = match.name;
-          companyName = companyName || match.company;
+          leadId = match.leadId;
+          funnelId = match.funnelId;
+          if (!contactName) { contactName = match.name; companyName = companyName || match.company; }
         }
       }
       return {
@@ -644,6 +663,8 @@ router.get(
       to: r.toNumber,
       contactName,
       companyName,
+      leadId,
+      funnelId,
       lineId: r.lineId,
       duration: r.duration,
       disposition: r.disposition,
