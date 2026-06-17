@@ -267,6 +267,13 @@
       "when": 1781639786069,
       "tag": "0037_graceful_santa_claus",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1781692814569,
+      "tag": "0038_burly_annihilus",
+      "breakpoints": true
     }
   ]
 }

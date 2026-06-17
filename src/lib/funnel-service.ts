@@ -30,6 +30,8 @@ export interface LeadEvent {
 export interface Lead {
   id: string;
   name: string;
+  firstName?: string | null;
+  lastName?: string | null;
   title: string;
   company: string;
   email: string;
@@ -92,6 +94,8 @@ function serializeLead(lead: Lead, lite = false) {
   return {
     id: lead.id,
     name: lead.name,
+    firstName: lead.firstName ?? null,
+    lastName: lead.lastName ?? null,
     title: lead.title,
     company: lead.company,
     email: lead.email,

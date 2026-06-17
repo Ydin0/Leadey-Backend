@@ -221,6 +221,8 @@ async function loadFunnel(
     leads: result.leads.map((l) => ({
       id: l.id,
       name: l.name,
+      firstName: l.firstName,
+      lastName: l.lastName,
       title: l.title,
       company: l.company,
       email: l.email,
@@ -1050,6 +1052,8 @@ router.post(
     };
     const LBL = {
       name: ["Lead Name", "Name", "Full Name"],
+      firstName: ["Lead First Name", "First Name", "Given Name"],
+      lastName: ["Lead Last Name", "Last Name", "Surname", "Family Name"],
       email: ["Lead Email", "Email", "Work Email"],
       title: ["Lead Title", "Title", "Job Title"],
       phone: ["Lead Phone", "Phone", "Mobile"],
@@ -1114,7 +1118,11 @@ router.post(
     rows.forEach((rawRow: unknown, index: number) => {
       const row = rawRow && typeof rawRow === "object" ? (rawRow as Record<string, unknown>) : {};
 
-      const name = getField(row, LBL.name);
+      const firstName = getField(row, LBL.firstName);
+      const lastName = getField(row, LBL.lastName);
+      // Full name comes from a mapped "Lead Name" column, else compose it from
+      // the separate first/last columns so either mapping style works.
+      const name = getField(row, LBL.name) || [firstName, lastName].filter(Boolean).join(" ");
       const cName = getField(row, LBL.cName);
       const email = getField(row, LBL.email).toLowerCase();
       const cDomainRaw = normalizeDomain(getField(row, LBL.cDomain)) || domainFromEmail(email);
@@ -1206,8 +1214,13 @@ router.post(
       const phone = getField(row, LBL.phone);
       const linkedinUrl = getField(row, LBL.linkedin);
       const leadId = createId("lead");
+      // Prefer the explicitly-mapped first/last; otherwise split the full name so
+      // {{first_name}}/{{last_name}} email variables still resolve.
+      const nameParts = name.split(" ").filter(Boolean);
+      const fnFinal = firstName || nameParts[0] || null;
+      const lnFinal = lastName || nameParts.slice(1).join(" ") || null;
       newLeads.push({
-        id: leadId, funnelId: funnel.id, importId, name, title, company: canonicalCompany, email, phone, linkedinUrl,
+        id: leadId, funnelId: funnel.id, importId, name, firstName: fnFinal, lastName: lnFinal, title, company: canonicalCompany, email, phone, linkedinUrl,
         currentStep: 1, totalSteps: funnel.steps.length, status: "pending",
         nextAction: firstStep.label, nextDate: new Date(now + firstStep.dayOffset * DAY_MS),
         source: "CSV Import", sourceType: "csv",

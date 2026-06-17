@@ -7,6 +7,11 @@ export const leads = pgTable("leads", {
     .notNull()
     .references(() => funnels.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
+  /** Explicit first/last name when the source provided them separately (CSV
+   *  import, scraper). Lets email templates field-map {{first_name}} /
+   *  {{last_name}} reliably instead of splitting the full name. */
+  firstName: text("first_name"),
+  lastName: text("last_name"),
   title: text("title").notNull().default(""),
   company: text("company").notNull(),
   email: text("email").notNull().default(""),
