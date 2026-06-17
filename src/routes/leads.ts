@@ -64,7 +64,7 @@ function buildLeadConditions(orgId: string, q: Record<string, unknown>): SQL[] {
   if (Number.isFinite(maxEmp) && maxEmp > 0) c.push(sql`${leads.companyEmployeeCount} <= ${maxEmp}`);
 
   // Close-style query builder (Smart Views) — AND its predicate onto the rest.
-  const filterWhere = buildLeadFilterWhere(decodeFilterParam(q.filter));
+  const filterWhere = buildLeadFilterWhere(decodeFilterParam(q.filter), { orgId });
   if (filterWhere) c.push(filterWhere);
 
   return c;

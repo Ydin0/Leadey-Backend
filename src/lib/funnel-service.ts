@@ -121,7 +121,7 @@ function serializeLead(lead: Lead, lite = false) {
     doNotCall: lead.doNotCall ?? false,
     opportunityId: lead.opportunityId ?? null,
     notes: lite ? undefined : lead.notes,
-    customFields: lite ? [] : (lead.customFields ?? []),
+    customFields: lead.customFields ?? [],
     createdAt: lead.createdAt.toISOString(),
     updatedAt: lead.updatedAt.toISOString(),
     callCount: lead.callCount ?? 0,

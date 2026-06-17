@@ -122,12 +122,9 @@ async function loadFunnel(
   }
 
   // Custom fields: the full set on a full load, just the focused lead's on a
-  // lite load (the leads table / nav don't render custom fields).
-  const customFieldsByLead = withEvents
-    ? await getCustomFieldsForLeads(result.leads.map((l) => l.id))
-    : fullLeadId
-      ? await getCustomFieldsForLeads([fullLeadId])
-      : new Map();
+  // Custom fields for ALL leads (incl. lite) so the leads list / Smart Views can
+  // filter on them. Returns empty cheaply for orgs with no custom fields.
+  const customFieldsByLead = await getCustomFieldsForLeads(result.leads.map((l) => l.id));
 
   // Events for the focused lead only, when this is a lite load.
   type EventRow = { id: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
