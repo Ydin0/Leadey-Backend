@@ -1269,6 +1269,71 @@ router.patch(
   }),
 );
 
+// ─── PATCH /contacts/:id ─────────────────────────────────────────────
+// Edit a discovered contact's details (name / title / email / phone / LinkedIn)
+// from the standalone lead profile view. Mirrors to the master contact.
+router.patch(
+  "/contacts/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = req.params.id as string;
+    const body = (req.body || {}) as Partial<Record<"name" | "title" | "email" | "phone" | "linkedinUrl", string>>;
+
+    const [existing] = await db
+      .select()
+      .from(scraperContacts)
+      .where(and(eq(scraperContacts.id, id), eq(scraperContacts.organizationId, orgId)))
+      .limit(1);
+    if (!existing) throw new ApiError(404, "Contact not found");
+
+    const updates: Record<string, unknown> = {};
+    if (body.name !== undefined) {
+      const fullName = body.name.trim();
+      if (!fullName) throw new ApiError(400, "Name cannot be empty");
+      const [firstName, ...rest] = fullName.split(" ");
+      updates.fullName = fullName;
+      updates.firstName = firstName || null;
+      updates.lastName = rest.join(" ") || null;
+    }
+    if (body.title !== undefined) updates.currentTitle = body.title.trim();
+    if (body.email !== undefined) updates.email = body.email.trim().toLowerCase();
+    if (body.phone !== undefined) updates.phone = body.phone.trim();
+    if (body.linkedinUrl !== undefined) updates.linkedinUrl = body.linkedinUrl.trim();
+    if (Object.keys(updates).length === 0) throw new ApiError(400, "Nothing to update");
+    updates.updatedAt = new Date();
+
+    await db.update(scraperContacts).set(updates).where(eq(scraperContacts.id, id));
+
+    const linkedinUrl = (updates.linkedinUrl as string) ?? existing.linkedinUrl ?? "";
+    if (linkedinUrl) {
+      try {
+        await upsertMasterContact(orgId, {
+          linkedinUrl,
+          fullName: (updates.fullName as string) ?? existing.fullName ?? null,
+          firstName: (updates.firstName as string) ?? existing.firstName ?? null,
+          lastName: (updates.lastName as string) ?? existing.lastName ?? null,
+          currentTitle: (updates.currentTitle as string) ?? existing.currentTitle ?? null,
+          email: (updates.email as string) ?? existing.email ?? null,
+          phone: (updates.phone as string) ?? existing.phone ?? null,
+        });
+      } catch (err) {
+        console.warn("[contact-edit] master mirror failed:", err instanceof Error ? err.message : err);
+      }
+    }
+
+    res.json({
+      data: {
+        id,
+        name: (updates.fullName as string) ?? existing.fullName,
+        title: (updates.currentTitle as string) ?? existing.currentTitle,
+        email: (updates.email as string) ?? existing.email,
+        phone: (updates.phone as string) ?? existing.phone,
+        linkedinUrl: (updates.linkedinUrl as string) ?? existing.linkedinUrl,
+      },
+    });
+  }),
+);
+
 // ─── POST /contacts/bulk-status ─────────────────────────────────────
 // Bulk update contact statuses
 router.post(

@@ -65,6 +65,7 @@ import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
 import { leadHiringRoles } from "../db/schema/hiring-roles";
+import { upsertMasterContact } from "../lib/master-db";
 
 const router = Router();
 
@@ -1780,6 +1781,71 @@ router.post(
         doNotCall: value,
         flaggedLeads: result.flaggedLeads,
         funnel: buildFunnelPayload(refreshed!, { includeLeads: true }),
+      },
+    });
+  }),
+);
+
+// ─── PATCH /funnels/:funnelId/leads/:leadId/contact ──────────────────────
+// Edit a contact's details (name / title / email / phone / LinkedIn) from the
+// lead profile view. Updates the lead row and mirrors to the master contact so
+// the change follows the person across campaigns.
+router.patch(
+  "/funnels/:funnelId/leads/:leadId/contact",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) throw new ApiError(404, "Lead not found in funnel");
+
+    const body = (req.body || {}) as Partial<Record<"name" | "title" | "email" | "phone" | "linkedinUrl", string>>;
+    const updates: Record<string, unknown> = {};
+    if (body.name !== undefined) {
+      const name = normalizeString(body.name);
+      if (!name) throw new ApiError(400, "Name cannot be empty");
+      updates.name = name;
+    }
+    if (body.title !== undefined) updates.title = normalizeString(body.title);
+    if (body.email !== undefined) updates.email = normalizeString(body.email).toLowerCase();
+    if (body.phone !== undefined) updates.phone = normalizeString(body.phone);
+    if (body.linkedinUrl !== undefined) updates.linkedinUrl = normalizeString(body.linkedinUrl);
+    if (Object.keys(updates).length === 0) throw new ApiError(400, "Nothing to update");
+    updates.updatedAt = new Date();
+
+    await db.update(leads).set(updates).where(eq(leads.id, lead.id));
+
+    // Mirror to the master contact (keyed by LinkedIn URL) so the edit follows
+    // the person everywhere. Best-effort — never blocks the lead update.
+    const linkedinUrl = (updates.linkedinUrl as string) ?? lead.linkedinUrl ?? "";
+    if (linkedinUrl) {
+      const fullName = (updates.name as string) ?? lead.name ?? "";
+      const [firstName, ...rest] = fullName.split(" ");
+      try {
+        await upsertMasterContact(orgId, {
+          linkedinUrl,
+          fullName: fullName || null,
+          firstName: firstName || null,
+          lastName: rest.join(" ") || null,
+          currentTitle: (updates.title as string) ?? lead.title ?? null,
+          email: (updates.email as string) ?? lead.email ?? null,
+          phone: (updates.phone as string) ?? lead.phone ?? null,
+        });
+      } catch (err) {
+        console.warn("[lead-contact] master mirror failed:", err instanceof Error ? err.message : err);
+      }
+    }
+
+    res.json({
+      data: {
+        id: lead.id,
+        name: (updates.name as string) ?? lead.name,
+        title: (updates.title as string) ?? lead.title,
+        email: (updates.email as string) ?? lead.email,
+        phone: (updates.phone as string) ?? lead.phone,
+        linkedinUrl: (updates.linkedinUrl as string) ?? lead.linkedinUrl,
       },
     });
   }),
