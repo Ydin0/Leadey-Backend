@@ -274,6 +274,13 @@
       "when": 1781692814569,
       "tag": "0038_burly_annihilus",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1781702874279,
+      "tag": "0039_sudden_bromley",
+      "breakpoints": true
     }
   ]
 }

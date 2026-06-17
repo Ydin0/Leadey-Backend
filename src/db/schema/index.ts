@@ -17,6 +17,7 @@ export { callRecords } from "./call-records";
 export { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
 export { discoveryRuns, scraperContacts } from "./contacts";
 export { creditTransactions } from "./credits";
+export { smartViews } from "./smart-views";
 export { templates } from "./templates";
 export { masterCompanies, masterContacts } from "./master";
 export {
