@@ -7,6 +7,7 @@ import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
 import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, dedupeKey } from "../lib/helpers";
+import { buildLeadFilterWhere, decodeFilterParam } from "../lib/lead-filter";
 
 const router = Router();
 
@@ -61,6 +62,10 @@ function buildLeadConditions(orgId: string, q: Record<string, unknown>): SQL[] {
   if (Number.isFinite(minEmp) && minEmp > 0) c.push(sql`${leads.companyEmployeeCount} >= ${minEmp}`);
   const maxEmp = Number(q.maxEmployees);
   if (Number.isFinite(maxEmp) && maxEmp > 0) c.push(sql`${leads.companyEmployeeCount} <= ${maxEmp}`);
+
+  // Close-style query builder (Smart Views) — AND its predicate onto the rest.
+  const filterWhere = buildLeadFilterWhere(decodeFilterParam(q.filter));
+  if (filterWhere) c.push(filterWhere);
 
   return c;
 }
@@ -118,6 +123,39 @@ router.get(
       data: rows.map((r) => serializeLead({ ...r.lead, funnelName: r.funnelName })),
       meta: { page, pageSize, totalCount: Number(total), totalPages: Math.ceil(Number(total) / pageSize) },
     });
+  }),
+);
+
+// ─── GET /leads/export — CSV of every lead matching the (Smart View) filter ──
+router.get(
+  "/leads/export",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
+    const rows = await db
+      .select({ lead: leads, funnelName: funnels.name })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(...conds))
+      .orderBy(sql`lower(${leads.company})`, desc(leads.createdAt))
+      .limit(50000);
+
+    const headers = ["Name", "First Name", "Last Name", "Title", "Company", "Email", "Phone", "LinkedIn", "Status", "Source", "Score", "Domain", "Industry", "Employees", "Location", "Campaign", "Created"];
+    const esc = (v: unknown) => {
+      const s = v == null ? "" : String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = [headers.join(",")];
+    for (const { lead: l, funnelName } of rows) {
+      lines.push([
+        l.name, l.firstName, l.lastName, l.title, l.company, l.email, l.phone, l.linkedinUrl,
+        l.status, l.source, l.score, l.companyDomain, l.companyIndustry, l.companyEmployeeCount,
+        l.companyLocation, funnelName, l.createdAt?.toISOString(),
+      ].map(esc).join(","));
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="leads-export.csv"');
+    res.send(lines.join("\n"));
   }),
 );
 
