@@ -2131,7 +2131,13 @@ router.post(
     const orgId = getOrgId(req);
     const funnelId = req.params.funnelId;
     const body = req.body as { companies?: { name: string; domain?: string | null; linkedinUrl?: string | null }[] };
-    const companies = (body.companies || []).filter((c) => c && c.name).slice(0, 50);
+    // Each company is a separate TheirStack lookup, so a single synchronous
+    // request is capped to keep it well under the HTTP timeout (and bound the
+    // credit spend). When more are selected we process the first ENRICH_CAP and
+    // report the truncation so the UI can prompt to run again for the rest.
+    const ENRICH_CAP = 150;
+    const requestedCompanies = (body.companies || []).filter((c) => c && c.name);
+    const companies = requestedCompanies.slice(0, ENRICH_CAP);
     if (companies.length === 0) throw new ApiError(400, "companies is required");
 
     const [funnel] = await db
@@ -2269,6 +2275,8 @@ router.post(
     res.json({
       data: {
         companiesSearched: companies.length,
+        companiesRequested: requestedCompanies.length,
+        capped: requestedCompanies.length > companies.length,
         jobsFound,
         rolesCreated,
         leadsEnriched: leadsEnriched.size,
