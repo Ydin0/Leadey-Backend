@@ -387,12 +387,13 @@ router.get(
     const startUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     startUtc.setUTCDate(startUtc.getUTCDate() - (ANALYTICS_DAYS - 1));
 
-    // Per-rep calls by UTC day.
+    // Per-rep calls + talk time (sum of call duration, seconds) by UTC day.
     const callRows = await db
       .select({
         userId: callRecords.userId,
         day: sql<string>`to_char(date_trunc('day', ${callRecords.calledAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
         c: count(),
+        talk: sql<number>`coalesce(sum(${callRecords.duration}), 0)`,
       })
       .from(callRecords)
       .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, startUtc)))
@@ -410,10 +411,13 @@ router.get(
       .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
 
     const callMap = new Map<string, Map<string, number>>();
+    const talkMap = new Map<string, Map<string, number>>();
     for (const r of callRows) {
       if (!r.userId) continue;
       if (!callMap.has(r.userId)) callMap.set(r.userId, new Map());
       callMap.get(r.userId)!.set(r.day, Number(r.c));
+      if (!talkMap.has(r.userId)) talkMap.set(r.userId, new Map());
+      talkMap.get(r.userId)!.set(r.day, Number(r.talk));
     }
     const meetMap = new Map<string, Map<string, number>>();
     for (const r of meetingRows) {
@@ -432,12 +436,14 @@ router.get(
 
     const members = memberRows.map((m) => {
       const calls = callMap.get(m.id);
+      const talk = talkMap.get(m.id);
       const meets = meetMap.get(m.id);
       return {
         id: m.id,
         series: days.map((day) => ({
           date: `${day}T00:00:00.000Z`,
           calls: calls?.get(day) ?? 0,
+          talkTime: talk?.get(day) ?? 0,
           emails: 0,
           sms: 0,
           linkedin: 0,
