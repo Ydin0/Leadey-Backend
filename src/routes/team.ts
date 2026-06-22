@@ -369,7 +369,9 @@ router.delete(
 // call_records (per rep), meetings from opportunities created (per owner).
 // Email/SMS/LinkedIn/replies are 0 until those integrations land — the shape
 // is kept stable so the UI's 4-channel layout works unchanged.
-const ANALYTICS_DAYS = 90;
+// A full rolling year so the Team page's calendar can select any single date
+// or custom range within the last 12 months without a refetch.
+const ANALYTICS_DAYS = 365;
 
 router.get(
   "/team/analytics",
