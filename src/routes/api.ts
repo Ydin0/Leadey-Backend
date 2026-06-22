@@ -1272,7 +1272,42 @@ router.post(
       return;
     }
 
+    // Final lead/event sets to write — narrowed inside the transaction once we
+    // hold the per-funnel lock and can see any concurrent import's rows.
+    let leadsToInsert = newLeads;
+    let eventsToInsert = newEvents;
+
     await db.transaction(async (tx) => {
+      // Serialize imports for THIS funnel. A double-submit (two requests fired
+      // near-simultaneously) would otherwise each read the pre-insert state and
+      // both write the full set — duplicating every contact. The advisory lock
+      // makes the second import wait for the first to commit; we then re-check
+      // against the now-committed rows and drop anything already imported.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${funnel.id}))`);
+
+      const committed = await tx
+        .select({ name: leads.name, company: leads.company, email: leads.email })
+        .from(leads)
+        .where(eq(leads.funnelId, funnel.id));
+      const committedKeys = new Set(committed.map((l) => dedupeKey(l.name, l.company, l.email)));
+      if (committedKeys.size) {
+        const survivors = newLeads.filter((l) => !committedKeys.has(dedupeKey(l.name ?? "", l.company ?? "", l.email ?? "")));
+        const dropped = newLeads.length - survivors.length;
+        if (dropped > 0) {
+          const keep = new Set(survivors.map((l) => l.id));
+          leadsToInsert = survivors;
+          eventsToInsert = newEvents.filter((e) => e.leadId && keep.has(e.leadId));
+          // Reflect the concurrent-dup drop in the counts + returned ids.
+          importedRows -= dropped;
+          duplicateLeads += dropped;
+          summary.importedRows = importedRows;
+          summary.duplicateLeads = duplicateLeads;
+          for (let i = addedLeadIds.length - 1; i >= 0; i--) {
+            if (!keep.has(addedLeadIds[i])) addedLeadIds.splice(i, 1);
+          }
+        }
+      }
+
       // Insert the import record FIRST — leads carry a FK to imports.id, and
       // Postgres checks foreign keys per-statement, so the parent row must
       // already exist before the leads that reference it are inserted.
@@ -1307,20 +1342,20 @@ router.post(
       // parameters, so a large import (thousands of rows × ~30 cols) must be
       // chunked or it errors with MAX_PARAMETERS_EXCEEDED.
       const INSERT_CHUNK = 500;
-      for (let i = 0; i < newLeads.length; i += INSERT_CHUNK) {
-        await tx.insert(leads).values(newLeads.slice(i, i + INSERT_CHUNK));
+      for (let i = 0; i < leadsToInsert.length; i += INSERT_CHUNK) {
+        await tx.insert(leads).values(leadsToInsert.slice(i, i + INSERT_CHUNK));
       }
-      for (let i = 0; i < newEvents.length; i += INSERT_CHUNK) {
-        await tx.insert(leadEvents).values(newEvents.slice(i, i + INSERT_CHUNK));
+      for (let i = 0; i < eventsToInsert.length; i += INSERT_CHUNK) {
+        await tx.insert(leadEvents).values(eventsToInsert.slice(i, i + INSERT_CHUNK));
       }
     });
 
     // Push leads to Smartlead if campaign exists
-    if (funnel.smartleadCampaignId && newLeads.length > 0) {
+    if (funnel.smartleadCampaignId && leadsToInsert.length > 0) {
       await pushLeadsToSmartlead(
         Number(funnel.smartleadCampaignId),
         orgId,
-        newLeads.map((l) => ({
+        leadsToInsert.map((l) => ({
           id: l.id,
           name: l.name,
           email: l.email,
