@@ -3,6 +3,7 @@ import { getOrgId } from "../lib/auth";
 import {
   getMergedLeadStatuses,
   saveCustomLeadStatuses,
+  saveHiddenBuiltInStatuses,
 } from "../lib/lead-status-config";
 
 const router = Router();
@@ -24,14 +25,20 @@ router.get(
   }),
 );
 
-// PUT /api/lead-statuses — replace the org's custom statuses.
+// PUT /api/lead-statuses — replace the org's custom statuses + hidden built-ins.
 router.put(
   "/lead-statuses",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const custom = req.body?.custom ?? req.body;
-    const merged = await saveCustomLeadStatuses(orgId, custom);
-    res.json({ data: merged });
+    const body = req.body ?? {};
+    const custom = body.custom ?? (Array.isArray(body) ? body : []);
+    await saveCustomLeadStatuses(orgId, custom);
+    // Only touch hidden built-ins when the client sends the field, so older
+    // callers that PUT just `custom` don't accidentally clear it.
+    if (Array.isArray(body.hidden)) {
+      await saveHiddenBuiltInStatuses(orgId, body.hidden);
+    }
+    res.json({ data: await getMergedLeadStatuses(orgId) });
   }),
 );
 

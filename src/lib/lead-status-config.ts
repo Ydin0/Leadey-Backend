@@ -35,6 +35,9 @@ export const BUILTIN_LEAD_STATUSES: LeadStatusDef[] = [
 ];
 
 const SETTINGS_KEY = "custom_lead_statuses";
+const HIDDEN_SETTINGS_KEY = "hidden_lead_statuses";
+// "new" is the default status every lead starts in — keep it always available.
+const PROTECTED_KEYS = new Set(["new"]);
 const VALID_COLORS: LeadStatusColor[] = [
   "slate",
   "blue",
@@ -75,12 +78,49 @@ async function loadCustom(orgId: string): Promise<LeadStatusDef[]> {
   }
 }
 
-/** Built-in statuses followed by the org's custom statuses. */
+/** Built-in keys an org has chosen to hide (sanitised: real, non-protected). */
+async function loadHidden(orgId: string): Promise<string[]> {
+  const raw = await getSetting(orgId, HIDDEN_SETTINGS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (k) => typeof k === "string" && BUILTIN_KEYS.has(k) && !PROTECTED_KEYS.has(k),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Built-in statuses (minus any the org has hidden) followed by custom ones.
+ *  Hidden built-ins simply drop out of the pickers everywhere; leads already
+ *  on a hidden status still resolve their label/colour via the built-in
+ *  fallback, so nothing breaks. */
 export async function getMergedLeadStatuses(
   orgId: string,
 ): Promise<LeadStatusDef[]> {
-  const custom = await loadCustom(orgId);
-  return [...BUILTIN_LEAD_STATUSES, ...custom];
+  const [custom, hidden] = await Promise.all([loadCustom(orgId), loadHidden(orgId)]);
+  const hiddenSet = new Set(hidden);
+  const builtIns = BUILTIN_LEAD_STATUSES.filter((s) => !hiddenSet.has(s.key));
+  return [...builtIns, ...custom];
+}
+
+/** Persist which built-in statuses the org has hidden. Protected keys (e.g.
+ *  "new") and unknown keys are dropped. */
+export async function saveHiddenBuiltInStatuses(
+  orgId: string,
+  input: unknown,
+): Promise<void> {
+  const list = Array.isArray(input) ? input : [];
+  const sanitised = [
+    ...new Set(
+      list.filter(
+        (k) => typeof k === "string" && BUILTIN_KEYS.has(k) && !PROTECTED_KEYS.has(k),
+      ),
+    ),
+  ];
+  await upsertSetting(orgId, HIDDEN_SETTINGS_KEY, JSON.stringify(sanitised));
 }
 
 /** Persist the org's custom statuses, sanitising input. Built-in keys and
