@@ -686,6 +686,85 @@ router.get(
   }),
 );
 
+// GET /api/phone-lines/call-records/:id — one call record (for shareable links).
+// Org-scoped, so a shared link only opens for teammates in the same org.
+router.get(
+  "/phone-lines/call-records/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = String(req.params.id);
+
+    const [r] = await db
+      .select()
+      .from(callRecords)
+      .where(and(eq(callRecords.id, id), eq(callRecords.organizationId, orgId)))
+      .limit(1);
+    if (!r) throw new ApiError(404, "Call record not found");
+
+    // Resolve a contact name/company + clickable lead link (same logic as the
+    // list route, scoped to this single record).
+    let contactName = r.contactName;
+    let companyName = r.companyName;
+    let leadId: string | null = r.leadId ?? null;
+    let funnelId: string | null = null;
+    if (leadId) {
+      const [info] = await db
+        .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), eq(leads.id, leadId)))
+        .limit(1);
+      if (info) {
+        funnelId = info.funnelId;
+        if (!contactName) { contactName = info.name; companyName = companyName || info.company; }
+      }
+    } else {
+      const counterpart = r.direction === "outbound" ? r.toNumber : r.fromNumber;
+      const key = phoneKey(counterpart);
+      if (key) {
+        const orgLeads = await db
+          .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company, phone: leads.phone })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(eq(funnels.organizationId, orgId));
+        const match = orgLeads.find((l) => phoneKey(l.phone) === key);
+        if (match) {
+          leadId = match.id;
+          funnelId = match.funnelId;
+          if (!contactName) { contactName = match.name; companyName = companyName || match.company; }
+        }
+      }
+    }
+
+    res.json({
+      data: {
+        id: r.id,
+        direction: r.direction,
+        from: r.fromNumber,
+        to: r.toNumber,
+        contactName,
+        companyName,
+        leadId,
+        funnelId,
+        lineId: r.lineId,
+        duration: r.duration,
+        disposition: r.disposition,
+        recordingUrl: r.recordingUrl,
+        recordingSid: r.recordingSid,
+        recordingDuration: r.recordingDuration,
+        transcript: r.transcript,
+        summary: r.summary,
+        transcriptSegments: r.transcriptSegments ?? null,
+        speakers: r.speakers ?? null,
+        summaryStructured: r.summaryStructured ?? null,
+        userId: r.userId,
+        userName: r.userName,
+        timestamp: r.calledAt.toISOString(),
+      },
+    });
+  }),
+);
+
 // POST /api/phone-lines/call-records — save a call record
 router.post(
   "/phone-lines/call-records",
