@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq, ilike, or, sql } from "drizzle-orm";
+import { and, eq, ilike, or, sql, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { funnels } from "../db/schema/funnels";
 import { leads } from "../db/schema/leads";
@@ -96,7 +96,7 @@ router.get(
           .limit(PER_GROUP),
 
         db
-          .select({ id: opportunities.id, name: opportunities.name })
+          .select({ id: opportunities.id, name: opportunities.name, sourceLeadId: opportunities.sourceLeadId })
           .from(opportunities)
           .where(
             and(
@@ -214,6 +214,19 @@ router.get(
     }
     const leadHref = (l: LookupLead) => `/dashboard/funnels/${l.funnelId}/leads/${l.id}`;
 
+    // Opportunities have no standalone page — route them to their source lead's
+    // profile (org-scoped). Resolve the source lead → funnel for each.
+    const oppLeadIds = [...new Set(oppRows.map((o) => o.sourceLeadId).filter(Boolean) as string[])];
+    const oppLeadById = new Map<string, { id: string; funnelId: string }>();
+    if (oppLeadIds.length) {
+      const oppLeads = await db
+        .select({ id: leads.id, funnelId: leads.funnelId })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), inArray(leads.id, oppLeadIds)));
+      for (const l of oppLeads) oppLeadById.set(l.id, l);
+    }
+
     const results: SearchResult[] = [
       ...campaigns.map((c) => ({
         type: "campaign" as const,
@@ -230,13 +243,18 @@ router.get(
         href: `/dashboard/funnels/${l.funnelId}/leads/${l.id}`,
         domain: l.companyDomain || emailDomain(l.email),
       })),
-      ...oppRows.map((o) => ({
-        type: "opportunity" as const,
-        id: o.id,
-        title: o.name,
-        subtitle: "Opportunity",
-        href: `/dashboard/opportunities/${o.id}`,
-      })),
+      ...oppRows.map((o) => {
+        const lead = o.sourceLeadId ? oppLeadById.get(o.sourceLeadId) : undefined;
+        return {
+          type: "opportunity" as const,
+          id: o.id,
+          title: o.name,
+          subtitle: "Opportunity",
+          // No opportunity detail page — open the source lead's profile, else
+          // fall back to the opportunities board rather than 404.
+          href: lead ? `/dashboard/funnels/${lead.funnelId}/leads/${lead.id}` : `/dashboard/opportunities`,
+        };
+      }),
       ...companyRows.map((c) => {
         const match =
           (c.name && byCompanyName.get(c.name.toLowerCase())) ||
