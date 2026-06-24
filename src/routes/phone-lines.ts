@@ -668,6 +668,8 @@ router.get(
       lineId: r.lineId,
       duration: r.duration,
       disposition: r.disposition,
+      outcome: r.outcome ?? null,
+      outcomeManual: r.outcomeManual ?? false,
       recordingUrl: r.recordingUrl,
       recordingSid: r.recordingSid,
       recordingDuration: r.recordingDuration,
@@ -749,6 +751,8 @@ router.get(
         lineId: r.lineId,
         duration: r.duration,
         disposition: r.disposition,
+        outcome: r.outcome ?? null,
+        outcomeManual: r.outcomeManual ?? false,
         recordingUrl: r.recordingUrl,
         recordingSid: r.recordingSid,
         recordingDuration: r.recordingDuration,
@@ -1697,12 +1701,36 @@ router.post(
           transcriptSegments: updated.transcriptSegments ?? null,
           speakers: updated.speakers ?? null,
           summaryStructured: updated.summaryStructured ?? null,
+          outcome: updated.outcome ?? null,
+          outcomeManual: updated.outcomeManual ?? false,
         },
       });
     } catch (err) {
       console.error("[Summarize] Error:", err);
       throw new ApiError(500, "Failed to transcribe and summarize call");
     }
+  }),
+);
+
+// PATCH /api/phone-lines/call-records/:id/outcome — manually set the call's
+// outcome (overrides the AI classification; AI won't change it after).
+router.patch(
+  "/phone-lines/call-records/:id/outcome",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = String(req.params.id);
+    const outcome = req.body?.outcome === null || req.body?.outcome === "" ? null : String(req.body?.outcome || "");
+    const [rec] = await db
+      .select({ id: callRecords.id })
+      .from(callRecords)
+      .where(and(eq(callRecords.id, id), eq(callRecords.organizationId, orgId)))
+      .limit(1);
+    if (!rec) throw new ApiError(404, "Call record not found");
+    await db
+      .update(callRecords)
+      .set({ outcome, outcomeManual: true })
+      .where(eq(callRecords.id, id));
+    res.json({ data: { id, outcome, outcomeManual: true } });
   }),
 );
 

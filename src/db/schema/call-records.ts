@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, jsonb, real } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, jsonb, real, boolean } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 import { phoneLines } from "./phone-lines";
 
@@ -42,6 +42,12 @@ export const callRecords = pgTable("call_records", {
   funnelId: text("funnel_id"),
   duration: integer("duration").notNull().default(0),
   disposition: text("disposition").notNull().default("completed"),
+  // Sales OUTCOME of the call (distinct from the telephony disposition) — e.g.
+  // "booked_meeting", "qualified", "disqualified". AI-classified on transcription,
+  // overridable by the rep. Stores the outcome key; org defines the label set.
+  outcome: text("outcome"),
+  /** True once a human has set the outcome — AI won't overwrite a manual choice. */
+  outcomeManual: boolean("outcome_manual").notNull().default(false),
   // Recording
   recordingUrl: text("recording_url"),
   recordingSid: text("recording_sid"),

@@ -152,12 +152,14 @@ Return ONLY a JSON object with this exact shape:
     "tldr": ["3-6 short, specific bullet takeaways of the whole call"],
     "sections": [ { "title": "Short topic heading", "points": ["specific bullet", "..."] } ],
     "nextSteps": ["concrete agreed next step", "..."]
-  }
+  },
+  "outcome": "<exactly one of the provided outcome labels, or null>"
 }
 
 Rules:
 - The sales rep / agent works for the company making the call; the other person is the prospect/lead. Use the provided rep and contact names to label speakers; fall back to first names heard in the transcript, else "Speaker A"/"Speaker B".
 - Summary must be specific and useful (names, numbers, commitments, objections). 3-6 tldr bullets; 2-5 sections; include nextSteps only if a next step was agreed.
+- "outcome": classify the call as EXACTLY one of the outcome labels provided in the user message (verbatim). If the call had no real conversation (voicemail, no answer, noise), pick the label that means "no clear outcome"/"conversation incomplete" if present, else null.
 - If the transcript is empty or just noise, return tldr: ["No meaningful conversation captured."], sections: [], and omit nextSteps.
 - Only include "segmentSpeakers" when explicitly asked (single-channel transcripts). Output JSON only, no markdown.`;
 
@@ -166,17 +168,21 @@ interface Analysis {
   speakerRoles: Record<string, "rep" | "prospect" | "other">;
   segmentSpeakers?: string[];
   summary: CallSummaryStructured;
+  outcome?: string | null;
 }
 
 async function analyze(
   client: OpenAI,
   body: string,
-  ctx: { repName: string; contactName: string; direction: string; needSegmentSpeakers: boolean },
+  ctx: { repName: string; contactName: string; direction: string; needSegmentSpeakers: boolean; outcomeLabels: string[] },
 ): Promise<Analysis | null> {
   const meta = `Rep/agent on this call: ${ctx.repName || "unknown"}. Prospect/contact: ${ctx.contactName || "unknown"}. Direction: ${ctx.direction}.`;
   const ask = ctx.needSegmentSpeakers
     ? `The transcript below is a single channel — assign a speaker (A or B) to EACH numbered line via "segmentSpeakers" (one entry per line, in order).`
     : `Each line is already labelled with its speaker (A or B). Do NOT return "segmentSpeakers".`;
+  const outcomeAsk = ctx.outcomeLabels.length
+    ? `\nOutcome labels (choose exactly one for "outcome", verbatim): ${ctx.outcomeLabels.map((l) => `"${l}"`).join(", ")}.`
+    : `\nNo outcome labels available — set "outcome" to null.`;
   try {
     const completion = await client.chat.completions.create({
       model: SUMMARY_MODEL,
@@ -185,7 +191,7 @@ async function analyze(
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: ANALYSIS_SYSTEM },
-        { role: "user", content: `${meta}\n${ask}\n\nTranscript:\n${body}` },
+        { role: "user", content: `${meta}\n${ask}${outcomeAsk}\n\nTranscript:\n${body}` },
       ],
     });
     const parsed = JSON.parse(completion.choices[0]?.message?.content || "{}") as Partial<Analysis>;
@@ -194,6 +200,7 @@ async function analyze(
       speakerNames: parsed.speakerNames || {},
       speakerRoles: parsed.speakerRoles || {},
       segmentSpeakers: parsed.segmentSpeakers,
+      outcome: typeof parsed.outcome === "string" ? parsed.outcome : null,
       summary: {
         tldr: Array.isArray(parsed.summary.tldr) ? parsed.summary.tldr : [],
         sections: Array.isArray(parsed.summary.sections) ? parsed.summary.sections : [],
@@ -243,6 +250,11 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
   const contactName = record?.contactName || "";
   const direction = record?.direction || "outbound";
 
+  // The org's outcome label set — the AI classifies the call into one of these.
+  const { getCallOutcomes } = await import("./call-outcomes");
+  const outcomes = record?.organizationId ? await getCallOutcomes(record.organizationId) : [];
+  const outcomeLabels = outcomes.map((o) => o.label);
+
   const client = new OpenAI({ apiKey });
   const wavUrl = recordingUrl.replace(/\.mp3($|\?)/i, ".wav$1");
 
@@ -254,7 +266,7 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
   if (dual && dual.length > 0) {
     segments = dual.map((d) => ({ speaker: d.speaker, start: d.seg.start, end: d.seg.end, text: d.seg.text }));
     const body = segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
-    analysis = await analyze(client, body, { repName, contactName, direction, needSegmentSpeakers: false });
+    analysis = await analyze(client, body, { repName, contactName, direction, needSegmentSpeakers: false, outcomeLabels });
   } else {
     // ── Fallback: single (mixed) channel → transcribe the mp3, LLM diarizes ──
     const mp3 = await fetchMedia(recordingUrl);
@@ -262,7 +274,7 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
       const raw = await transcribeSegments(client, mp3, "call.mp3", "audio/mpeg");
       if (raw.length > 0) {
         const numbered = raw.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
-        analysis = await analyze(client, numbered, { repName, contactName, direction, needSegmentSpeakers: true });
+        analysis = await analyze(client, numbered, { repName, contactName, direction, needSegmentSpeakers: true, outcomeLabels });
         const speakerForIdx = analysis?.segmentSpeakers || [];
         segments = raw.map((s, i) => ({
           speaker: speakerForIdx[i] === "B" ? "B" : "A",
@@ -292,6 +304,13 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
   };
   const summary = summaryStructured.tldr.join(" ") || (transcript ? "" : "No speech was detected in this recording.");
 
+  // Map the AI's chosen outcome label → its key. Never overwrite a manual choice.
+  let outcomeUpdate: { outcome: string } | Record<string, never> = {};
+  if (!record?.outcomeManual && analysis?.outcome) {
+    const match = outcomes.find((o) => o.label.toLowerCase() === analysis!.outcome!.trim().toLowerCase());
+    if (match) outcomeUpdate = { outcome: match.key };
+  }
+
   await db
     .update(callRecords)
     .set({
@@ -300,6 +319,7 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
       transcriptSegments: segments.length > 0 ? segments : null,
       speakers: speakers.length > 0 ? speakers : null,
       summaryStructured: analysis ? summaryStructured : null,
+      ...outcomeUpdate,
     })
     .where(eq(callRecords.id, callRecordId));
 
