@@ -13,6 +13,9 @@ export const phoneLines = pgTable("phone_lines", {
   countryCode: text("country_code").notNull(),
   type: text("type").notNull(), // "local" | "toll-free" | "mobile"
   status: text("status").notNull().default("active"),
+  // US local-presence indexing — area code + 2-letter state of the number.
+  areaCode: text("area_code"),
+  usState: text("us_state"),
   assignedTo: text("assigned_to"),
   assignedToName: text("assigned_to_name"),
   monthlyCost: real("monthly_cost").notNull().default(1.15),

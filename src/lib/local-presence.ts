@@ -1,9 +1,11 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, sql, count } from "drizzle-orm";
+import twilioSdk from "twilio";
 import { db } from "../db/index";
 import { phoneLines } from "../db/schema/phone-lines";
 import { callRecords } from "../db/schema/call-records";
 import { getSetting, upsertSetting } from "./settings-service";
-import { areaInfoOf } from "./us-area-codes";
+import { createId, ApiError } from "./helpers";
+import { areaInfoOf, stateOfAreaCode, AREA_CODES } from "./us-area-codes";
 
 export interface LocalPresenceConfig {
   /** Master switch — when off, calls use the rep's selected/assigned line. */
@@ -56,6 +58,7 @@ interface OwnedLine {
   number: string;
   areaCode: string | null;
   state: string;
+  stateName: string;
   timezone: string;
 }
 
@@ -69,7 +72,7 @@ export async function ownedUsLines(orgId: string): Promise<OwnedLine[]> {
     .filter((r) => r.type !== "toll-free")
     .map((r) => {
       const info = areaInfoOf(r.number);
-      return info ? { id: r.id, number: r.number, areaCode: digits(r.number).slice(-10, -7) || null, state: info.state, timezone: info.timezone } : null;
+      return info ? { id: r.id, number: r.number, areaCode: digits(r.number).slice(-10, -7) || null, state: info.state, stateName: info.stateName, timezone: info.timezone } : null;
     })
     .filter((x): x is OwnedLine => x !== null);
 }
@@ -131,4 +134,70 @@ export async function pickCallerLine(orgId: string, toNumber: string): Promise<P
   const best = ranked[0];
   if (!best) return null;
   return { lineId: best.l.id, number: best.l.number, state: best.l.state ?? dest.state, source: "match" };
+}
+
+const twilio = () => twilioSdk(process.env.TWILIO_ACCOUNT_SID!, process.env.TWILIO_AUTH_TOKEN!);
+
+/** First area code we own a number in, for a given US state (else any code in
+ *  the state). Used so "buy for state TX" picks a sensible area code. */
+function pickAreaCodeForState(state: string): string | null {
+  const entry = Object.entries(AREA_CODES).find(([, info]) => info.state === state);
+  return entry ? entry[0] : null;
+}
+
+/** Buy a local US number for an area code (or state) and store it as a line.
+ *  Enforces the org's maxNumbers ceiling. Throws ApiError on no availability /
+ *  cap reached. */
+export async function provisionLocalNumber(
+  orgId: string,
+  opts: { areaCode?: string; state?: string },
+): Promise<{ id: string; number: string; areaCode: string; state: string }> {
+  const cfg = await getLocalPresenceConfig(orgId);
+  const [{ owned }] = await db.select({ owned: count() }).from(phoneLines).where(eq(phoneLines.organizationId, orgId));
+  if (Number(owned) >= cfg.maxNumbers) {
+    throw new ApiError(403, `Number limit reached (${cfg.maxNumbers}). Raise the cap in local-presence settings to add more.`);
+  }
+
+  let areaCode = (opts.areaCode || "").replace(/[^\d]/g, "").slice(0, 3);
+  if (!areaCode && opts.state) areaCode = pickAreaCodeForState(opts.state) || "";
+  const info = areaCode ? stateOfAreaCode(areaCode) : null;
+  if (!areaCode || !info) throw new ApiError(400, "A valid US area code or state is required.");
+
+  const client = twilio();
+  const available = await client.availablePhoneNumbers("US").local.list({ areaCode: parseInt(areaCode, 10), limit: 1 });
+  // Fall back to any number in the same state if the exact area code is dry.
+  let chosen = available[0]?.phoneNumber;
+  if (!chosen) {
+    const inState = await client.availablePhoneNumbers("US").local.list({ inRegion: info.state, limit: 1 });
+    chosen = inState[0]?.phoneNumber;
+  }
+  if (!chosen) throw new ApiError(409, `No numbers available for ${info.stateName} (${areaCode}). Try another area code.`);
+
+  const bought = await client.incomingPhoneNumbers.create({
+    phoneNumber: chosen,
+    friendlyName: `Local · ${info.state} ${areaCode}`,
+    voiceApplicationSid: process.env.TWILIO_TWIML_APP_SID!,
+    ...(process.env.WEBHOOK_BASE_URL
+      ? { smsUrl: `${process.env.WEBHOOK_BASE_URL}/webhooks/twilio/sms`, smsMethod: "POST" as const }
+      : {}),
+  } as any);
+
+  const id = createId("pl");
+  const realAc = (bought.phoneNumber || chosen).replace(/[^\d]/g, "").slice(-10, -7);
+  const realInfo = stateOfAreaCode(realAc) || info;
+  await db.insert(phoneLines).values({
+    id,
+    organizationId: orgId,
+    twilioSid: bought.sid,
+    number: bought.phoneNumber,
+    friendlyName: `Local · ${realInfo.state} ${realAc}`,
+    country: "United States",
+    countryCode: "US",
+    type: "local",
+    status: "active",
+    monthlyCost: 1.15,
+    areaCode: realAc,
+    usState: realInfo.state,
+  });
+  return { id, number: bought.phoneNumber, areaCode: realAc, state: realInfo.state };
 }

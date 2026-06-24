@@ -5,7 +5,13 @@ import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
-import { getLocalPresenceConfig, saveLocalPresenceConfig, pickCallerLine } from "../lib/local-presence";
+import {
+  getLocalPresenceConfig, saveLocalPresenceConfig, pickCallerLine,
+  ownedUsLines, provisionLocalNumber,
+} from "../lib/local-presence";
+import { areaInfoOf } from "../lib/us-area-codes";
+
+const MONTHLY_COST_PER_NUMBER = 1.15;
 
 const router = Router();
 
@@ -72,6 +78,81 @@ router.post(
       return;
     }
     res.json({ data: { source: "match", callerId: picked.number, lineId: picked.lineId, state: picked.state } });
+  }),
+);
+
+// ── GET /api/calls/local-presence/coverage ─────────────────────────────
+// Owned US local numbers grouped for the coverage dashboard, + config + role.
+router.get(
+  "/calls/local-presence/coverage",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || "";
+    const lines = await ownedUsLines(orgId);
+    res.json({
+      data: {
+        lines: lines.map((l) => ({ id: l.id, number: l.number, areaCode: l.areaCode, state: l.state, stateName: l.stateName })),
+        config: await getLocalPresenceConfig(orgId),
+        isAdmin: await isOrgAdmin(userId),
+        monthlyCostPerNumber: MONTHLY_COST_PER_NUMBER,
+      },
+    });
+  }),
+);
+
+// ── POST /api/calls/coverage-scan { phones: [...] } ────────────────────
+// Diff a calling list's US states against owned numbers → uncovered states.
+// Powers the dialer pre-flight "buy local numbers?" modal.
+router.post(
+  "/calls/coverage-scan",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const phones: string[] = Array.isArray(req.body?.phones) ? req.body.phones : [];
+
+    const lines = await ownedUsLines(orgId);
+    const ownedStates = new Set(lines.map((l) => l.state));
+    const ownedByState: Record<string, number> = {};
+    for (const l of lines) ownedByState[l.state] = (ownedByState[l.state] ?? 0) + 1;
+
+    // Tally leads per US state, keeping a sample area code for provisioning.
+    const byState = new Map<string, { stateName: string; sampleAreaCode: string; leadCount: number }>();
+    for (const p of phones) {
+      const info = areaInfoOf(p);
+      if (!info) continue;
+      const ac = (p || "").replace(/[^\d]/g, "").slice(-10, -7);
+      const cur = byState.get(info.state);
+      if (cur) cur.leadCount += 1;
+      else byState.set(info.state, { stateName: info.stateName, sampleAreaCode: ac, leadCount: 1 });
+    }
+
+    const uncovered = [...byState.entries()]
+      .filter(([state]) => !ownedStates.has(state))
+      .map(([state, v]) => ({ state, stateName: v.stateName, sampleAreaCode: v.sampleAreaCode, leadCount: v.leadCount }))
+      .sort((a, b) => b.leadCount - a.leadCount);
+
+    res.json({
+      data: { uncovered, ownedByState, monthlyCostPerNumber: MONTHLY_COST_PER_NUMBER },
+    });
+  }),
+);
+
+// ── POST /api/calls/provision-local { areaCode | state } ────────────────
+// Buy one local US number (confirmed purchase). Gated to org admins unless the
+// org has set whoCanProvision = "anyone". Enforces the maxNumbers ceiling.
+router.post(
+  "/calls/provision-local",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || "";
+    const cfg = await getLocalPresenceConfig(orgId);
+    if (cfg.whoCanProvision !== "anyone" && !(await isOrgAdmin(userId))) {
+      throw new ApiError(403, "Only an admin can buy new numbers. Ask an admin to add local numbers for these states.");
+    }
+    const areaCode = req.body?.areaCode ? String(req.body.areaCode) : undefined;
+    const state = req.body?.state ? String(req.body.state) : undefined;
+    if (!areaCode && !state) throw new ApiError(400, "areaCode or state is required.");
+    const line = await provisionLocalNumber(orgId, { areaCode, state });
+    res.status(201).json({ data: line });
   }),
 );
 
