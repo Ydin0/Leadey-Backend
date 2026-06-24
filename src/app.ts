@@ -36,6 +36,7 @@ import smsRouter from "./routes/sms";
 import notificationsRouter from "./routes/notifications";
 import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts";
 import assistantRouter from "./routes/assistant";
+import callsRouter from "./routes/calls";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -110,6 +111,7 @@ app.use("/api", requireAuth(), smsRouter);
 app.use("/api", requireAuth(), notificationsRouter);
 app.use("/api", requireAuth(), emailAccountsRouter);
 app.use("/api", requireAuth(), assistantRouter);
+app.use("/api", requireAuth(), callsRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
