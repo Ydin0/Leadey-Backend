@@ -21,6 +21,51 @@ interface RawSegment {
   text: string;
 }
 
+// ── Whisper hallucination filtering ──────────────────────────────────────
+// When a channel is silent (the other party is speaking), Whisper invents
+// short filler phrases ("Bye.", "Thank you.", "you") with confident-looking
+// timestamps. We drop these using Whisper's own per-segment confidence signals
+// plus a stock-filler guard, then collapse repeats. Real speech has a low
+// no_speech_prob, so genuine short replies ("Okay.", "Yes.") survive.
+const STOCK_HALLUCINATIONS = new Set([
+  "", "you", "bye", "thank you", "thanks", "thank you.", "thanks for watching",
+  "thanks for watching!", "please subscribe", "okay", "ok", "yeah", ".", "..", "...",
+  "see you next time", "see you", "i'll see you next time",
+]);
+
+function normText(t: string): string {
+  return t.trim().toLowerCase().replace(/[.!?,]+$/g, "").trim();
+}
+
+function isProbablyHallucination(s: {
+  text: string; noSpeechProb: number; avgLogprob: number; compressionRatio: number;
+}): boolean {
+  const text = s.text.trim();
+  if (!text) return true;
+  // Confident non-speech (a silent channel) → drop.
+  if (s.noSpeechProb >= 0.6 && s.avgLogprob <= -0.4) return true;
+  // Very low decoder confidence → likely invented.
+  if (s.avgLogprob <= -1.0) return true;
+  // Highly repetitive output ("you you you", "bye bye bye").
+  if (s.compressionRatio >= 2.4) return true;
+  // Stock filler that Whisper emits over near-silence.
+  if (STOCK_HALLUCINATIONS.has(normText(text)) && s.noSpeechProb >= 0.45) return true;
+  return false;
+}
+
+/** Drop consecutive duplicate lines (same normalized text) within a channel. */
+function dedupeConsecutive(segs: RawSegment[]): RawSegment[] {
+  const out: RawSegment[] = [];
+  let prev = "";
+  for (const s of segs) {
+    const key = normText(s.text);
+    if (key && key === prev) continue;
+    prev = key;
+    out.push(s);
+  }
+  return out;
+}
+
 /** Fetch a Twilio recording media URL (Basic-auth) as a Buffer. */
 async function fetchMedia(url: string): Promise<Buffer | null> {
   const accountSid = process.env.TWILIO_ACCOUNT_SID!;
@@ -49,10 +94,28 @@ async function transcribeSegments(
     model: TRANSCRIBE_MODEL,
     response_format: "verbose_json",
     timestamp_granularities: ["segment"],
-  })) as unknown as { segments?: { start: number; end: number; text: string }[]; text?: string };
-  return (tr.segments || [])
-    .map((s) => ({ start: Number(s.start) || 0, end: Number(s.end) || 0, text: (s.text || "").trim() }))
-    .filter((s) => s.text);
+    // Greedy decode — far less prone to the random filler hallucinations
+    // Whisper produces when it samples over silence.
+    temperature: 0,
+  })) as unknown as {
+    segments?: {
+      start: number; end: number; text: string;
+      avg_logprob?: number; no_speech_prob?: number; compression_ratio?: number;
+    }[];
+    text?: string;
+  };
+  const mapped = (tr.segments || []).map((s) => ({
+    start: Number(s.start) || 0,
+    end: Number(s.end) || 0,
+    text: (s.text || "").trim(),
+    avgLogprob: Number(s.avg_logprob ?? 0),
+    noSpeechProb: Number(s.no_speech_prob ?? 0),
+    compressionRatio: Number(s.compression_ratio ?? 0),
+  }));
+  const kept = mapped
+    .filter((s) => s.text && !isProbablyHallucination(s))
+    .map((s) => ({ start: s.start, end: s.end, text: s.text }));
+  return dedupeConsecutive(kept);
 }
 
 /** Transcribe a dual-channel recording → one speaker per channel. */
