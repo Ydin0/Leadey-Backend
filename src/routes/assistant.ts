@@ -12,7 +12,7 @@ import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
 
 const router = Router();
-const ASSISTANT_MODEL = process.env.ASSISTANT_MODEL || "gpt-4o-mini";
+const ASSISTANT_MODEL = process.env.ASSISTANT_MODEL || "gpt-4o";
 
 function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => {
@@ -39,9 +39,13 @@ async function orgFunnelIds(orgId: string): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+interface ToolDef {
+  type: "function";
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+}
 const TOOLS: Record<
   string,
-  { def: OpenAI.Chat.Completions.ChatCompletionTool; run: (args: any, ctx: ToolCtx) => Promise<unknown> }
+  { def: ToolDef; run: (args: any, ctx: ToolCtx) => Promise<unknown> }
 > = {
   org_overview: {
     def: {
@@ -330,49 +334,70 @@ router.post(
 
 You help sales reps get work done: finding leads and companies, summarising campaign performance, reviewing calls, drafting outreach (emails, call openers, follow-ups), and answering questions about their workspace.
 
-Use the provided tools to pull REAL data from this organisation's workspace whenever a question depends on their leads, companies, campaigns, calls, or team. Never invent figures, names, contact details, or call outcomes — if a tool returns nothing, say so plainly. Call multiple tools if needed before answering.
+Tools you have:
+- Workspace tools (org_overview, list_campaigns, search_leads, lead_status_breakdown, get_company, recent_calls, team_performance) — use these for anything about THIS organisation's leads, companies, campaigns, calls or team. Never invent figures, names, contact details, or call outcomes — if a tool returns nothing, say so plainly.
+- web_search — you DO have live internet access. Use it to research prospects/companies, find recent news, verify facts, look up best practices, or anything not in the workspace. When you use the web, ground your answer in what you found.
+
+Use as many tools as needed (workspace + web together when useful) before answering.
 
 Style: concise and action-oriented. Lead with the answer, use short bullet points and real numbers, and suggest a concrete next step when useful. You can draft copy (emails, scripts) directly when asked. Keep responses focused — this is a chat sidebar, not an essay.`;
 
     const client = new OpenAI({ apiKey });
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: "system", content: system },
-      ...history,
-    ];
-    const tools = Object.values(TOOLS).map((t) => t.def);
     const ctx: ToolCtx = { orgId, userId };
+
+    // Responses API → hosted web_search tool runs alongside our custom,
+    // org-scoped function tools. web_search is executed by OpenAI; our function
+    // tools we execute and feed back.
+    const tools: OpenAI.Responses.Tool[] = [
+      { type: "web_search" },
+      ...Object.values(TOOLS).map((t) => ({
+        type: "function" as const,
+        name: t.def.function.name,
+        description: t.def.function.description ?? "",
+        parameters: (t.def.function.parameters ?? { type: "object", properties: {} }) as Record<string, unknown>,
+        strict: false,
+      })),
+    ];
+
+    const input: OpenAI.Responses.ResponseInputItem[] = history.map(
+      (m: { role: "user" | "assistant"; content: string }): OpenAI.Responses.ResponseInputItem =>
+        ({ role: m.role, content: m.content }),
+    );
 
     let reply = "";
     for (let i = 0; i < 6; i++) {
-      const completion = await client.chat.completions.create({
+      const resp = await client.responses.create({
         model: ASSISTANT_MODEL,
-        temperature: 0.3,
-        max_tokens: 1200,
-        messages,
+        instructions: system,
+        input,
         tools,
         tool_choice: "auto",
+        max_output_tokens: 1500,
+        temperature: 0.3,
       });
-      const msg = completion.choices[0]?.message;
-      if (!msg) break;
-      messages.push(msg);
-      if (!msg.tool_calls?.length) {
-        reply = msg.content || "";
+      const fnCalls = (resp.output || []).filter(
+        (o): o is OpenAI.Responses.ResponseFunctionToolCall => o.type === "function_call",
+      );
+      if (!fnCalls.length) {
+        reply = resp.output_text || "";
         break;
       }
-      for (const tc of msg.tool_calls) {
-        if (tc.type !== "function") continue;
-        const tool = TOOLS[tc.function.name];
+      // Carry the model's output items (incl. function_call + web_search calls)
+      // back into the input so the next turn has full context.
+      input.push(...(resp.output as unknown as OpenAI.Responses.ResponseInputItem[]));
+      for (const fc of fnCalls) {
+        const tool = TOOLS[fc.name];
         let result: unknown;
         try {
-          const parsedArgs = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
-          result = tool ? await tool.run(parsedArgs, ctx) : { error: `Unknown tool ${tc.function.name}` };
+          const args = fc.arguments ? JSON.parse(fc.arguments) : {};
+          result = tool ? await tool.run(args, ctx) : { error: `Unknown tool ${fc.name}` };
         } catch (err) {
           result = { error: err instanceof Error ? err.message : "tool failed" };
         }
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: JSON.stringify(result).slice(0, 8000),
+        input.push({
+          type: "function_call_output",
+          call_id: fc.call_id,
+          output: JSON.stringify(result).slice(0, 8000),
         });
       }
     }
