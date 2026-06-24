@@ -1,7 +1,8 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { db } from "../db/index";
 import { users } from "../db/schema/organizations";
+import { dialerSessions, dialerQueueItems } from "../db/schema/dialer";
 import { getOrgId } from "../lib/auth";
 import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
@@ -73,11 +74,27 @@ router.post(
       return;
     }
     const picked = await pickCallerLine(orgId, to);
-    if (!picked) {
-      res.json({ data: { source: "default", callerId: null, lineId: null, state: null } });
+    if (picked) {
+      res.json({ data: { source: "match", callerId: picked.number, lineId: picked.lineId, state: picked.state } });
       return;
     }
-    res.json({ data: { source: "match", callerId: picked.number, lineId: picked.lineId, state: picked.state } });
+    // No owned number matched. Tell the client whether this is a US state we
+    // *could* cover (so it can offer a one-off buy on a manual dial).
+    const dest = areaInfoOf(to);
+    const userId = getAuth(req)?.userId || "";
+    const canProvision = cfg.whoCanProvision === "anyone" || (await isOrgAdmin(userId));
+    res.json({
+      data: {
+        source: "default",
+        callerId: null,
+        lineId: null,
+        state: dest?.state ?? null,
+        usUncovered: !!dest,
+        stateName: dest?.stateName ?? null,
+        areaCode: dest ? to.replace(/[^\d]/g, "").slice(-10, -7) : null,
+        canProvision,
+      },
+    });
   }),
 );
 
@@ -107,7 +124,24 @@ router.post(
   "/calls/coverage-scan",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const phones: string[] = Array.isArray(req.body?.phones) ? req.body.phones : [];
+    let phones: string[] = Array.isArray(req.body?.phones) ? req.body.phones : [];
+
+    // sessionId mode: pull the phones from a dialer session's queue (org-scoped).
+    const sessionId = req.body?.sessionId ? String(req.body.sessionId) : null;
+    if (sessionId) {
+      const [sess] = await db
+        .select({ id: dialerSessions.id })
+        .from(dialerSessions)
+        .where(and(eq(dialerSessions.id, sessionId), eq(dialerSessions.organizationId, orgId)))
+        .limit(1);
+      if (sess) {
+        const items = await db
+          .select({ phone: dialerQueueItems.leadPhone })
+          .from(dialerQueueItems)
+          .where(eq(dialerQueueItems.sessionId, sessionId));
+        phones = items.map((i) => i.phone).filter(Boolean);
+      }
+    }
 
     const lines = await ownedUsLines(orgId);
     const ownedStates = new Set(lines.map((l) => l.state));
