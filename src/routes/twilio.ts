@@ -233,8 +233,39 @@ webhookRouter.post(
     // amdStatusCallback. The dialer uses that to auto-drop a voicemail.
     // "DetectMessageEnd" waits for the beep before firing — slightly slower
     // than "Enable" but lets us play the VM at the right moment.
+    // Caller-ID ownership guard: the browser may pass any CallerId, but we must
+    // only ever present a number this org actually owns (legal + STIR/SHAKEN).
+    // Validate against the org's lines; if it's not owned, fall back to the
+    // rep's assigned line, else the org's first line.
+    let safeCallerId: string | undefined = callerId || from || undefined;
+    if (isFromBrowser && callerId) {
+      try {
+        const { db } = await import("../db");
+        const { phoneLines } = await import("../db/schema/phone-lines");
+        const { users } = await import("../db/schema/organizations");
+        const { eq: e } = await import("drizzle-orm");
+        const userId = from!.slice("client:".length);
+        const [u] = await db.select({ orgId: users.organizationId }).from(users).where(e(users.id, userId)).limit(1);
+        if (u?.orgId) {
+          const lines = await db
+            .select({ number: phoneLines.number, assignedTo: phoneLines.assignedTo })
+            .from(phoneLines)
+            .where(e(phoneLines.organizationId, u.orgId));
+          const d = (s: string | null) => (s || "").replace(/[^\d]/g, "");
+          const cid = d(callerId);
+          if (!lines.some((l) => d(l.number) === cid)) {
+            const fb = lines.find((l) => l.assignedTo === userId) || lines[0];
+            safeCallerId = fb?.number;
+            console.warn("[Twilio Voice] CallerId not owned by org — falling back to an owned line.");
+          }
+        }
+      } catch (err) {
+        console.error("[Twilio Voice] caller-id validation failed:", err);
+      }
+    }
+
     const dialOptions: Record<string, unknown> = {
-      callerId: callerId || from || undefined,
+      callerId: safeCallerId,
       record: "record-from-answer-dual",
       recordingStatusCallback: recordingCallback,
       recordingStatusCallbackEvent: "completed",

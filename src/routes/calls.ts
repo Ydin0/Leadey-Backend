@@ -7,7 +7,7 @@ import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
 import {
   getLocalPresenceConfig, saveLocalPresenceConfig, pickCallerLine,
-  ownedUsLines, provisionLocalNumber,
+  ownedUsLines, provisionLocalNumber, reclaimUnusedLocalNumbers,
 } from "../lib/local-presence";
 import { areaInfoOf } from "../lib/us-area-codes";
 
@@ -153,6 +153,20 @@ router.post(
     if (!areaCode && !state) throw new ApiError(400, "areaCode or state is required.");
     const line = await provisionLocalNumber(orgId, { areaCode, state });
     res.status(201).json({ data: line });
+  }),
+);
+
+// ── POST /api/calls/local-presence/reclaim { days? } (admin only) ───────
+// Release auto-provisioned local numbers unused for `days` (default 30).
+router.post(
+  "/calls/local-presence/reclaim",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || "";
+    if (!(await isOrgAdmin(userId))) throw new ApiError(403, "Only an admin can release numbers.");
+    const days = Math.max(1, Math.floor(Number(req.body?.days) || 30));
+    const result = await reclaimUnusedLocalNumbers(orgId, days);
+    res.json({ data: result });
   }),
 );
 

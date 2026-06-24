@@ -1,4 +1,4 @@
-import { and, eq, gte, sql, count } from "drizzle-orm";
+import { and, eq, gte, sql, count, isNull, isNotNull, lt } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db/index";
 import { phoneLines } from "../db/schema/phone-lines";
@@ -200,4 +200,57 @@ export async function provisionLocalNumber(
     usState: realInfo.state,
   });
   return { id, number: bought.phoneNumber, areaCode: realAc, state: realInfo.state };
+}
+
+/**
+ * Release auto-provisioned local-presence numbers (those carrying usState, and
+ * not assigned to a rep) that are older than `days` and have had zero outbound
+ * calls in that window — so numbers bought for a one-off list don't accrue cost
+ * forever. Returns the released numbers. Best-effort per number.
+ */
+export async function reclaimUnusedLocalNumbers(
+  orgId: string,
+  days = 30,
+): Promise<{ released: string[]; checked: number }> {
+  const cutoff = new Date(Date.now() - days * 86400000);
+  const candidates = await db
+    .select({ id: phoneLines.id, number: phoneLines.number, twilioSid: phoneLines.twilioSid })
+    .from(phoneLines)
+    .where(
+      and(
+        eq(phoneLines.organizationId, orgId),
+        eq(phoneLines.status, "active"),
+        isNotNull(phoneLines.usState), // only local-presence-provisioned numbers
+        isNull(phoneLines.assignedTo), // never reclaim a rep's assigned line
+        lt(phoneLines.createdAt, cutoff),
+      ),
+    );
+  if (!candidates.length) return { released: [], checked: 0 };
+
+  const counts = await todayCountSince(orgId, cutoff);
+  const client = twilio();
+  const released: string[] = [];
+  for (const c of candidates) {
+    if ((counts.get(digits(c.number)) ?? 0) > 0) continue; // used recently — keep
+    try {
+      await client.incomingPhoneNumbers(c.twilioSid).remove();
+    } catch {
+      /* already gone on Twilio — still drop our row */
+    }
+    await db.delete(phoneLines).where(eq(phoneLines.id, c.id));
+    released.push(c.number);
+  }
+  return { released, checked: candidates.length };
+}
+
+/** Outbound call count per number since a cutoff (org-scoped). */
+async function todayCountSince(orgId: string, since: Date): Promise<Map<string, number>> {
+  const rows = await db
+    .select({ from: callRecords.fromNumber, n: sql<number>`count(*)::int` })
+    .from(callRecords)
+    .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound"), gte(callRecords.calledAt, since)))
+    .groupBy(callRecords.fromNumber);
+  const map = new Map<string, number>();
+  for (const r of rows) map.set(digits(r.from), Number(r.n));
+  return map;
 }
