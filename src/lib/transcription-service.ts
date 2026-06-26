@@ -42,15 +42,27 @@ function isProbablyHallucination(s: {
 }): boolean {
   const text = s.text.trim();
   if (!text) return true;
-  // Confident non-speech (a silent channel) → drop.
-  if (s.noSpeechProb >= 0.6 && s.avgLogprob <= -0.4) return true;
-  // Very low decoder confidence → likely invented.
-  if (s.avgLogprob <= -1.0) return true;
+  // Confident non-speech (a truly silent channel). Telephony speech can carry a
+  // moderate no_speech_prob, so only drop when it's *very* confident silence.
+  if (s.noSpeechProb >= 0.85 && s.avgLogprob <= -0.5) return true;
+  // Extremely low decoder confidence → likely invented. (Telephony speech sits
+  // around -0.6…-1.2, so keep that; only drop the clearly-garbage tail.)
+  if (s.avgLogprob <= -1.6) return true;
   // Highly repetitive output ("you you you", "bye bye bye").
   if (s.compressionRatio >= 2.4) return true;
-  // Stock filler that Whisper emits over near-silence.
-  if (STOCK_HALLUCINATIONS.has(normText(text)) && s.noSpeechProb >= 0.45) return true;
+  // Stock filler Whisper emits over near-silence (only when it also looks like
+  // non-speech, so a real "Okay."/"Yeah." mid-conversation survives).
+  if (STOCK_HALLUCINATIONS.has(normText(text)) && s.noSpeechProb >= 0.6) return true;
   return false;
+}
+
+/** Conservative pass used as a safety net: only the unambiguous hallucinations
+ *  (exact stock filler, or heavy repetition) — never confidence-based. */
+function isClearHallucination(s: { text: string; compressionRatio: number }): boolean {
+  const t = normText(s.text);
+  if (!t) return true;
+  if (s.compressionRatio >= 2.6) return true;
+  return STOCK_HALLUCINATIONS.has(t);
 }
 
 /** Drop consecutive duplicate lines (same normalized text) within a channel. */
@@ -112,10 +124,16 @@ async function transcribeSegments(
     noSpeechProb: Number(s.no_speech_prob ?? 0),
     compressionRatio: Number(s.compression_ratio ?? 0),
   }));
-  const kept = mapped
-    .filter((s) => s.text && !isProbablyHallucination(s))
-    .map((s) => ({ start: s.start, end: s.end, text: s.text }));
-  return dedupeConsecutive(kept);
+  const withText = mapped.filter((s) => s.text);
+  let kept = withText.filter((s) => !isProbablyHallucination(s));
+  // Safety net: never let the confidence filter empty a channel that actually
+  // had transcribed speech (quiet/telephony channels can trip every threshold).
+  // Fall back to dropping only the unambiguous hallucinations.
+  if (kept.length === 0 && withText.length > 0) {
+    kept = withText.filter((s) => !isClearHallucination(s));
+  }
+  console.log(`[Transcription] ${filename}: ${mapped.length} raw → ${kept.length} kept segments`);
+  return dedupeConsecutive(kept.map((s) => ({ start: s.start, end: s.end, text: s.text })));
 }
 
 /** Transcribe a dual-channel recording → one speaker per channel. */
@@ -124,10 +142,17 @@ async function transcribeDualChannel(
   wavUrl: string,
 ): Promise<{ speaker: string; seg: RawSegment }[] | null> {
   const wav = await fetchMedia(wavUrl);
-  if (!wav) return null;
+  if (!wav) {
+    console.warn("[Transcription] dual: could not fetch .wav — will fall back to mixed mp3");
+    return null;
+  }
   const split = splitStereoWav(wav);
-  if (!split) return null;
+  if (!split) {
+    console.warn(`[Transcription] dual: recording is not 2-channel PCM (wav ${wav.length}B) — falling back to mixed mp3`);
+    return null;
+  }
   if (split.left.length > MAX_AUDIO_BYTES || split.right.length > MAX_AUDIO_BYTES) return null;
+  console.log(`[Transcription] dual channels: A=${split.left.length}B B=${split.right.length}B @ ${split.sampleRate}Hz`);
 
   const [leftSegs, rightSegs] = await Promise.all([
     transcribeSegments(client, split.left, "channel-a.wav", "audio/wav"),
@@ -178,7 +203,7 @@ async function analyze(
 ): Promise<Analysis | null> {
   const meta = `Rep/agent on this call: ${ctx.repName || "unknown"}. Prospect/contact: ${ctx.contactName || "unknown"}. Direction: ${ctx.direction}.`;
   const ask = ctx.needSegmentSpeakers
-    ? `The transcript below is a single channel — assign a speaker (A or B) to EACH numbered line via "segmentSpeakers" (one entry per line, in order).`
+    ? `The transcript below is a SINGLE mixed channel containing BOTH people. Diarize it: assign a speaker (A = the rep/agent, B = the prospect/contact) to EACH numbered line via "segmentSpeakers" (one entry per line, in order). This is a two-way conversation — it must NOT be one speaker the whole time. Use turn-taking, questions vs answers, and the rep/contact names to attribute lines; the caller usually opens, the other person responds. If genuinely unsure on a line, alternate from the previous speaker rather than repeating.`
     : `Each line is already labelled with its speaker (A or B). Do NOT return "segmentSpeakers".`;
   const outcomeAsk = ctx.outcomeLabels.length
     ? `\nOutcome labels (choose exactly one for "outcome", verbatim): ${ctx.outcomeLabels.map((l) => `"${l}"`).join(", ")}.`
@@ -261,28 +286,49 @@ export async function transcribeAndSummarize(callRecordId: string, recordingUrl:
   let segments: TranscriptSegment[] = [];
   let analysis: Analysis | null = null;
 
+  // The mixed (single-stream) path: transcribe the mp3 and let the LLM split
+  // speakers. Used when there's no usable stereo recording, OR as a fallback
+  // when dual-channel collapses to a single speaker (a quiet/empty channel).
+  const runMixed = async (): Promise<boolean> => {
+    const mp3 = await fetchMedia(recordingUrl);
+    if (!mp3) return false;
+    const raw = await transcribeSegments(client, mp3, "call.mp3", "audio/mpeg");
+    if (raw.length === 0) return false;
+    const numbered = raw.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
+    analysis = await analyze(client, numbered, { repName, contactName, direction, needSegmentSpeakers: true, outcomeLabels });
+    const speakerForIdx = analysis?.segmentSpeakers || [];
+    segments = raw.map((s, i) => ({
+      speaker: speakerForIdx[i] === "B" ? "B" : "A",
+      start: s.start,
+      end: s.end,
+      text: s.text,
+    }));
+    return segments.length > 0;
+  };
+
   // ── Preferred path: dual-channel → one speaker per channel ──
   const dual = await transcribeDualChannel(client, wavUrl);
-  if (dual && dual.length > 0) {
+  const dualSpeakers = dual ? new Set(dual.map((d) => d.speaker)).size : 0;
+  // Trust dual only when BOTH parties produced speech. A 2-party call (≳15s)
+  // that came back one-sided means a channel was empty/over-filtered — recover
+  // both sides from the mixed audio instead of dropping the prospect.
+  const dualCollapsed = !!dual && dual.length > 0 && dualSpeakers < 2 && (record?.duration ?? 0) >= 15;
+
+  if (dual && dual.length > 0 && !dualCollapsed) {
     segments = dual.map((d) => ({ speaker: d.speaker, start: d.seg.start, end: d.seg.end, text: d.seg.text }));
     const body = segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
     analysis = await analyze(client, body, { repName, contactName, direction, needSegmentSpeakers: false, outcomeLabels });
   } else {
-    // ── Fallback: single (mixed) channel → transcribe the mp3, LLM diarizes ──
-    const mp3 = await fetchMedia(recordingUrl);
-    if (mp3) {
-      const raw = await transcribeSegments(client, mp3, "call.mp3", "audio/mpeg");
-      if (raw.length > 0) {
-        const numbered = raw.map((s, i) => `${i + 1}. ${s.text}`).join("\n");
-        analysis = await analyze(client, numbered, { repName, contactName, direction, needSegmentSpeakers: true, outcomeLabels });
-        const speakerForIdx = analysis?.segmentSpeakers || [];
-        segments = raw.map((s, i) => ({
-          speaker: speakerForIdx[i] === "B" ? "B" : "A",
-          start: s.start,
-          end: s.end,
-          text: s.text,
-        }));
-      }
+    if (dualCollapsed) {
+      console.warn(`[Transcription] ${callRecordId}: dual-channel collapsed to ${dualSpeakers} speaker(s) on a ${record?.duration}s call — falling back to mixed-audio diarization`);
+    }
+    const ok = await runMixed();
+    // If the mix produced nothing usable but we did have a one-sided dual
+    // result, keep that rather than an empty transcript.
+    if (!ok && dual && dual.length > 0) {
+      segments = dual.map((d) => ({ speaker: d.speaker, start: d.seg.start, end: d.seg.end, text: d.seg.text }));
+      const body = segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
+      analysis = await analyze(client, body, { repName, contactName, direction, needSegmentSpeakers: false, outcomeLabels });
     }
   }
 
