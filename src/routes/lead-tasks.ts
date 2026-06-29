@@ -8,13 +8,14 @@ import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { getUserRole } from "../lib/permissions";
+import { getTaskCategories, saveTaskCategories } from "../lib/task-categories";
 import { ApiError, createId } from "../lib/helpers";
 
-const TASK_CATEGORIES = new Set(["follow_up", "call_back", "email", "reminder", "general"]);
+// Categories are org-configurable now, so accept any non-empty key (slugified).
 function normalizeCategory(raw: unknown): string | undefined {
   if (raw === undefined) return undefined;
-  const c = String(raw || "").trim();
-  return TASK_CATEGORIES.has(c) ? c : "general";
+  const c = String(raw || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return c || undefined;
 }
 
 const router = Router();
@@ -211,6 +212,24 @@ router.patch(
       .where(eq(leadTasks.id, taskId))
       .returning();
     res.json({ data: serializeTask(updated, await resolveAssigneeName(updated.assigneeId)) });
+  }),
+);
+
+// ─── GET /task-categories ───────────────────────────────────────────
+router.get(
+  "/task-categories",
+  asyncHandler(async (req, res) => {
+    res.json({ data: await getTaskCategories(getOrgId(req)) });
+  }),
+);
+
+// ─── PUT /task-categories ───────────────────────────────────────────
+router.put(
+  "/task-categories",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const input = Array.isArray(req.body?.categories) ? req.body.categories : req.body;
+    res.json({ data: await saveTaskCategories(orgId, input) });
   }),
 );
 
