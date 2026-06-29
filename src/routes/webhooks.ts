@@ -9,7 +9,9 @@ import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
 import { organizations, users } from "../db/schema/organizations";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
+import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { createId, scoreLead } from "../lib/helpers";
+import crypto from "crypto";
 import { setLeadCustomFields } from "../lib/custom-fields-service";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
@@ -746,6 +748,102 @@ router.post("/twilio/dial-status", async (req: Request, res: Response) => {
       );
     } catch (err) {
       console.error("[Twilio Dial Status] Error:", err);
+    }
+  })();
+});
+
+// ─── POST /webhooks/calendly/:accountId ──────────────────────────────────
+// Calendly invitee.created / invitee.canceled. The URL is account-scoped so we
+// know which account's signing key to verify with. Body is RAW (express.raw),
+// for signature verification.
+function verifyCalendlySignature(header: string, raw: Buffer, signingKey: string): boolean {
+  // Header format: "t=<unix>,v1=<hex hmac of `${t}.${rawBody}`>"
+  const parts = Object.fromEntries((header || "").split(",").map((p) => p.split("=").map((s) => s.trim()) as [string, string]));
+  const t = parts.t;
+  const v1 = parts.v1;
+  if (!t || !v1) return false;
+  const expected = crypto.createHmac("sha256", signingKey).update(`${t}.${raw.toString("utf8")}`).digest("hex");
+  const a = Buffer.from(v1);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+router.post("/calendly/:accountId", async (req: Request, res: Response) => {
+  const accountId = req.params.accountId as string;
+  const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
+  res.status(200).send("OK"); // ACK fast; process async
+
+  void (async () => {
+    try {
+      const [acct] = await db.select().from(calendlyAccounts).where(eq(calendlyAccounts.id, accountId));
+      if (!acct?.webhookSigningKey) return;
+      const sig = req.header("Calendly-Webhook-Signature") || "";
+      if (!verifyCalendlySignature(sig, raw, acct.webhookSigningKey)) {
+        console.warn(`[Calendly webhook] bad signature for account ${accountId}`);
+        return;
+      }
+
+      const evt = JSON.parse(raw.toString("utf8")) as Record<string, any>;
+      const kind = evt?.event as string;
+      const p = (evt?.payload || {}) as Record<string, any>;
+      const sched = (p.scheduled_event || {}) as Record<string, any>;
+      const inviteeEmail = String(p.email || "").trim().toLowerCase();
+      const inviteeName = String(p.name || "").trim();
+      const eventUri = String(sched.uri || p.uri || p.event || createId("cevt"));
+      const title = String(sched.name || "Meeting");
+      const startTime = sched.start_time ? new Date(sched.start_time) : null;
+      const endTime = sched.end_time ? new Date(sched.end_time) : null;
+      const joinUrl = sched.location?.join_url || p.cancel_url || null;
+      const status = kind === "invitee.canceled" ? "canceled" : "scheduled";
+
+      // Match to a lead by email within the org.
+      let leadId: string | null = null;
+      let funnelId: string | null = null;
+      if (inviteeEmail) {
+        const [lead] = await db
+          .select({ id: leads.id, funnelId: leads.funnelId })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.organizationId, acct.organizationId), sql`lower(${leads.email}) = ${inviteeEmail}`))
+          .limit(1);
+        if (lead) { leadId = lead.id; funnelId = lead.funnelId; }
+      }
+
+      // Upsert the meeting (by Calendly event uri).
+      const mvals = {
+        organizationId: acct.organizationId, userId: acct.userId, calendlyEventUri: eventUri,
+        inviteeEmail, inviteeName, title, startTime, endTime, joinUrl, status, leadId,
+      };
+      const [existing] = await db.select({ id: calendlyMeetings.id }).from(calendlyMeetings).where(eq(calendlyMeetings.calendlyEventUri, eventUri));
+      if (existing) await db.update(calendlyMeetings).set(mvals).where(eq(calendlyMeetings.id, existing.id));
+      else await db.insert(calendlyMeetings).values({ id: createId("cmtg"), ...mvals });
+
+      // Matched → drop a timeline event + notify the rep.
+      if (leadId) {
+        await db.insert(leadEvents).values({
+          id: createId("event"),
+          leadId,
+          type: status === "canceled" ? "meeting_canceled" : "meeting_scheduled",
+          outcome: status,
+          stepIndex: 0,
+          meta: { channel: "calendly", title, startTime: startTime?.toISOString() || null, joinUrl, inviteeEmail },
+          timestamp: new Date(),
+        });
+        try {
+          const { createNotification } = await import("./notifications");
+          await createNotification({
+            orgId: acct.organizationId,
+            userId: acct.userId,
+            type: "meeting",
+            title: status === "canceled" ? "Meeting canceled" : "Meeting booked",
+            body: `${title}${startTime ? ` · ${startTime.toLocaleString()}` : ""}`,
+            leadId,
+            funnelId,
+          });
+        } catch { /* non-fatal */ }
+      }
+    } catch (err) {
+      console.error("[Calendly webhook] error:", err);
     }
   })();
 });

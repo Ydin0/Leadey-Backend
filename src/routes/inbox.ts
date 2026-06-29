@@ -1,13 +1,14 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, gte, lt, or, isNull, inArray, desc } from "drizzle-orm";
+import { eq, and, gte, lt, or, isNull, inArray, desc, sql } from "drizzle-orm";
 import { db } from "../db";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
-import { leads } from "../db/schema/leads";
+import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { masterContacts } from "../db/schema/master";
+import { calendlyMeetings } from "../db/schema/calendly";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 
@@ -186,19 +187,40 @@ async function potentialContacts(orgId: string) {
       )),
   ]);
 
-  type PC = { phone: string; lastAt: string; calls: number; texts: number; name: string | null };
+  type PC = {
+    phone: string | null; email: string | null; name: string | null;
+    lastAt: string; calls: number; texts: number; meetings: number;
+    source: "phone" | "calendly";
+  };
   const map = new Map<string, PC>();
   const upsert = (phone: string, at: Date | null, kind: "call" | "text") => {
     const key = norm(phone) || phone;
     if (!key) return;
     let pc = map.get(key);
-    if (!pc) { pc = { phone, lastAt: (at ?? new Date()).toISOString(), calls: 0, texts: 0, name: null }; map.set(key, pc); }
+    if (!pc) { pc = { phone, email: null, name: null, lastAt: (at ?? new Date()).toISOString(), calls: 0, texts: 0, meetings: 0, source: "phone" }; map.set(key, pc); }
     if (kind === "call") pc.calls++; else pc.texts++;
     const iso = (at ?? new Date()).toISOString();
     if (iso > pc.lastAt) pc.lastAt = iso;
   };
   for (const r of callRows) upsert(r.phone, r.at, "call");
   for (const r of smsRows) upsert(r.phone, r.at, "text");
+
+  // Unknown Calendly invitees (meetings not matched to a lead), keyed by email.
+  const mtgRows = await db
+    .select({ email: calendlyMeetings.inviteeEmail, name: calendlyMeetings.inviteeName, at: calendlyMeetings.startTime, created: calendlyMeetings.createdAt })
+    .from(calendlyMeetings)
+    .where(and(eq(calendlyMeetings.organizationId, orgId), isNull(calendlyMeetings.leadId)));
+  for (const m of mtgRows) {
+    const email = (m.email || "").trim().toLowerCase();
+    if (!email) continue;
+    const key = `email:${email}`;
+    let pc = map.get(key);
+    const iso = (m.at ?? m.created ?? new Date()).toISOString();
+    if (!pc) { pc = { phone: null, email, name: m.name || null, lastAt: iso, calls: 0, texts: 0, meetings: 0, source: "calendly" }; map.set(key, pc); }
+    pc.meetings++;
+    if (!pc.name && m.name) pc.name = m.name;
+    if (iso > pc.lastAt) pc.lastAt = iso;
+  }
 
   // Enrich names from master_contacts by last-10-digit phone match.
   const list = [...map.values()];
@@ -238,8 +260,8 @@ router.post(
   "/inbox/potential-contacts/convert",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { phone, name, funnelId } = req.body as { phone?: string; name?: string; funnelId?: string };
-    if (!phone?.trim()) throw new ApiError(400, "phone required");
+    const { phone, email, name, funnelId } = req.body as { phone?: string; email?: string; name?: string; funnelId?: string };
+    if (!phone?.trim() && !email?.trim()) throw new ApiError(400, "phone or email required");
     if (!funnelId) throw new ApiError(400, "funnelId required");
 
     const [funnel] = await db
@@ -248,16 +270,39 @@ router.post(
       .where(and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)));
     if (!funnel) throw new ApiError(404, "Campaign not found");
 
+    const emailNorm = (email || "").trim().toLowerCase();
     const id = createId("lead");
     await db.insert(leads).values({
       id,
       funnelId,
-      name: name?.trim() || phone.trim(),
+      name: name?.trim() || phone?.trim() || emailNorm || "New contact",
       company: "",
-      phone: phone.trim(),
+      phone: phone?.trim() || "",
+      email: emailNorm,
       source: "Inbound",
       status: "new",
     });
+
+    // Back-link this person's unmatched Calendly meetings (by email) → set
+    // leadId + drop a meeting event on the new lead's timeline.
+    if (emailNorm) {
+      const mtgs = await db
+        .select()
+        .from(calendlyMeetings)
+        .where(and(eq(calendlyMeetings.organizationId, orgId), isNull(calendlyMeetings.leadId), sql`lower(${calendlyMeetings.inviteeEmail}) = ${emailNorm}`));
+      for (const m of mtgs) {
+        await db.update(calendlyMeetings).set({ leadId: id }).where(eq(calendlyMeetings.id, m.id));
+        await db.insert(leadEvents).values({
+          id: createId("event"),
+          leadId: id,
+          type: m.status === "canceled" ? "meeting_canceled" : "meeting_scheduled",
+          outcome: m.status,
+          stepIndex: 0,
+          meta: { channel: "calendly", title: m.title, startTime: m.startTime?.toISOString() || null, joinUrl: m.joinUrl, inviteeEmail: m.inviteeEmail },
+          timestamp: new Date(),
+        });
+      }
+    }
 
     // Re-point this org's recent unmatched inbound activity from this number.
     const key = norm(phone);

@@ -36,6 +36,7 @@ import importsRouter from "./routes/imports";
 import smsRouter from "./routes/sms";
 import notificationsRouter from "./routes/notifications";
 import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts";
+import calendlyRouter, { calendlyPublicRouter } from "./routes/calendly";
 import assistantRouter from "./routes/assistant";
 import callsRouter from "./routes/calls";
 import callOutcomesRouter from "./routes/call-outcomes";
@@ -62,6 +63,7 @@ app.use(
 // Raw body needed for webhook signature verification — must be before express.json()
 app.use("/webhooks/clerk", express.raw({ type: "application/json" }));
 app.use("/webhooks/stripe", express.raw({ type: "application/json" }));
+app.use("/webhooks/calendly", express.raw({ type: "application/json" }));
 
 // Large enough for bulk CSV lead imports (tens of thousands of rows arrive as
 // one JSON body). The frontend also trims each row to only the mapped columns.
@@ -80,6 +82,7 @@ app.use("/api/admin", requireAdmin, adminRouter);
 // Unauthenticated email routes (OAuth callback + open-tracking pixel) — must be
 // registered BEFORE the authed /api routers so they aren't gated by requireAuth.
 app.use(emailPublicRouter);
+app.use(calendlyPublicRouter);
 
 // Authenticated API routes
 app.use("/api", requireAuth(), dashboardRouter);
@@ -113,6 +116,7 @@ app.use("/api", requireAuth(), importsRouter);
 app.use("/api", requireAuth(), smsRouter);
 app.use("/api", requireAuth(), notificationsRouter);
 app.use("/api", requireAuth(), emailAccountsRouter);
+app.use("/api", requireAuth(), calendlyRouter);
 app.use("/api", requireAuth(), assistantRouter);
 app.use("/api", requireAuth(), callsRouter);
 app.use("/api", requireAuth(), callOutcomesRouter);
