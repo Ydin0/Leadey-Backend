@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, or, asc, inArray, gte, ilike } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db";
 import { leadTasks } from "../db/schema/lead-tasks";
@@ -9,6 +9,13 @@ import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { getUserRole } from "../lib/permissions";
 import { ApiError, createId } from "../lib/helpers";
+
+const TASK_CATEGORIES = new Set(["follow_up", "call_back", "email", "reminder", "general"]);
+function normalizeCategory(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  const c = String(raw || "").trim();
+  return TASK_CATEGORIES.has(c) ? c : "general";
+}
 
 const router = Router();
 
@@ -30,6 +37,7 @@ function serializeTask(t: typeof leadTasks.$inferSelect, assigneeName: string | 
     funnelId: t.funnelId,
     leadId: t.leadId,
     label: t.label,
+    category: t.category,
     dueAt: t.dueAt ? t.dueAt.toISOString() : null,
     done: t.done,
     assigneeId: t.assigneeId,
@@ -37,6 +45,19 @@ function serializeTask(t: typeof leadTasks.$inferSelect, assigneeName: string | 
     createdBy: t.createdBy,
     createdAt: t.createdAt.toISOString(),
   };
+}
+
+/** Bucket a task by its due date relative to now (matches the dashboard's
+ *  grouping so the Inbox sections line up). */
+function taskGroup(t: { done: boolean; dueAt: Date | null }): "overdue" | "today" | "upcoming" | "done" {
+  if (t.done) return "done";
+  if (!t.dueAt) return "today"; // undated open tasks surface as "today / now"
+  const now = new Date();
+  const startOfToday = new Date(now); startOfToday.setHours(0, 0, 0, 0);
+  const endOfToday = new Date(startOfToday); endOfToday.setDate(endOfToday.getDate() + 1);
+  if (t.dueAt < startOfToday) return "overdue";
+  if (t.dueAt < endOfToday) return "today";
+  return "upcoming";
 }
 
 function fullName(u: { firstName: string | null; lastName: string | null; email: string | null }): string | null {
@@ -131,10 +152,11 @@ router.post(
     const orgId = getOrgId(req);
     const { funnelId, leadId } = req.params as { funnelId: string; leadId: string };
     await assertLeadInOrg(orgId, funnelId, leadId);
-    const { label, dueAt, assigneeId: requestedAssignee } = req.body as {
+    const { label, dueAt, assigneeId: requestedAssignee, category } = req.body as {
       label?: string;
       dueAt?: string | null;
       assigneeId?: string | null;
+      category?: string;
     };
     if (!label?.trim()) throw new ApiError(400, "label required");
     const auth = getAuth(req);
@@ -146,6 +168,7 @@ router.post(
       funnelId,
       leadId,
       label: label.trim(),
+      category: normalizeCategory(category) ?? "follow_up",
       dueAt: dueAt ? new Date(dueAt) : null,
       assigneeId,
       createdBy: auth?.userId || null,
@@ -174,6 +197,7 @@ router.patch(
       updates.label = label;
     }
     if ("done" in req.body) updates.done = !!req.body.done;
+    if ("category" in req.body) updates.category = normalizeCategory(req.body.category);
     if ("dueAt" in req.body) {
       updates.dueAt = req.body.dueAt ? new Date(req.body.dueAt) : null;
     }
@@ -187,6 +211,111 @@ router.patch(
       .where(eq(leadTasks.id, taskId))
       .returning();
     res.json({ data: serializeTask(updated, await resolveAssigneeName(updated.assigneeId)) });
+  }),
+);
+
+// ─── GET /tasks ─────────────────────────────────────────────────────
+// Org-wide task list for the unified Inbox (Tasks + Reminders tabs).
+// Defaults to the current user's tasks; admins/managers can view a specific
+// member's or the whole team's (assigneeId=all). Returns every open task plus
+// recently-completed ones, each tagged with a group (overdue/today/upcoming/done)
+// and enriched with the lead/company/campaign it belongs to.
+router.get(
+  "/tasks",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    if (!userId) { res.json({ data: [] }); return; }
+    const role = await getUserRole(userId);
+    const canViewOthers = role === "admin" || role === "manager";
+
+    // Resolve whose tasks to show.
+    const requested = (req.query.assigneeId as string | undefined)?.trim();
+    let assigneeFilter: string | "all";
+    if (!canViewOthers) assigneeFilter = userId;            // reps: always self
+    else if (!requested || requested === "mine") assigneeFilter = userId;
+    else assigneeFilter = requested;                        // "all" or a member id
+
+    const category = normalizeCategory(req.query.category);
+    const status = (req.query.status as string | undefined) || "all"; // open|done|all
+    const search = (req.query.search as string | undefined)?.trim();
+    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+
+    const conditions = [eq(leadTasks.organizationId, orgId)];
+    if (assigneeFilter !== "all") conditions.push(eq(leadTasks.assigneeId, assigneeFilter));
+    if (req.query.category !== undefined && category) conditions.push(eq(leadTasks.category, category));
+    if (search) conditions.push(ilike(leadTasks.label, `%${search}%`));
+    if (status === "open") conditions.push(eq(leadTasks.done, false));
+    else if (status === "done") conditions.push(and(eq(leadTasks.done, true), gte(leadTasks.updatedAt, sixtyDaysAgo))!);
+    else conditions.push(or(eq(leadTasks.done, false), gte(leadTasks.updatedAt, sixtyDaysAgo))!); // all: open + recent done
+
+    const rows = await db
+      .select({
+        task: leadTasks,
+        assigneeFirst: users.firstName,
+        assigneeLast: users.lastName,
+        assigneeEmail: users.email,
+        leadName: leads.name,
+        leadCompany: leads.company,
+        campaignName: funnels.name,
+      })
+      .from(leadTasks)
+      .leftJoin(users, eq(users.id, leadTasks.assigneeId))
+      .leftJoin(leads, eq(leads.id, leadTasks.leadId))
+      .leftJoin(funnels, eq(funnels.id, leadTasks.funnelId))
+      .where(and(...conditions))
+      .orderBy(asc(leadTasks.done), asc(leadTasks.dueAt), asc(leadTasks.createdAt));
+
+    res.json({
+      data: rows.map((r) => ({
+        ...serializeTask(
+          r.task,
+          r.assigneeFirst || r.assigneeLast || r.assigneeEmail
+            ? fullName({ firstName: r.assigneeFirst, lastName: r.assigneeLast, email: r.assigneeEmail })
+            : null,
+        ),
+        group: taskGroup(r.task),
+        leadName: r.leadName ?? null,
+        company: r.leadCompany ?? null,
+        campaignName: r.campaignName ?? null,
+      })),
+    });
+  }),
+);
+
+// ─── POST /tasks ────────────────────────────────────────────────────
+// Create a task/reminder from the Inbox. A lead is optional (standalone
+// reminders); when a leadId is supplied its funnel is validated.
+router.post(
+  "/tasks",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const auth = getAuth(req);
+    const { label, dueAt, assigneeId: requestedAssignee, category, leadId, funnelId } = req.body as {
+      label?: string;
+      dueAt?: string | null;
+      assigneeId?: string | null;
+      category?: string;
+      leadId?: string | null;
+      funnelId?: string | null;
+    };
+    if (!label?.trim()) throw new ApiError(400, "label required");
+    if (leadId && funnelId) await assertLeadInOrg(orgId, funnelId, leadId);
+    const assigneeId = await resolveAssignee(req, orgId, requestedAssignee);
+    const id = createId("ltask");
+    await db.insert(leadTasks).values({
+      id,
+      organizationId: orgId,
+      funnelId: leadId && funnelId ? funnelId : null,
+      leadId: leadId && funnelId ? leadId : null,
+      label: label.trim(),
+      category: normalizeCategory(category) ?? "reminder",
+      dueAt: dueAt ? new Date(dueAt) : null,
+      assigneeId,
+      createdBy: auth?.userId || null,
+    });
+    const [created] = await db.select().from(leadTasks).where(eq(leadTasks.id, id));
+    res.status(201).json({ data: serializeTask(created, await resolveAssigneeName(assigneeId)) });
   }),
 );
 

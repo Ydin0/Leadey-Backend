@@ -295,6 +295,13 @@
       "when": 1782329127942,
       "tag": "0041_colossal_mongoose",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1782737647433,
+      "tag": "0042_perpetual_raza",
+      "breakpoints": true
     }
   ]
 }

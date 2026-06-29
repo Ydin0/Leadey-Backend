@@ -3,20 +3,21 @@ import { organizations } from "./organizations";
 import { funnels } from "./funnels";
 import { leads } from "./leads";
 
-/** Per-lead to-do items shown in the Lead View's Details column. Scoped to an
- *  org + funnel + lead so a rep can track follow-ups on a specific lead. */
+/** To-do items shown in the Lead View's Details column and the unified Inbox's
+ *  Tasks/Reminders tabs. Usually scoped to a lead, but funnelId/leadId are
+ *  nullable so a standalone task or reminder can be created from the Inbox
+ *  without a specific lead. */
 export const leadTasks = pgTable("lead_tasks", {
   id: text("id").primaryKey(),
   organizationId: text("organization_id")
     .notNull()
     .references(() => organizations.id, { onDelete: "cascade" }),
-  funnelId: text("funnel_id")
-    .notNull()
-    .references(() => funnels.id, { onDelete: "cascade" }),
-  leadId: text("lead_id")
-    .notNull()
-    .references(() => leads.id, { onDelete: "cascade" }),
+  funnelId: text("funnel_id").references(() => funnels.id, { onDelete: "cascade" }),
+  leadId: text("lead_id").references(() => leads.id, { onDelete: "cascade" }),
   label: text("label").notNull(),
+  /** Task kind — drives the category chip and the Reminders tab (which is just
+   *  tasks where category = 'reminder'). */
+  category: text("category").notNull().default("follow_up"),
   dueAt: timestamp("due_at", { withTimezone: true }),
   done: boolean("done").notNull().default(false),
   /** Clerk user id the task is assigned to. Members can only assign to
