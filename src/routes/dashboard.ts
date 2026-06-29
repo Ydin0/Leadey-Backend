@@ -432,7 +432,12 @@ router.get(
       .from(leadTasks)
       .innerJoin(leads, eq(leadTasks.leadId, leads.id))
       .innerJoin(funnels, eq(leadTasks.funnelId, funnels.id))
-      .where(eq(leadTasks.organizationId, orgId));
+      // Only the signed-in rep's own tasks — the dashboard is personal, not a
+      // team-wide view (that lives in the Inbox with an assignee filter).
+      .where(and(
+        eq(leadTasks.organizationId, orgId),
+        userId ? eq(leadTasks.assigneeId, userId) : sql`false`,
+      ));
 
     const tasks = taskRows
       .filter((t) => {
