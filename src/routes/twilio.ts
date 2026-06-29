@@ -156,6 +156,11 @@ webhookRouter.post(
     const webhookBase = process.env.WEBHOOK_BASE_URL;
     const recordingCallback = webhookBase ? `${webhookBase}/webhooks/twilio/recording` : undefined;
     const amdCallback = webhookBase ? `${webhookBase}/webhooks/twilio/amd` : undefined;
+    // <Dial> action callback — fires when the dialed leg ends, carrying
+    // DialCallDuration (the seconds the prospect was actually CONNECTED, not
+    // counting ringing/dialing). We use it to overwrite the call record's
+    // duration with true talk time. See /webhooks/twilio/dial-status.
+    const dialStatusCallback = webhookBase ? `${webhookBase}/webhooks/twilio/dial-status` : undefined;
 
     // ── Inbound PSTN call routing ────────────────────────────────────────
     // A call placed by a browser softphone hits this same voice URL but with
@@ -269,6 +274,9 @@ webhookRouter.post(
       record: "record-from-answer-dual",
       recordingStatusCallback: recordingCallback,
       recordingStatusCallbackEvent: "completed",
+      // Report the connected duration of the prospect leg back to us. The empty
+      // TwiML the action returns lets the parent call end as before.
+      ...(dialStatusCallback ? { action: dialStatusCallback, method: "POST" } : {}),
     };
     if (amdCallback) {
       dialOptions.machineDetection = "DetectMessageEnd";

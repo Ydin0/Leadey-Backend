@@ -690,6 +690,66 @@ router.post("/twilio/recording", async (req: Request, res: Response) => {
   })();
 });
 
+// ─── POST /webhooks/twilio/dial-status ───────────────────────────────────
+// <Dial> action callback. Fires when the dialed (prospect) leg ends. Twilio
+// sends DialCallStatus + DialCallDuration — the latter is the seconds the
+// prospect was actually CONNECTED (answer → hangup), NOT counting the
+// ringing/dialing time. We overwrite the call record's duration with it so
+// "Talk time" / "Avg call length" reflect true connected time, not the
+// browser's placement-to-hangup timer (which includes dialing).
+router.post("/twilio/dial-status", async (req: Request, res: Response) => {
+  const callSid = req.body?.CallSid as string | undefined;
+  const dialStatus = req.body?.DialCallStatus as string | undefined;
+  const dialDuration = parseInt(req.body?.DialCallDuration || "0", 10);
+
+  console.log(
+    `[Twilio Dial Status] CallSid=${callSid} DialCallStatus=${dialStatus} DialCallDuration=${dialDuration}s`,
+  );
+
+  // Return empty TwiML so the parent (rep) call ends as it did before we added
+  // the action — Twilio continues the call with whatever this returns.
+  const twiml = new twilioSdk.twiml.VoiceResponse();
+  res.type("text/xml").send(twiml.toString());
+
+  if (!callSid) return;
+
+  void (async () => {
+    try {
+      // Only connected calls have real talk time; anything else stays at 0.
+      const connectedSeconds =
+        dialStatus === "completed" && Number.isFinite(dialDuration) && dialDuration > 0
+          ? Math.min(dialDuration, 86400)
+          : 0;
+
+      // The browser logs the record at hangup; this callback can win the race,
+      // so retry to match (mirrors the recording webhook).
+      let record = await db.query.callRecords.findFirst({
+        where: eq(callRecords.twilioCallSid, callSid),
+      });
+      for (let attempt = 0; !record && attempt < 20; attempt++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        record = await db.query.callRecords.findFirst({
+          where: eq(callRecords.twilioCallSid, callSid),
+        });
+      }
+      if (!record) {
+        console.log(`[Twilio Dial Status] No call record for CallSid=${callSid} after retries`);
+        return;
+      }
+
+      await db
+        .update(callRecords)
+        .set({ duration: connectedSeconds })
+        .where(eq(callRecords.id, record.id));
+      console.log(
+        `[Twilio Dial Status] Set record ${record.id} duration → ${connectedSeconds}s (connected time)`,
+      );
+    } catch (err) {
+      console.error("[Twilio Dial Status] Error:", err);
+    }
+  })();
+});
+
 // ─── POST /webhooks/twilio/amd ───────────────────────────────────────────
 // Twilio's Answering Machine Detection result. AnsweredBy values:
 //   "human"             — a person picked up
