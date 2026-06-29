@@ -957,6 +957,13 @@ async function findNextDialable(
   session: typeof dialerSessions.$inferSelect,
 ): Promise<typeof dialerQueueItems.$inferSelect | null> {
   const orgId = session.organizationId;
+  // Serialize "pick next" across every rep in this org. Without this, two reps
+  // advancing at the same instant both read the queue before either marks a
+  // lead in_progress, so both grab the SAME lead and dial it simultaneously
+  // (the "we called the same lead at the same time" complaint). The lock is
+  // released automatically when the transaction commits.
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${orgId}))`);
+
   const f = (session.filtersJson as {
     excludeDoNotCall?: boolean;
     excludeClosed?: boolean;
@@ -1030,6 +1037,8 @@ async function findNextDialable(
   }
 
   // Leads another rep is ACTIVELY on right now — pass over (don't double-ring).
+  // Only ACTIVE sessions count: a paused/abandoned session that stepped away
+  // mid-lead must not lock that lead away from everyone else forever.
   const collidedRows = await tx
     .select({ leadId: dialerQueueItems.leadId })
     .from(dialerQueueItems)
@@ -1038,7 +1047,7 @@ async function findNextDialable(
       and(
         eq(dialerSessions.organizationId, orgId),
         sql`${dialerQueueItems.sessionId} <> ${session.id}`,
-        inArray(dialerSessions.status, ["active", "paused"]),
+        eq(dialerSessions.status, "active"),
         inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
       ),
     );
