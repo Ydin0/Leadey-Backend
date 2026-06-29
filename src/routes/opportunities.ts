@@ -671,7 +671,7 @@ router.patch(
     if (!existing) throw new ApiError(404, "Opportunity not found");
 
     const allowed = [
-      "name", "stageId", "masterCompanyId", "masterContactId", "ownerId",
+      "name", "pipelineId", "stageId", "masterCompanyId", "masterContactId", "ownerId",
       "value", "currency", "probabilityOverride", "expectedCloseDate",
       "notes", "lostReason",
     ] as const;
@@ -695,6 +695,36 @@ router.patch(
         if (k === "expectedCloseDate" && value !== existing.expectedCloseDate) {
           events.push({ type: "close_date_changed", meta: { from: existing.expectedCloseDate, to: value } });
         }
+      }
+    }
+
+    // Moving the opportunity to a different pipeline. Validate it belongs to
+    // the org, and make sure the resulting stage actually lives in that
+    // pipeline (auto-fall back to its first stage if the client didn't supply a
+    // valid one) so the deal never points at a stage from another pipeline.
+    const newPipelineId = updates.pipelineId as string | undefined;
+    if (newPipelineId && newPipelineId !== existing.pipelineId) {
+      const [p] = await db
+        .select()
+        .from(pipelines)
+        .where(and(eq(pipelines.id, newPipelineId), eq(pipelines.organizationId, orgId)));
+      if (!p) throw new ApiError(404, "Pipeline not found");
+      events.push({ type: "pipeline_changed", meta: { from: existing.pipelineId, to: newPipelineId } });
+
+      const targetStageId = (updates.stageId as string | undefined) ?? existing.stageId;
+      const [inPipeline] = await db
+        .select({ id: pipelineStages.id })
+        .from(pipelineStages)
+        .where(and(eq(pipelineStages.id, targetStageId), eq(pipelineStages.pipelineId, newPipelineId)));
+      if (!inPipeline) {
+        const [first] = await db
+          .select()
+          .from(pipelineStages)
+          .where(eq(pipelineStages.pipelineId, newPipelineId))
+          .orderBy(asc(pipelineStages.sortOrder))
+          .limit(1);
+        if (!first) throw new ApiError(400, "Target pipeline has no stages");
+        updates.stageId = first.id;
       }
     }
 
