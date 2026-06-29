@@ -13,6 +13,43 @@ import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
+const DEPARTMENTS_KEY = "team_departments";
+
+// Seeded for orgs that haven't customised yet — mirrors the legacy "pods" so
+// existing member assignments keep resolving.
+const DEFAULT_DEPARTMENTS = [
+  { name: "Enterprise", color: "#97A4D6" },
+  { name: "Mid-Market", color: "#86EFAC" },
+  { name: "SMB", color: "#6E7BCB" },
+];
+const DEPARTMENT_COLORS = [
+  "#97A4D6", "#86EFAC", "#6E7BCB", "#E0A878", "#C58FD6", "#5FB6C9", "#E08FA8", "#6FBEA8",
+];
+
+interface Department {
+  name: string;
+  color: string;
+}
+
+async function loadDepartments(orgId: string): Promise<Department[]> {
+  const raw = await getSetting(orgId, DEPARTMENTS_KEY);
+  if (!raw) return DEFAULT_DEPARTMENTS;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_DEPARTMENTS;
+    const cleaned = parsed
+      .map((d, i) => ({
+        name: typeof d?.name === "string" ? d.name.trim() : "",
+        color: typeof d?.color === "string" && /^#[0-9a-fA-F]{6}$/.test(d.color)
+          ? d.color
+          : DEPARTMENT_COLORS[i % DEPARTMENT_COLORS.length],
+      }))
+      .filter((d) => d.name.length > 0);
+    return cleaned;
+  } catch {
+    return DEFAULT_DEPARTMENTS;
+  }
+}
 
 async function loadKpiConfig(orgId: string): Promise<Record<string, unknown>> {
   const raw = await getSetting(orgId, KPI_CONFIG_KEY);
@@ -135,6 +172,46 @@ router.put(
     };
     await upsertSetting(orgId, KPI_CONFIG_KEY, JSON.stringify(config));
     res.json({ data: config });
+  }),
+);
+
+// ─── GET /team/departments ──────────────────────────────────────────
+// The org's departments (formerly "pods"). Seeded with defaults if unset.
+router.get(
+  "/team/departments",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    res.json({ data: await loadDepartments(orgId) });
+  }),
+);
+
+// ─── PUT /team/departments ──────────────────────────────────────────
+// Replace the org's department list. Body: { departments: [{name,color}] }.
+// Renaming a department here does NOT rewrite member assignments — callers
+// should update affected members' department too if they rename one.
+router.put(
+  "/team/departments",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const input = Array.isArray(req.body?.departments) ? req.body.departments : [];
+    const seen = new Set<string>();
+    const cleaned: Department[] = [];
+    for (let i = 0; i < input.length; i++) {
+      const d = input[i];
+      const name = typeof d?.name === "string" ? d.name.trim() : "";
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue; // no duplicate names
+      seen.add(key);
+      cleaned.push({
+        name,
+        color: typeof d?.color === "string" && /^#[0-9a-fA-F]{6}$/.test(d.color)
+          ? d.color
+          : DEPARTMENT_COLORS[i % DEPARTMENT_COLORS.length],
+      });
+    }
+    await upsertSetting(orgId, DEPARTMENTS_KEY, JSON.stringify(cleaned));
+    res.json({ data: cleaned });
   }),
 );
 
