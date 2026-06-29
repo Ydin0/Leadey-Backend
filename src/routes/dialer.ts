@@ -323,6 +323,27 @@ router.post(
     } catch (err: any) {
       throw new ApiError(400, `Twilio rejected VM drop: ${err?.message || err}`);
     }
+
+    // Dropping a voicemail means the call reached an answering machine — mark
+    // the call record so connect-rate excludes it and the voicemail metric
+    // counts it. The browser logs the record at hangup, which happens just
+    // after this drop, so retry briefly to match (background; don't block).
+    void (async () => {
+      try {
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const updated = await db
+            .update(callRecords)
+            .set({ disposition: "voicemail" })
+            .where(and(eq(callRecords.twilioCallSid, callSid), eq(callRecords.organizationId, orgId)))
+            .returning({ id: callRecords.id });
+          if (updated.length > 0) return;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      } catch (err) {
+        console.error("[VM drop] failed to mark call record as voicemail:", err);
+      }
+    })();
+
     res.json({ data: { ok: true, voicemailId: vm.id } });
   }),
 );

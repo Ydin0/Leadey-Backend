@@ -445,6 +445,11 @@ router.get(
         userId: callRecords.userId,
         day: sql<string>`to_char(date_trunc('day', ${callRecords.calledAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
         c: count(),
+        // Connected = a PERSON picked up: talk time > 0 (ringing excluded) and
+        // not a voicemail/machine. Drives the connect-rate stat.
+        connected: sql<number>`coalesce(count(*) filter (where ${callRecords.duration} > 0 and ${callRecords.disposition} <> 'voicemail'), 0)`,
+        // Calls that reached voicemail (answering machine detected).
+        voicemail: sql<number>`coalesce(count(*) filter (where ${callRecords.disposition} = 'voicemail'), 0)`,
         talk: sql<number>`coalesce(sum(${callRecords.duration}), 0)`,
       })
       .from(callRecords)
@@ -463,11 +468,17 @@ router.get(
       .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
 
     const callMap = new Map<string, Map<string, number>>();
+    const connectedMap = new Map<string, Map<string, number>>();
+    const voicemailMap = new Map<string, Map<string, number>>();
     const talkMap = new Map<string, Map<string, number>>();
     for (const r of callRows) {
       if (!r.userId) continue;
       if (!callMap.has(r.userId)) callMap.set(r.userId, new Map());
       callMap.get(r.userId)!.set(r.day, Number(r.c));
+      if (!connectedMap.has(r.userId)) connectedMap.set(r.userId, new Map());
+      connectedMap.get(r.userId)!.set(r.day, Number(r.connected));
+      if (!voicemailMap.has(r.userId)) voicemailMap.set(r.userId, new Map());
+      voicemailMap.get(r.userId)!.set(r.day, Number(r.voicemail));
       if (!talkMap.has(r.userId)) talkMap.set(r.userId, new Map());
       talkMap.get(r.userId)!.set(r.day, Number(r.talk));
     }
@@ -488,6 +499,8 @@ router.get(
 
     const members = memberRows.map((m) => {
       const calls = callMap.get(m.id);
+      const connected = connectedMap.get(m.id);
+      const voicemail = voicemailMap.get(m.id);
       const talk = talkMap.get(m.id);
       const meets = meetMap.get(m.id);
       return {
@@ -495,6 +508,8 @@ router.get(
         series: days.map((day) => ({
           date: `${day}T00:00:00.000Z`,
           calls: calls?.get(day) ?? 0,
+          connectedCalls: connected?.get(day) ?? 0,
+          voicemailCalls: voicemail?.get(day) ?? 0,
           talkTime: talk?.get(day) ?? 0,
           emails: 0,
           sms: 0,
