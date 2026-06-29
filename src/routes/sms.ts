@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, asc, desc, gte } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -183,6 +183,57 @@ router.get(
       .orderBy(asc(smsMessages.createdAt));
 
     res.json({ data: rows });
+  }),
+);
+
+// GET /api/sms/threads — org-wide SMS conversations grouped by counterparty
+// number, latest message first. Includes unmatched inbound texts (leadId null).
+router.get(
+  "/sms/threads",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const rows = await db
+      .select({
+        msg: smsMessages,
+        leadName: leads.name,
+        leadCompany: leads.company,
+      })
+      .from(smsMessages)
+      .leftJoin(leads, eq(leads.id, smsMessages.leadId))
+      .where(and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, since)))
+      .orderBy(desc(smsMessages.createdAt))
+      .limit(1000);
+
+    const norm = (p: string) => (p || "").replace(/[^\d]/g, "").slice(-10);
+    type Thread = {
+      key: string; phone: string; leadId: string | null; funnelId: string | null;
+      contactName: string | null; company: string | null;
+      lastBody: string; lastDirection: string; lastAt: string;
+      inboundCount: number; total: number; needsReply: boolean;
+    };
+    const threads = new Map<string, Thread>();
+    for (const r of rows) {
+      const m = r.msg;
+      const counterparty = m.direction === "outbound" ? m.toNumber : m.fromNumber;
+      const key = norm(counterparty) || counterparty;
+      let t = threads.get(key);
+      if (!t) {
+        // rows are latest-first → the first one we see for a key is the latest.
+        t = {
+          key, phone: counterparty, leadId: m.leadId, funnelId: m.funnelId,
+          contactName: r.leadName ?? null, company: r.leadCompany ?? null,
+          lastBody: m.body, lastDirection: m.direction, lastAt: m.createdAt.toISOString(),
+          inboundCount: 0, total: 0, needsReply: m.direction === "inbound",
+        };
+        threads.set(key, t);
+      }
+      t.total++;
+      if (m.direction === "inbound") t.inboundCount++;
+      if (!t.leadId && m.leadId) { t.leadId = m.leadId; t.funnelId = m.funnelId; }
+      if (!t.contactName && r.leadName) { t.contactName = r.leadName; t.company = r.leadCompany ?? null; }
+    }
+    res.json({ data: [...threads.values()] });
   }),
 );
 
