@@ -425,7 +425,12 @@ router.get(
     const conditions = [eq(opportunities.organizationId, orgId)];
     if (pipelineId) conditions.push(eq(opportunities.pipelineId, pipelineId));
     if (stageId) conditions.push(eq(opportunities.stageId, stageId));
-    if (ownerId) conditions.push(eq(opportunities.ownerId, ownerId));
+    // ownerId may be a single id or a comma-separated list (multi-select).
+    if (ownerId) {
+      const ownerIds = ownerId.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ownerIds.length === 1) conditions.push(eq(opportunities.ownerId, ownerIds[0]));
+      else if (ownerIds.length > 1) conditions.push(inArray(opportunities.ownerId, ownerIds));
+    }
     if (q) {
       // Search by opp name OR linked company name
       conditions.push(

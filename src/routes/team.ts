@@ -318,6 +318,61 @@ router.patch(
   }),
 );
 
+// ─── PATCH /team/:userId ────────────────────────────────────────────
+// Edit a member's profile (first/last name). Updates Clerk + our DB so the
+// corrected name shows everywhere. Email is the login identity and isn't
+// editable here — fixing it means re-inviting the correct address.
+router.patch(
+  "/team/:userId",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = req.params.userId;
+    const { firstName, lastName } = req.body || {};
+
+    if (firstName === undefined && lastName === undefined) {
+      throw new ApiError(400, "Nothing to update");
+    }
+
+    // Member must belong to this org.
+    const [existing] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+    if (!existing) throw new ApiError(404, "Member not found");
+
+    const first = firstName === undefined ? undefined : String(firstName).trim();
+    const last = lastName === undefined ? undefined : String(lastName).trim();
+
+    // Update Clerk (best-effort — DB is the source of truth for the team list).
+    try {
+      await clerkClient.users.updateUser(userId, {
+        ...(first !== undefined ? { firstName: first } : {}),
+        ...(last !== undefined ? { lastName: last } : {}),
+      });
+    } catch (err: any) {
+      console.error("[team.patch] Clerk updateUser failed:", err?.errors?.[0]?.message || err?.message);
+    }
+
+    const [updated] = await db
+      .update(users)
+      .set({
+        ...(first !== undefined ? { firstName: first || null } : {}),
+        ...(last !== undefined ? { lastName: last || null } : {}),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)))
+      .returning();
+
+    res.json({
+      data: {
+        id: userId,
+        firstName: updated?.firstName ?? null,
+        lastName: updated?.lastName ?? null,
+      },
+    });
+  }),
+);
+
 // ─── DELETE /team/:userId ───────────────────────────────────────────
 // Remove a member from the organization
 router.delete(
