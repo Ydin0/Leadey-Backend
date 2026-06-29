@@ -4,6 +4,7 @@ import {
   getMergedLeadStatuses,
   saveCustomLeadStatuses,
   saveHiddenBuiltInStatuses,
+  saveLeadStatusOrder,
 } from "../lib/lead-status-config";
 
 const router = Router();
@@ -33,10 +34,13 @@ router.put(
     const body = req.body ?? {};
     const custom = body.custom ?? (Array.isArray(body) ? body : []);
     await saveCustomLeadStatuses(orgId, custom);
-    // Only touch hidden built-ins when the client sends the field, so older
-    // callers that PUT just `custom` don't accidentally clear it.
+    // Only touch hidden built-ins / order when the client sends the field, so
+    // older callers that PUT just `custom` don't accidentally clear them.
     if (Array.isArray(body.hidden)) {
       await saveHiddenBuiltInStatuses(orgId, body.hidden);
+    }
+    if (Array.isArray(body.order)) {
+      await saveLeadStatusOrder(orgId, body.order);
     }
     res.json({ data: await getMergedLeadStatuses(orgId) });
   }),

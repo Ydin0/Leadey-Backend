@@ -36,6 +36,7 @@ export const BUILTIN_LEAD_STATUSES: LeadStatusDef[] = [
 
 const SETTINGS_KEY = "custom_lead_statuses";
 const HIDDEN_SETTINGS_KEY = "hidden_lead_statuses";
+const ORDER_SETTINGS_KEY = "lead_status_order";
 // "new" is the default status every lead starts in — keep it always available.
 const PROTECTED_KEYS = new Set(["new"]);
 const VALID_COLORS: LeadStatusColor[] = [
@@ -93,17 +94,66 @@ async function loadHidden(orgId: string): Promise<string[]> {
   }
 }
 
-/** Built-in statuses (minus any the org has hidden) followed by custom ones.
- *  Hidden built-ins simply drop out of the pickers everywhere; leads already
- *  on a hidden status still resolve their label/colour via the built-in
- *  fallback, so nothing breaks. */
+/** The org's custom display order as a list of status keys. Sanitised to
+ *  strings; unknown/duplicate keys are tolerated (ignored at sort time). */
+async function loadOrder(orgId: string): Promise<string[]> {
+  const raw = await getSetting(orgId, ORDER_SETTINGS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((k) => typeof k === "string" && k);
+  } catch {
+    return [];
+  }
+}
+
+/** Sort statuses by the org's saved key order. Keys present in `order` come
+ *  first in that order; anything not listed keeps its natural relative
+ *  position at the end (stable), so new built-ins/custom statuses don't vanish
+ *  and orgs that never reordered get the default built-in-then-custom layout. */
+function applyOrder<T extends { key: string }>(items: T[], order: string[]): T[] {
+  if (order.length === 0) return items;
+  const rank = new Map(order.map((k, i) => [k, i]));
+  return items
+    .map((item, i) => ({ item, i }))
+    .sort((a, b) => {
+      const ra = rank.get(a.item.key);
+      const rb = rank.get(b.item.key);
+      if (ra !== undefined && rb !== undefined) return ra - rb;
+      if (ra !== undefined) return -1;
+      if (rb !== undefined) return 1;
+      return a.i - b.i; // both unranked → preserve original order
+    })
+    .map(({ item }) => item);
+}
+
+/** Built-in statuses (minus any the org has hidden) plus custom ones, sorted
+ *  by the org's saved order. Hidden built-ins simply drop out of the pickers
+ *  everywhere; leads already on a hidden status still resolve their
+ *  label/colour via the built-in fallback, so nothing breaks. */
 export async function getMergedLeadStatuses(
   orgId: string,
 ): Promise<LeadStatusDef[]> {
-  const [custom, hidden] = await Promise.all([loadCustom(orgId), loadHidden(orgId)]);
+  const [custom, hidden, order] = await Promise.all([
+    loadCustom(orgId),
+    loadHidden(orgId),
+    loadOrder(orgId),
+  ]);
   const hiddenSet = new Set(hidden);
   const builtIns = BUILTIN_LEAD_STATUSES.filter((s) => !hiddenSet.has(s.key));
-  return [...builtIns, ...custom];
+  return applyOrder([...builtIns, ...custom], order);
+}
+
+/** Persist the org's preferred display order for statuses (a list of keys).
+ *  Non-string entries are dropped; duplicates are collapsed. */
+export async function saveLeadStatusOrder(
+  orgId: string,
+  input: unknown,
+): Promise<void> {
+  const list = Array.isArray(input) ? input : [];
+  const sanitised = [...new Set(list.filter((k) => typeof k === "string" && k))];
+  await upsertSetting(orgId, ORDER_SETTINGS_KEY, JSON.stringify(sanitised));
 }
 
 /** Persist which built-in statuses the org has hidden. Protected keys (e.g.
