@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { eq, and, gte, count, inArray, or, sql } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
-import { funnels } from "../db/schema/funnels";
+import { funnels, funnelMembers } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { callRecords } from "../db/schema/call-records";
@@ -10,6 +10,7 @@ import { users } from "../db/schema/organizations";
 import { createId, ApiError } from "../lib/helpers";
 import { buildCockpit, type Funnel, type Lead } from "../lib/funnel-service";
 import { getOrgId } from "../lib/auth";
+import { canViewFunnel, getUserRole } from "../lib/permissions";
 import { getSetting } from "../lib/settings-service";
 
 const router = Router();
@@ -26,11 +27,31 @@ function asyncHandler<P = Record<string, string>>(handler: AsyncHandler<P>) {
   };
 }
 
-/** Load all funnels for an org with steps + leads (NO per-lead events — those
- *  are the expensive part on big campaigns; the cockpit derives the few
- *  event-dependent bits via small targeted queries instead). */
-async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
-  const results = await db.query.funnels.findMany({
+/** Load the funnels a rep should actually work in their cockpit, with steps +
+ *  leads (NO per-lead events — those are the expensive part on big campaigns;
+ *  the cockpit derives the few event-dependent bits via small targeted queries
+ *  instead).
+ *
+ *  Scoped to what the user can SEE, using the same rule the funnels list/detail
+ *  routes enforce (canViewFunnel): admins/managers get every funnel, public
+ *  funnels are visible to all, and private funnels only to their members.
+ *  Without this the home cockpit aggregated EVERY org funnel, so reps saw
+ *  call/LinkedIn/WhatsApp tasks for campaigns they aren't even on. */
+async function loadAllFunnels(
+  orgId: string,
+  access: { userId: string | null; role: string },
+): Promise<Funnel[]> {
+  // The funnels this user is a member of (for the private-funnel check).
+  const myFunnelIds = new Set<string>();
+  if (access.userId) {
+    const memberships = await db
+      .select({ funnelId: funnelMembers.funnelId })
+      .from(funnelMembers)
+      .where(eq(funnelMembers.userId, access.userId));
+    for (const m of memberships) myFunnelIds.add(m.funnelId);
+  }
+
+  const results = (await db.query.funnels.findMany({
     where: eq(funnels.organizationId, orgId),
     with: {
       steps: { orderBy: (s, { asc }) => [asc(s.sortOrder)] },
@@ -56,7 +77,9 @@ async function loadAllFunnels(orgId: string): Promise<Funnel[]> {
         },
       },
     },
-  });
+  })).filter((f) =>
+    canViewFunnel(access.role, (f as { visibility?: string }).visibility, myFunnelIds.has(f.id)),
+  );
 
   return results.map((result) => ({
     id: result.id,
@@ -111,7 +134,9 @@ router.get(
   "/dashboard",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const allFunnels = await loadAllFunnels(orgId);
+    const userId = getAuth(req)?.userId || null;
+    const role = userId ? await getUserRole(userId) : "rep";
+    const allFunnels = await loadAllFunnels(orgId, { userId, role });
     const funnelIds = allFunnels.map((f) => f.id);
 
     const todayStart = new Date();
