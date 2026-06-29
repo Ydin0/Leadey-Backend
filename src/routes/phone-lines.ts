@@ -24,6 +24,7 @@ function phoneKey(raw: string | null | undefined): string | null {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
+import { getUserRole } from "../lib/permissions";
 import { createId, ApiError } from "../lib/helpers";
 import {
   uploadSupportingDocumentWithFile,
@@ -68,16 +69,23 @@ router.get(
   "/phone-lines",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    const role = userId ? await getUserRole(userId) : "rep";
+    const canSeeAll = role === "admin" || role === "manager";
 
     const monthStart = new Date();
     monthStart.setDate(1);
     monthStart.setHours(0, 0, 0, 0);
 
-    const lines = await db
+    const allLines = await db
       .select()
       .from(phoneLines)
       .where(eq(phoneLines.organizationId, orgId))
       .orderBy(desc(phoneLines.createdAt));
+
+    // Non-admins only see (and can dial/text from) the numbers assigned to them.
+    // Admins & managers see the whole org's numbers.
+    const lines = canSeeAll ? allLines : allLines.filter((l) => l.assignedTo === userId);
 
     // Compute stats per line for current month
     const statsRows = await db

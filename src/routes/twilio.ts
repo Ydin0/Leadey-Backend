@@ -214,6 +214,9 @@ webhookRouter.post(
             record: "record-from-answer-dual" as any,
             recordingStatusCallback: recordingCallback,
             recordingStatusCallbackEvent: "completed" as any,
+            // When no rep answers, the action fires with DialCallStatus
+            // no-answer/busy — we log it as a MISSED inbound call there.
+            ...(webhookBase ? { action: `${webhookBase}/webhooks/twilio/inbound-status`, method: "POST" } : {}),
           } as any);
           for (const id of identities) dial.client(id);
         } else {

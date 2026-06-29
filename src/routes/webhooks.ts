@@ -7,6 +7,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { funnels, funnelSteps } from "../db/schema/funnels";
 import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
+import { phoneLines } from "../db/schema/phone-lines";
 import { organizations, users } from "../db/schema/organizations";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
@@ -748,6 +749,90 @@ router.post("/twilio/dial-status", async (req: Request, res: Response) => {
       );
     } catch (err) {
       console.error("[Twilio Dial Status] Error:", err);
+    }
+  })();
+});
+
+// ─── POST /webhooks/twilio/inbound-status ────────────────────────────────
+// <Dial> action on an inbound call. If no rep answered (status no-answer/busy/
+// failed), log a MISSED inbound call so it shows in the Inbox + lead profile.
+router.post("/twilio/inbound-status", async (req: Request, res: Response) => {
+  const callSid = req.body?.CallSid as string | undefined;
+  const from = (req.body?.From as string | undefined) || ""; // caller (prospect)
+  const to = (req.body?.To as string | undefined) || "";     // our Twilio number
+  const dialStatus = req.body?.DialCallStatus as string | undefined;
+
+  // End the call (answered calls are already bridged & logged by the browser).
+  const twiml = new twilioSdk.twiml.VoiceResponse();
+  res.type("text/xml").send(twiml.toString());
+
+  if (dialStatus === "completed" || !from || !to) return;
+
+  void (async () => {
+    try {
+      const digits = (p: string) => (p || "").replace(/[^0-9]/g, "").slice(-10);
+      // Resolve the dialed number → its org + owner.
+      const toKey = digits(to);
+      const allLines = await db
+        .select({ id: phoneLines.id, number: phoneLines.number, organizationId: phoneLines.organizationId, assignedTo: phoneLines.assignedTo })
+        .from(phoneLines);
+      const line = allLines.find((l) => digits(l.number) === toKey);
+      if (!line) return;
+
+      // Already logged this missed call? (action can fire once; guard anyway.)
+      if (callSid) {
+        const existing = await db.query.callRecords.findFirst({ where: eq(callRecords.twilioCallSid, callSid) });
+        if (existing) return;
+      }
+
+      // Match the caller to a lead by phone (last 10 digits).
+      const fromKey = digits(from);
+      let leadId: string | null = null;
+      let funnelId: string | null = null;
+      let contactName: string | null = null;
+      if (fromKey) {
+        const [lead] = await db
+          .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.organizationId, line.organizationId), sql`right(regexp_replace(${leads.phone}, '[^0-9]', '', 'g'), 10) = ${fromKey}`))
+          .limit(1);
+        if (lead) { leadId = lead.id; funnelId = lead.funnelId; contactName = lead.name; }
+      }
+
+      await db.insert(callRecords).values({
+        id: createId("cr"),
+        organizationId: line.organizationId,
+        lineId: line.id,
+        twilioCallSid: callSid || null,
+        direction: "inbound",
+        fromNumber: from,
+        toNumber: to,
+        contactName,
+        leadId,
+        funnelId,
+        duration: 0,
+        disposition: "missed",
+        userId: line.assignedTo || null,
+        calledAt: new Date(),
+      });
+
+      if (line.assignedTo) {
+        try {
+          const { createNotification } = await import("./notifications");
+          await createNotification({
+            orgId: line.organizationId,
+            userId: line.assignedTo,
+            type: "missed_call",
+            title: `Missed call${contactName ? ` from ${contactName}` : ""}`,
+            body: from,
+            leadId,
+            funnelId,
+          });
+        } catch { /* non-fatal */ }
+      }
+    } catch (err) {
+      console.error("[Twilio inbound-status] error:", err);
     }
   })();
 });
