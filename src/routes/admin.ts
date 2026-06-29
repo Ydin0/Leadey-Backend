@@ -18,7 +18,7 @@ import {
   getLastSyncedAt,
   isSyncInProgress,
 } from "../lib/twilio-cost-sync";
-import { inviteEmailToOrganization, invitePlatformAdmin } from "../lib/invitations";
+import { inviteEmailToOrganization, invitePlatformAdmin, ensureOrgMembershipCap } from "../lib/invitations";
 import { alias } from "drizzle-orm/pg-core";
 
 const accountManagers = alias(users, "account_managers");
@@ -584,7 +584,7 @@ router.post(
     if (!email?.trim()) throw new ApiError(400, "Email is required");
 
     const [org] = await db
-      .select({ name: organizations.name })
+      .select({ name: organizations.name, seatsIncluded: organizations.seatsIncluded })
       .from(organizations)
       .where(eq(organizations.id, req.params.id));
     if (!org) throw new ApiError(404, "Organization not found");
@@ -601,6 +601,9 @@ router.post(
       ? [actorRow.firstName, actorRow.lastName].filter(Boolean).join(" ") ||
         actorRow.email
       : undefined;
+
+    // Make sure Clerk's membership cap covers the seat allowance before adding.
+    await ensureOrgMembershipCap(req.params.id, org.seatsIncluded || 1);
 
     const result = await inviteEmailToOrganization({
       email: email.trim(),
@@ -915,6 +918,11 @@ router.patch(
         updatedAt: new Date(),
       })
       .where(eq(organizations.id, req.params.id));
+
+    // Keep Clerk's per-org membership cap in step with the allocated seats, so
+    // the org can actually invite up to its seat count (Clerk enforces its own
+    // low default cap and would otherwise reject members past it).
+    await ensureOrgMembershipCap(req.params.id, seats);
 
     await recordAudit({
       actorUserId: actor,

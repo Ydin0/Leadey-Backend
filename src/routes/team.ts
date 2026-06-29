@@ -10,7 +10,7 @@ import { ApiError } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
-import { inviteEmailToOrganization } from "../lib/invitations";
+import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 
@@ -184,17 +184,12 @@ router.post(
       }
     }
 
-    // Keep Clerk's org membership cap in sync with our seat allowance.
-    // Clerk enforces its own `max_allowed_memberships` (default 5) and will
-    // reject invites with "organization membership quota exceeded" even when
-    // we have seats free, so raise it to at least our seat limit first.
-    try {
-      await clerkClient.organizations.updateOrganization(orgId, {
-        maxAllowedMemberships: seatLimit,
-      });
-    } catch {
-      // Non-fatal — if this fails, the invite below surfaces the real error.
-    }
+    // Keep Clerk's org membership cap in sync with our seat allowance before
+    // adding the membership. Clerk enforces its own `max_allowed_memberships`
+    // (low default) and rejects invites with "organization membership quota
+    // exceeded" even when we have seats free. ensureOrgMembershipCap raises it
+    // via the REST API and logs on failure (rather than silently swallowing).
+    await ensureOrgMembershipCap(orgId, seatLimit);
 
     try {
       // Create the Clerk user (with name) + org membership directly, then email

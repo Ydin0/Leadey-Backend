@@ -47,6 +47,49 @@ async function clerk(path: string, init: RequestInit = {}): Promise<any> {
   return body;
 }
 
+/**
+ * Raise Clerk's per-org `max_allowed_memberships` so it never sits below the
+ * org's allocated seat count. Clerk enforces this cap on EVERY membership add
+ * (default for new orgs is low — 5), and rejects with
+ * `organization_membership_quota_exceeded` once it's hit, even when our own
+ * seat allowance has free seats. That mismatch is why an org shows "50 seats"
+ * in our UI but invites silently fail past Clerk's default cap.
+ *
+ * We only ever RAISE the cap (never lower it) so we don't strand existing
+ * members. Uses the REST API directly with the secret key — more reliable than
+ * the lazily-initialised `@clerk/express` proxy client in non-request contexts.
+ *
+ * Best-effort: logs and swallows on failure so it can be called inline without
+ * blocking the surrounding operation.
+ */
+export async function ensureOrgMembershipCap(
+  organizationId: string,
+  seats: number,
+): Promise<void> {
+  const cap = Math.max(1, Math.floor(seats));
+  try {
+    const org = await clerk(`/organizations/${organizationId}`);
+    const raw = org?.max_allowed_memberships;
+    // In Clerk, `0` means "unlimited" — never clamp an unlimited org down.
+    // A positive value already covering the cap needs no change. `null`/missing
+    // is treated as unknown, so we proceed to set it explicitly.
+    if (typeof raw === "number" && (raw === 0 || raw >= cap)) return;
+    await clerk(`/organizations/${organizationId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ max_allowed_memberships: cap }),
+    });
+    console.log(
+      `[invitations] set org ${organizationId} membership cap ${raw ?? "unset"} → ${cap}`,
+    );
+  } catch (err: any) {
+    console.error(
+      `[invitations] failed to raise membership cap for org ${organizationId} to ${cap}:`,
+      err?.status,
+      err?.message || err,
+    );
+  }
+}
+
 function isClerkAlreadyError(err: any): boolean {
   const code = err?.clerkCode;
   return (
@@ -264,7 +307,18 @@ export async function inviteEmailToOrganization(
       }),
     });
   } catch (err: any) {
-    if (!isClerkAlreadyError(err)) throw err;
+    if (isClerkAlreadyError(err)) {
+      // Already a member — nothing to do.
+    } else if (err?.clerkCode === "organization_membership_quota_exceeded") {
+      // Clerk's per-org cap is below the seat allowance. The membership can't
+      // be created, so don't pretend success — surface a clear, actionable error.
+      throw new ApiError(
+        409,
+        "This organisation has reached its membership limit in our auth provider. Increasing the seat count will raise it automatically — if this persists, contact support.",
+      );
+    } else {
+      throw err;
+    }
   }
 
   // 3. Mint a sign-in URL
