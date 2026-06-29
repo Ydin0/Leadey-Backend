@@ -29,9 +29,14 @@ const ACCOUNT_SID = env.TWILIO_ACCOUNT_SID;
 const AUTH_TOKEN = env.TWILIO_AUTH_TOKEN;
 if (!ACCOUNT_SID || !AUTH_TOKEN) throw new Error("Missing Twilio creds in .env");
 
-const DB_URL =
-  process.env.PROD_DATABASE_URL ||
-  "postgres://postgres:eRnFEeaaLksTNEQawwqzXYWRKMuVNgSP@trolley.proxy.rlwy.net:38903/railway";
+// Connection string comes from the environment — NEVER hardcode credentials.
+// e.g. PROD_DATABASE_URL="postgres://…" node scripts/backfill-connected-duration.mjs
+const DB_URL = process.env.PROD_DATABASE_URL || process.env.DATABASE_URL || env.DATABASE_URL;
+if (!DB_URL) {
+  throw new Error(
+    "Set PROD_DATABASE_URL (or DATABASE_URL) to the target database before running.",
+  );
+}
 
 const DRY_RUN = process.env.DRY_RUN === "1";
 const LIMIT = process.env.LIMIT ? Number(process.env.LIMIT) : null;
