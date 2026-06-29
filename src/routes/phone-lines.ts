@@ -569,12 +569,22 @@ router.get(
           .select({ phone: leads.phone })
           .from(leads)
           .where(and(eq(leads.funnelId, lead.funnelId), eq(leads.company, lead.company)));
-        const phoneSet = Array.from(
-          new Set([lead.phone, ...siblings.map((s) => s.phone)].filter((p) => p && p.trim())),
-        ) as string[];
-        if (phoneSet.length) {
-          leadConds.push(inArray(callRecords.toNumber, phoneSet));
-          leadConds.push(inArray(callRecords.fromNumber, phoneSet));
+        // Match on the last 10 DIGITS, not the raw string — the lead's phone is
+        // stored with spaces ("+44 7907 68…") while call_records are E.164
+        // ("+447907…"), so an exact match misses. Inbound calls match on
+        // fromNumber, outbound on toNumber — both are covered here. (Without
+        // this, only outbound calls — which also carry a stamped leadId — showed
+        // on the lead profile.)
+        const digitSet = Array.from(
+          new Set(
+            [lead.phone, ...siblings.map((s) => s.phone)]
+              .map((p) => (p || "").replace(/[^0-9]/g, "").slice(-10))
+              .filter((d) => d.length >= 7),
+          ),
+        );
+        for (const d of digitSet) {
+          leadConds.push(sql`right(regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g'), 10) = ${d}`);
+          leadConds.push(sql`right(regexp_replace(${callRecords.fromNumber}, '[^0-9]', '', 'g'), 10) = ${d}`);
         }
       }
       conditions.push(or(...leadConds)!);

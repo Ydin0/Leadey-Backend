@@ -164,14 +164,17 @@ async function loadFunnel(
   const emailsByAddr = new Map<string, number>();
   if (phoneSet.size) {
     // Telephony log (authoritative) by phone…
+    // Count by the COUNTERPARTY (callee for outbound, caller for inbound) across
+    // BOTH directions, so inbound calls also count toward the lead.
+    const counterparty = sql`regexp_replace(case when ${callRecords.direction} = 'outbound' then ${callRecords.toNumber} else ${callRecords.fromNumber} end, '[^0-9]', '', 'g')`;
     const callRows = await db
       .select({
-        phone: sql<string>`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`,
+        phone: sql<string>`${counterparty}`,
         n: sql<number>`count(*)::int`,
       })
       .from(callRecords)
-      .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
-      .groupBy(sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`);
+      .where(eq(callRecords.organizationId, orgId))
+      .groupBy(counterparty);
     for (const r of callRows) if (r.phone && phoneSet.has(r.phone)) callsByPhone.set(r.phone, r.n);
     // …and logged call events by phone (catches calls recorded only as an event,
     // not in call_records). Take the MAX so no real call is ever under-counted.
