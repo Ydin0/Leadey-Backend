@@ -60,6 +60,17 @@ router.get(
 
     const term = `%${q}%`;
 
+    // Phone search: match on digits only so "+1 415 722 1246", "(415) 722-1246"
+    // and "+14157221246" all hit the same stored number. We compare the last 10
+    // digits when the query has enough, so a country-code difference doesn't
+    // hide the lead. Only engages when the query is essentially a number.
+    const qDigits = q.replace(/\D/g, "");
+    const isPhoneish = qDigits.length >= 5 && qDigits.length >= q.replace(/[\s()+\-.]/g, "").length;
+    const phoneNeedle = qDigits.length >= 10 ? qDigits.slice(-10) : qDigits;
+    const leadPhoneMatch = isPhoneish
+      ? ilike(sql`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`, `%${phoneNeedle}%`)
+      : undefined;
+
     const [campaigns, leadRows, oppRows, companyRows, contactRows, memberRows] =
       await Promise.all([
         db
@@ -78,6 +89,7 @@ router.get(
             name: leads.name,
             company: leads.company,
             email: leads.email,
+            phone: leads.phone,
             companyDomain: leads.companyDomain,
             funnelId: leads.funnelId,
           })
@@ -90,6 +102,7 @@ router.get(
                 ilike(leads.name, term),
                 ilike(leads.email, term),
                 ilike(leads.company, term),
+                ...(leadPhoneMatch ? [leadPhoneMatch] : []),
               ),
             ),
           )
@@ -142,6 +155,9 @@ router.get(
                 ilike(scraperContacts.fullName, term),
                 ilike(scraperContacts.email, term),
                 ilike(scraperContacts.currentCompany, term),
+                ...(isPhoneish
+                  ? [ilike(sql`regexp_replace(${scraperContacts.phone}, '[^0-9]', '', 'g')`, `%${phoneNeedle}%`)]
+                  : []),
               ),
             ),
           )
@@ -239,7 +255,11 @@ router.get(
         type: "lead" as const,
         id: l.id,
         title: l.name,
-        subtitle: joinParts([l.company, l.email]) || "Lead",
+        // When the user searched a phone number, surface it so the match is
+        // obvious; otherwise show company/email as before.
+        subtitle: isPhoneish
+          ? joinParts([l.phone, l.company]) || "Lead"
+          : joinParts([l.company, l.email]) || "Lead",
         href: `/dashboard/funnels/${l.funnelId}/leads/${l.id}`,
         domain: l.companyDomain || emailDomain(l.email),
       })),
