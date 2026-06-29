@@ -11,6 +11,16 @@ import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 
+/** Rough dial-country of a number, so we text a UK lead from a UK number and a
+ *  US lead from a US number (Twilio rejects mismatched From/To combinations). */
+function phoneCountry(num: string | null | undefined): "us" | "uk" | "other" {
+  const raw = (num || "").replace(/[^\d+]/g, "");
+  const d = raw.replace(/\D/g, "");
+  if (raw.startsWith("+44") || d.startsWith("44") || /^07\d{9}$/.test(d)) return "uk";
+  if (raw.startsWith("+1") || (d.length === 11 && d.startsWith("1")) || (!raw.startsWith("+") && d.length === 10)) return "us";
+  return "other";
+}
+
 const router = Router();
 const client = twilioSdk(
   process.env.TWILIO_ACCOUNT_SID!,
@@ -70,10 +80,17 @@ router.post(
       .from(phoneLines)
       .where(eq(phoneLines.organizationId, orgId));
     const activeLines = orgLines.filter((l) => l.status === "active");
-    // If the sender explicitly chose a line, honour it (any active org line);
-    // otherwise default to their assigned line, then the first active line.
+    // Twilio rejects mismatched From/To combinations (e.g. a US number texting a
+    // UK lead). Prefer a sender line whose country matches the recipient.
+    const destCountry = phoneCountry(lead.phone);
+    const sameCountry = (l: { number: string }) => destCountry === "other" || phoneCountry(l.number) === destCountry;
+    // If the sender explicitly chose a line, honour it; otherwise prefer a
+    // country-matched line (their own first), then any country-matched line,
+    // then the rep's assigned line, then the first active line.
     const line =
       (requestedLineId && activeLines.find((l) => l.id === requestedLineId)) ||
+      (userId && activeLines.find((l) => l.assignedTo === userId && sameCountry(l))) ||
+      activeLines.find((l) => sameCountry(l)) ||
       (userId && activeLines.find((l) => l.assignedTo === userId)) ||
       activeLines[0] ||
       null;
