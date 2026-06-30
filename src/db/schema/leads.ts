@@ -38,6 +38,10 @@ export const leads = pgTable("leads", {
    *  stays in the campaign but is shown in red and calls are confirmed first.
    *  Mirrored onto master_contacts.doNotCall so it follows the person. */
   doNotCall: boolean("do_not_call").notNull().default(false),
+  /** Free-form tags (used by workflow Tag steps + filtering). */
+  tags: jsonb("tags").$type<string[]>().notNull().default([]),
+  /** Assigned owner (Clerk user id) — set by workflow Assign steps. */
+  ownerId: text("owner_id"),
   smartleadLeadId: text("smartlead_lead_id"),
   unipileProviderId: text("unipile_provider_id"),
   /** The CSV import that created this lead, if any. Lets the Imports page

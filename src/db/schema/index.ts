@@ -36,6 +36,7 @@ export {
   opportunityEvents,
 } from "./opportunities";
 export { adminAuditLog } from "./admin-audit-log";
+export { workflows, workflowEnrollments, workflowStepRuns } from "./workflows";
 export { kbOffers, kbModules, kbLessons, kbAssignments, kbProgress } from "./knowledge-base";
 export {
   funnelsRelations,

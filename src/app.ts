@@ -40,6 +40,7 @@ import calendlyRouter, { calendlyPublicRouter } from "./routes/calendly";
 import assistantRouter from "./routes/assistant";
 import callsRouter from "./routes/calls";
 import callOutcomesRouter from "./routes/call-outcomes";
+import workflowsRouter from "./routes/workflows";
 import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
@@ -127,6 +128,7 @@ app.use("/api", requireAuth(), calendlyRouter);
 app.use("/api", requireAuth(), assistantRouter);
 app.use("/api", requireAuth(), callsRouter);
 app.use("/api", requireAuth(), callOutcomesRouter);
+app.use("/api", requireAuth(), workflowsRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
