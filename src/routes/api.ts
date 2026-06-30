@@ -60,7 +60,7 @@ import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
-import { getCustomFieldsForLeads } from "../lib/custom-fields-service";
+import { getCustomFieldsForLeads, setLeadCustomFields } from "../lib/custom-fields-service";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
@@ -1909,6 +1909,141 @@ router.patch(
         linkedinUrl: (updates.linkedinUrl as string) ?? lead.linkedinUrl,
       },
     });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/leads ───────────────────────────────────────
+// Create a single lead manually from the campaign (the "Individual contact"
+// flow + "Add contact" on a lead profile). Only name + company required — the
+// rest is filled in from the now-fully-editable lead profile.
+router.post(
+  "/funnels/:funnelId/leads",
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(await loadFunnel(orgId, req.params.funnelId), req.params.funnelId);
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const name = normalizeString(body.name as string);
+    const company = normalizeString(body.company as string);
+    if (!name) throw new ApiError(400, "Contact name is required");
+    if (!company) throw new ApiError(400, "Company name is required");
+
+    const id = createId("lead");
+    const email = normalizeString(body.email as string).toLowerCase();
+    const phone = normalizeString(body.phone as string);
+    const title = normalizeString(body.title as string);
+    const linkedinUrl = normalizeString(body.linkedinUrl as string);
+
+    await db.insert(leads).values({
+      id,
+      funnelId: funnel.id,
+      name,
+      company,
+      title,
+      email,
+      phone,
+      linkedinUrl,
+      source: "Manual",
+      sourceType: "manual",
+      status: "pending",
+      currentStep: 1,
+      totalSteps: funnel.steps.length || 1,
+    });
+
+    // Mirror to the org-wide master contact (keyed by LinkedIn) so it follows
+    // the person across campaigns — same as the contact PATCH.
+    if (linkedinUrl) {
+      const [firstName, ...rest] = name.split(" ");
+      try {
+        await upsertMasterContact(orgId, {
+          linkedinUrl,
+          fullName: name,
+          firstName: firstName || null,
+          lastName: rest.join(" ") || null,
+          currentTitle: title || null,
+          email: email || null,
+          phone: phone || null,
+        });
+      } catch (err) {
+        console.warn("[lead-create] master mirror failed:", err instanceof Error ? err.message : err);
+      }
+    }
+
+    const refreshed = getFunnelOrThrow(
+      await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: id }),
+      funnel.id,
+    );
+    res.status(201).json({
+      data: { leadId: id, funnel: buildFunnelPayload(refreshed, { includeLeads: true, fullLeadId: id }) },
+    });
+  }),
+);
+
+// ─── PATCH /funnels/:funnelId/leads/:leadId/company ───────────────────────
+// Edit company/About info. Company fields are shared, so they fan out to ALL
+// contacts at the same company in this funnel. Renaming `company` applies only
+// to the focused row (avoids accidental merges).
+router.patch(
+  "/funnels/:funnelId/leads/:leadId/company",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(await loadFunnel(orgId, req.params.funnelId), req.params.funnelId);
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) throw new ApiError(404, "Lead not found in funnel");
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const updates: Record<string, unknown> = {};
+    const strField = (k: string, col: string) => {
+      if (body[k] !== undefined) updates[col] = normalizeString(body[k] as string) || null;
+    };
+    strField("companyDomain", "companyDomain");
+    strField("companyIndustry", "companyIndustry");
+    strField("companyLocation", "companyLocation");
+    strField("companyDescription", "companyDescription");
+    strField("companyLinkedin", "companyLinkedin");
+    strField("companyAnnualRevenue", "companyAnnualRevenue");
+    if (body.companyEmployeeCount !== undefined) {
+      const n = Number(body.companyEmployeeCount);
+      updates.companyEmployeeCount = Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+    }
+    const renameCompany = body.company !== undefined ? normalizeString(body.company as string) : null;
+    if (Object.keys(updates).length === 0 && !renameCompany) throw new ApiError(400, "Nothing to update");
+
+    if (Object.keys(updates).length > 0) {
+      updates.updatedAt = new Date();
+      // Fan out shared company fields to every contact at this company.
+      await db.update(leads).set(updates).where(and(eq(leads.funnelId, funnel.id), eq(leads.company, lead.company)));
+    }
+    if (renameCompany && renameCompany !== lead.company) {
+      await db.update(leads).set({ company: renameCompany, updatedAt: new Date() }).where(eq(leads.id, lead.id));
+    }
+
+    const refreshed = getFunnelOrThrow(
+      await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: lead.id }),
+      funnel.id,
+    );
+    res.json({ data: { funnel: buildFunnelPayload(refreshed, { includeLeads: true, fullLeadId: lead.id }) } });
+  }),
+);
+
+// ─── PATCH /funnels/:funnelId/leads/:leadId/custom-fields ─────────────────
+// Set this lead's custom-field VALUES (keyed by field key; "" clears).
+router.patch(
+  "/funnels/:funnelId/leads/:leadId/custom-fields",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(await loadFunnel(orgId, req.params.funnelId), req.params.funnelId);
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) throw new ApiError(404, "Lead not found in funnel");
+
+    const values = (req.body?.values || {}) as Record<string, string>;
+    await setLeadCustomFields(orgId, lead.id, values);
+
+    const refreshed = getFunnelOrThrow(
+      await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: lead.id }),
+      funnel.id,
+    );
+    res.json({ data: { funnel: buildFunnelPayload(refreshed, { includeLeads: true, fullLeadId: lead.id }) } });
   }),
 );
 
