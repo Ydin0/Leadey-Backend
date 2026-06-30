@@ -11,7 +11,7 @@ import {
   dialerSessions,
   dialerQueueItems,
 } from "../db/schema/dialer";
-import { funnelSteps, funnels } from "../db/schema/funnels";
+import { funnelSteps, funnels, funnelMembers } from "../db/schema/funnels";
 import { leads, leadEvents } from "../db/schema/leads";
 import { masterContacts } from "../db/schema/master";
 import { callRecords } from "../db/schema/call-records";
@@ -841,6 +841,14 @@ router.post(
     // top lead. With the claim inside the lock, simultaneous starts serialize
     // and each rep gets a distinct lead. The partial unique index on (user_id)
     // WHERE status='active' still rejects a second active session per user.
+    // Working a campaign in the dialer grants access to it: add the rep as a
+    // member so they can open its lead profiles even when the campaign is
+    // Private (idempotent — the (funnel_id,user_id) unique index dedupes).
+    await db
+      .insert(funnelMembers)
+      .values({ id: createId("fm"), funnelId: sessionFunnelId, userId, role: "contributor" })
+      .onConflictDoNothing();
+
     const sessionId = createId("dlr");
     let firstItem: typeof dialerQueueItems.$inferSelect | null = null;
     try {

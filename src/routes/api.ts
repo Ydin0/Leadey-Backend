@@ -8,6 +8,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { scraperSignals } from "../db/schema/scrapers";
 import { masterCompanies, masterContacts } from "../db/schema/master";
 import { imports } from "../db/schema/imports";
+import { dialerSessions } from "../db/schema/dialer";
 
 /** Free email providers — never used as a company domain. */
 const FREE_EMAIL_DOMAINS = new Set([
@@ -446,7 +447,19 @@ router.get(
     // Visibility gate: a non-member rep can't open a PRIVATE campaign directly.
     const auth = getAuth(req as unknown as Request);
     const role = auth?.userId ? await getUserRole(auth.userId) : "rep";
-    const isMember = !!auth?.userId && members.some((m) => m.userId === auth.userId);
+    let isMember = !!auth?.userId && members.some((m) => m.userId === auth.userId);
+    // Working a campaign in the power dialer grants access to it: if the caller
+    // has (or had) a dialer session for this funnel, let them open its leads
+    // even when it's Private. Only checked when plain membership didn't already
+    // pass, so the common path stays a single query.
+    if (!isMember && auth?.userId && !canViewFunnel(role, funnel.visibility, false)) {
+      const [sess] = await db
+        .select({ id: dialerSessions.id })
+        .from(dialerSessions)
+        .where(and(eq(dialerSessions.userId, auth.userId), eq(dialerSessions.funnelId, req.params.funnelId)))
+        .limit(1);
+      if (sess) isMember = true;
+    }
     if (!canViewFunnel(role, funnel.visibility, isMember)) {
       throw new ApiError(403, "You do not have access to this campaign");
     }
