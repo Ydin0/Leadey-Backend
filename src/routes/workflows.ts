@@ -2,8 +2,10 @@ import { Router, Request, Response, NextFunction } from "express";
 import { eq, and, sql, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { funnels } from "../db/schema/funnels";
-import { workflows, workflowEnrollments } from "../db/schema/workflows";
+import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/workflows";
 import type { WorkflowGraph, WorkflowSettings } from "../db/schema/workflows";
+import { leads } from "../db/schema/leads";
+import { desc } from "drizzle-orm";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { enrollLeadsDirect } from "../services/workflow-engine";
@@ -44,10 +46,10 @@ function seedGraph(): WorkflowGraph {
   };
 }
 
-function serialize(
-  w: typeof workflows.$inferSelect,
-  stats?: { enrolled: number; active: number; completed: number },
-) {
+type WfStats = { enrolled: number; active: number; completed: number; exited: number; failed: number };
+const ZERO_STATS: WfStats = { enrolled: 0, active: 0, completed: 0, exited: 0, failed: 0 };
+
+function serialize(w: typeof workflows.$inferSelect, stats?: WfStats) {
   return {
     id: w.id,
     funnelId: w.funnelId,
@@ -55,7 +57,7 @@ function serialize(
     status: w.status,
     graph: w.graph,
     settings: w.settings,
-    stats: stats ?? { enrolled: 0, active: 0, completed: 0 },
+    stats: stats ?? { ...ZERO_STATS },
     createdAt: w.createdAt.toISOString(),
     updatedAt: w.updatedAt.toISOString(),
   };
@@ -85,9 +87,9 @@ async function loadWorkflowOr404(orgId: string, funnelId: string, workflowId: st
   return w;
 }
 
-/** Enrolled / in-progress / completed counts per workflow, in one query. */
+/** Enrolled / in-progress / completed / exited / failed counts per workflow. */
 async function statsByWorkflow(workflowIds: string[]) {
-  const map = new Map<string, { enrolled: number; active: number; completed: number }>();
+  const map = new Map<string, WfStats>();
   if (workflowIds.length === 0) return map;
   const rows = await db
     .select({
@@ -99,10 +101,12 @@ async function statsByWorkflow(workflowIds: string[]) {
     .where(inArray(workflowEnrollments.workflowId, workflowIds))
     .groupBy(workflowEnrollments.workflowId, workflowEnrollments.status);
   for (const r of rows) {
-    const s = map.get(r.workflowId) ?? { enrolled: 0, active: 0, completed: 0 };
+    const s = map.get(r.workflowId) ?? { ...ZERO_STATS };
     s.enrolled += r.n;
     if (r.status === "active") s.active += r.n;
-    if (r.status === "completed") s.completed += r.n;
+    else if (r.status === "completed") s.completed += r.n;
+    else if (r.status === "exited") s.exited += r.n;
+    else if (r.status === "failed") s.failed += r.n;
     map.set(r.workflowId, s);
   }
   return map;
@@ -198,6 +202,85 @@ router.post(
     if (leadIds.length === 0) throw new ApiError(400, "leadIds required");
     const enrolled = await enrollLeadsDirect(orgId, w.id, leadIds);
     res.json({ data: { enrolled } });
+  }),
+);
+
+// ─── GET /funnels/:funnelId/workflows/:workflowId/enrollments ───────────
+// The activity view: every lead that has run through the workflow — status,
+// where they are, when they next process, and the failure reason if any.
+router.get(
+  "/funnels/:funnelId/workflows/:workflowId/enrollments",
+  asyncHandler<WorkflowParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
+    const statusFilter = typeof req.query.status === "string" ? req.query.status : "";
+    const conds = [eq(workflowEnrollments.workflowId, w.id)];
+    if (statusFilter) conds.push(eq(workflowEnrollments.status, statusFilter));
+    const rows = await db
+      .select({
+        id: workflowEnrollments.id,
+        status: workflowEnrollments.status,
+        currentNodeId: workflowEnrollments.currentNodeId,
+        nextRunAt: workflowEnrollments.nextRunAt,
+        waitingFor: workflowEnrollments.waitingFor,
+        lastError: workflowEnrollments.lastError,
+        enteredAt: workflowEnrollments.enteredAt,
+        completedAt: workflowEnrollments.completedAt,
+        leadId: workflowEnrollments.leadId,
+        leadName: leads.name,
+        leadCompany: leads.company,
+        leadEmail: leads.email,
+      })
+      .from(workflowEnrollments)
+      .leftJoin(leads, eq(leads.id, workflowEnrollments.leadId))
+      .where(and(...conds))
+      .orderBy(desc(workflowEnrollments.enteredAt))
+      .limit(300);
+    res.json({
+      data: rows.map((r) => ({
+        id: r.id,
+        status: r.status,
+        currentNodeId: r.currentNodeId,
+        nextRunAt: r.nextRunAt ? r.nextRunAt.toISOString() : null,
+        waitingFor: r.waitingFor,
+        lastError: r.lastError,
+        enteredAt: r.enteredAt.toISOString(),
+        completedAt: r.completedAt ? r.completedAt.toISOString() : null,
+        lead: { id: r.leadId, name: r.leadName || "Unknown", company: r.leadCompany || "", email: r.leadEmail || "" },
+      })),
+    });
+  }),
+);
+
+// ─── GET .../enrollments/:enrollmentId/runs ─────────────────────────────
+// Per-step log for one enrollment (incl. failure detail).
+router.get(
+  "/funnels/:funnelId/workflows/:workflowId/enrollments/:enrollmentId/runs",
+  asyncHandler<WorkflowParams & { enrollmentId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
+    // Confirm the enrollment belongs to this workflow before returning its runs.
+    const [enr] = await db
+      .select({ id: workflowEnrollments.id })
+      .from(workflowEnrollments)
+      .where(and(eq(workflowEnrollments.id, req.params.enrollmentId), eq(workflowEnrollments.workflowId, w.id)));
+    if (!enr) throw new ApiError(404, "Enrollment not found");
+    const runs = await db
+      .select()
+      .from(workflowStepRuns)
+      .where(eq(workflowStepRuns.enrollmentId, enr.id))
+      .orderBy(workflowStepRuns.ranAt)
+      .limit(500);
+    res.json({
+      data: runs.map((r) => ({
+        id: r.id,
+        nodeId: r.nodeId,
+        type: r.type,
+        status: r.status,
+        detail: r.detail,
+        ranAt: r.ranAt.toISOString(),
+      })),
+    });
   }),
 );
 
