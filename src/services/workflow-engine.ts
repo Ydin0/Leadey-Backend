@@ -11,7 +11,7 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { sendEmail } from "../lib/email";
 import { sendEmailVia } from "../lib/email-providers";
-import { setLeadCustomFields, getCustomFieldsForLeads } from "../lib/custom-fields-service";
+import { setLeadCustomFields, getCustomFieldsForLeads, listFieldDefinitions } from "../lib/custom-fields-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { createId } from "../lib/helpers";
 
@@ -26,7 +26,7 @@ type Enrollment = typeof workflowEnrollments.$inferSelect;
 /** Map a Trigger node's selected label to a canonical trigger key. */
 export type TriggerType =
   | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "meeting_booked" | "manual";
-function triggerTypeFromLabel(label: string): TriggerType {
+export function triggerTypeFromLabel(label: string): TriggerType {
   switch (label) {
     case "Status changes": return "status_changed";
     case "Tag added": return "tag_added";
@@ -43,11 +43,11 @@ export interface TriggerCtx { status?: string; tag?: string }
 function graphOf(w: { graph: WorkflowGraph | null }): WorkflowGraph {
   return w.graph && Array.isArray(w.graph.nodes) ? w.graph : { nodes: [], edges: [] };
 }
-function nextNodeId(g: WorkflowGraph, fromId: string, port: string): string | null {
+export function nextNodeId(g: WorkflowGraph, fromId: string, port: string): string | null {
   const e = g.edges.find((ed) => ed.from === fromId && ed.port === port);
   return e?.to ?? null;
 }
-function triggerStart(g: WorkflowGraph): string | null {
+export function triggerStart(g: WorkflowGraph): string | null {
   const trigger = g.nodes.find((n) => n.type === "trigger");
   if (!trigger) return null;
   return nextNodeId(g, trigger.id, "out");
@@ -56,7 +56,7 @@ function triggerStart(g: WorkflowGraph): string | null {
 /** Build the {{snake_case}} token → value map for a lead, including every
  *  custom field by its key. Mirrors the app's personalize catalog so workflow
  *  steps and saved templates are interchangeable. */
-function buildTokens(lead: Lead, customFields: { key: string; value: string }[]): Record<string, string> {
+export function buildTokens(lead: Lead, customFields: { key: string; value: string }[]): Record<string, string> {
   const full = lead.name || [lead.firstName, lead.lastName].filter(Boolean).join(" ") || "";
   const parts = full.split(" ").filter(Boolean);
   const domain = lead.companyDomain || (lead.email?.split("@")[1] ?? "");
@@ -77,7 +77,7 @@ function buildTokens(lead: Lead, customFields: { key: string; value: string }[])
 /** Replace {{snake_case}} tokens (the app/template convention), plus a legacy
  *  fallback for the old {firstName}/{company}/… single-brace tokens so existing
  *  steps keep working. Unknown {{tokens}} are left intact. */
-function renderTokens(text: string, tokens: Record<string, string>): string {
+export function renderTokens(text: string, tokens: Record<string, string>): string {
   const first = tokens.first_name || (tokens.full_name || "").split(" ")[0] || "there";
   return (text || "")
     .replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key) => (key in tokens ? tokens[key] : `{{${key}}}`))
@@ -88,16 +88,23 @@ function renderTokens(text: string, tokens: Record<string, string>): string {
     .replace(/\{email\}/g, tokens.email || "");
 }
 
-/** Load a lead's custom field values as a flat {key,value} list. */
-async function leadTokens(lead: Lead): Promise<Record<string, string>> {
-  const map = await getCustomFieldsForLeads([lead.id]).catch(() => null);
-  const cfs = (map?.get(lead.id) || []).map((f) => ({ key: f.key, value: f.value }));
-  return buildTokens(lead, cfs);
+/** Build the full token map for a lead: standard tokens + every org custom
+ *  field (defaulting to "" so a mapped-but-unset field renders blank, not a
+ *  literal {{key}}) overlaid with the lead's actual values. */
+async function leadTokens(lead: Lead, orgId: string): Promise<Record<string, string>> {
+  const [defs, valMap] = await Promise.all([
+    listFieldDefinitions(orgId).catch(() => [] as { key: string }[]),
+    getCustomFieldsForLeads([lead.id]).catch(() => null),
+  ]);
+  const cfs = new Map<string, string>();
+  for (const d of defs) cfs.set(d.key, ""); // known fields default to empty
+  for (const f of valMap?.get(lead.id) || []) cfs.set(f.key, f.value);
+  return buildTokens(lead, [...cfs].map(([key, value]) => ({ key, value })));
 }
 
 const twilio = () => twilioSdk(process.env.TWILIO_ACCOUNT_SID!, process.env.TWILIO_AUTH_TOKEN!);
 function phoneDigits(p: string | null | undefined) { return (p || "").replace(/[^\d]/g, ""); }
-function phoneCountry(p: string | null | undefined): "us" | "uk" | "other" {
+export function phoneCountry(p: string | null | undefined): "us" | "uk" | "other" {
   const d = phoneDigits(p);
   if (d.startsWith("44") || /^0[127]/.test(d)) return "uk";
   if (d.length === 10 || d.startsWith("1")) return "us";
@@ -119,7 +126,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
   switch (node.type) {
     case "email": {
       if (!lead.email) { await logRun(enr, node, "skipped", { reason: "no email" }); return; }
-      const tokens = await leadTokens(lead);
+      const tokens = await leadTokens(lead, orgId);
       const subject = renderTokens(String(d.subject || ""), tokens);
       const bodyText = renderTokens(String(d.body || ""), tokens);
       const html = bodyText.replace(/\n/g, "<br>");
@@ -155,7 +162,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
     }
     case "sms": {
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
-      const tokens = await leadTokens(lead);
+      const tokens = await leadTokens(lead, orgId);
       const body = renderTokens(String(d.message || ""), tokens);
       const orgLines = await db.select().from(phoneLines).where(eq(phoneLines.organizationId, orgId));
       const active = orgLines.filter((l) => l.status === "active");
@@ -263,7 +270,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
   }
 }
 
-function durationMs(amount: unknown, unit: unknown): number {
+export function durationMs(amount: unknown, unit: unknown): number {
   const n = Number(amount) || 0;
   switch (String(unit)) {
     case "minutes": return n * 60_000;
@@ -363,9 +370,12 @@ async function runEnrollment(enr: Enrollment): Promise<void> {
       nodeId = nextNodeId(g, node.id, port);
       continue;
     }
-    // action node
+    // action node (email/sms/status/tag/field/assign/webhook/call/linkedin)
     await runAction(enr, node, lead);
     nodeId = nextNodeId(g, node.id, "out");
+    // Persist progress AFTER each side-effectful step so a crash/lease-replay
+    // resumes at the NEXT node and never re-sends an email/SMS already sent.
+    await db.update(workflowEnrollments).set({ currentNodeId: nodeId }).where(eq(workflowEnrollments.id, enr.id));
   }
   // ran out of nodes → completed
   await finish(enr.id, "completed");
