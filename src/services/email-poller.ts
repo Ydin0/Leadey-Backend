@@ -5,6 +5,7 @@ import { leadEvents } from "../db/schema/leads";
 import { createId } from "../lib/helpers";
 import { fetchNewMessages, type InboundMessage } from "../lib/email-providers";
 import { createNotification } from "../routes/notifications";
+import { fireTrigger, notifyWorkflowEvent } from "./workflow-engine";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -92,6 +93,10 @@ async function pollAccount(account: typeof emailAccounts.$inferSelect): Promise<
       meta: { channel: "email", direction: "inbound", subject: inbound.subject, body: inbound.text || inbound.html },
       timestamp: now,
     });
+    // Workflow reactions: wake wait-for-reply steps + apply exit-on-reply, and
+    // enroll into any "reply received" workflows.
+    void notifyWorkflowEvent(match.leadId, "replied");
+    if (match.funnelId) void fireTrigger(account.organizationId, match.funnelId, match.leadId, "reply_received");
     if (match.userId) {
       await createNotification({
         orgId: account.organizationId,

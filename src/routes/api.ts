@@ -61,6 +61,7 @@ import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads, setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields-service";
+import { fireTrigger } from "../services/workflow-engine";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
@@ -1376,6 +1377,12 @@ router.post(
       );
     }
 
+    // Enroll the freshly-imported leads into any active "lead enters campaign"
+    // workflows (one batched call; fire-and-forget).
+    if (leadsToInsert.length > 0) {
+      void fireTrigger(orgId, funnel.id, leadsToInsert.map((l) => l.id), "lead_enters_campaign");
+    }
+
     res.status(201).json({
       data: {
         importId,
@@ -1434,6 +1441,9 @@ router.patch(
           sql`lower(${leads.company}) = lower(${lead.company})`,
         ),
       );
+
+    // Enroll into any active "status changes" workflows (fire-and-forget).
+    void fireTrigger(orgId, funnel.id, lead.id, "status_changed");
 
     res.json({ data: { id: lead.id, status, company: lead.company } });
   }),
@@ -1975,6 +1985,9 @@ router.post(
         console.warn("[lead-create] master mirror failed:", err instanceof Error ? err.message : err);
       }
     }
+
+    // Enroll into any active "lead enters campaign" workflows (fire-and-forget).
+    void fireTrigger(orgId, funnel.id, id, "lead_enters_campaign");
 
     const refreshed = getFunnelOrThrow(
       await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: id }),

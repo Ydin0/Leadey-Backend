@@ -6,6 +6,7 @@ import { workflows, workflowEnrollments } from "../db/schema/workflows";
 import type { WorkflowGraph, WorkflowSettings } from "../db/schema/workflows";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
+import { enrollLeadsDirect } from "../services/workflow-engine";
 
 const router = Router();
 
@@ -183,6 +184,20 @@ router.patch(
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, existing.id);
     const stats = await statsByWorkflow([w.id]);
     res.json({ data: serialize(w, stats.get(w.id)) });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/workflows/:workflowId/enroll ───────────────
+// Manually enroll leads into a workflow (must be active to run).
+router.post(
+  "/funnels/:funnelId/workflows/:workflowId/enroll",
+  asyncHandler<WorkflowParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
+    const leadIds = Array.isArray(req.body?.leadIds) ? (req.body.leadIds as unknown[]).map(String) : [];
+    if (leadIds.length === 0) throw new ApiError(400, "leadIds required");
+    const enrolled = await enrollLeadsDirect(orgId, w.id, leadIds);
+    res.json({ data: { enrolled } });
   }),
 );
 

@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
 import twilioSdk from "twilio";
 import { ApiError } from "../lib/helpers";
+import { fireTriggerForLead, notifyWorkflowEvent } from "../services/workflow-engine";
 
 const { AccessToken } = twilioSdk.jwt;
 const { VoiceGrant } = AccessToken;
@@ -411,6 +412,10 @@ webhookRouter.post(
             meta: { channel: "sms", direction: "inbound", body },
             timestamp: new Date(),
           });
+
+          // Workflow reactions on an inbound reply.
+          void notifyWorkflowEvent(lead.id, "replied");
+          void fireTriggerForLead(lead.id, "reply_received");
 
           // Notify the rep who last texted this lead, else the line's owner.
           const [lastOut] = await db
