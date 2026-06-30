@@ -1,5 +1,8 @@
 import { Request, Response, NextFunction } from "express";
 import { getAuth, clerkClient } from "@clerk/express";
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { users } from "../db/schema/organizations";
 import { ApiError } from "./helpers";
 
 /**
@@ -14,6 +17,47 @@ import { ApiError } from "./helpers";
 
 const TTL_MS = 30_000;
 const cache = new Map<string, { orgs: Set<string>; exp: number }>();
+
+/**
+ * Re-point a user's (single-row) `users` record to an org they STILL belong to
+ * in Clerk after a membership change. CRITICAL safety: removing a user from one
+ * org must never blank their record while they remain in OTHER orgs — doing so
+ * made them vanish platform-wide (off every team list, role-less). We keep the
+ * row pointing at a still-valid org (preferring the one it already references),
+ * and only clear it when the user has no memberships left. Clerk is the source
+ * of truth; this just keeps our cache coherent. Best-effort — never throws.
+ */
+export async function syncUserPrimaryOrg(userId: string): Promise<void> {
+  invalidateOrgMembership(userId);
+  let memberships: { organization: { id: string }; role: string }[];
+  try {
+    const res = await clerkClient.users.getOrganizationMembershipList({ userId, limit: 100 });
+    memberships = res.data.map((m) => ({ organization: { id: m.organization.id }, role: m.role }));
+  } catch {
+    return; // don't risk clobbering the record on a transient Clerk error
+  }
+  try {
+    if (memberships.length === 0) {
+      await db
+        .update(users)
+        .set({ organizationId: null, role: null, updatedAt: new Date() })
+        .where(eq(users.id, userId));
+      return;
+    }
+    const current = await db.query.users.findFirst({
+      where: eq(users.id, userId),
+      columns: { organizationId: true },
+    });
+    const keep =
+      memberships.find((m) => m.organization.id === current?.organizationId) ?? memberships[0];
+    await db
+      .update(users)
+      .set({ organizationId: keep.organization.id, role: keep.role, updatedAt: new Date() })
+      .where(eq(users.id, userId));
+  } catch (err) {
+    console.error("[syncUserPrimaryOrg] failed:", err instanceof Error ? err.message : err);
+  }
+}
 
 /** Drop a user's cached membership set so a change takes effect immediately
  *  (called when we add/remove a member, or on a Clerk membership webhook). */

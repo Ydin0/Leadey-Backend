@@ -17,7 +17,7 @@ import { setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
-import { invalidateOrgMembership } from "../lib/org-membership";
+import { invalidateOrgMembership, syncUserPrimaryOrg } from "../lib/org-membership";
 
 const router = Router();
 
@@ -556,15 +556,10 @@ router.post("/clerk", async (req: Request, res: Response) => {
         break;
       }
       case "organizationMembership.deleted": {
-        invalidateOrgMembership(data.public_user_data.user_id);
-        await db
-          .update(users)
-          .set({
-            organizationId: null,
-            role: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(users.id, data.public_user_data.user_id));
+        // Re-point to a still-valid org instead of blanket-nulling the row,
+        // which would wipe a multi-org user platform-wide. (Also invalidates
+        // the membership cache.)
+        await syncUserPrimaryOrg(data.public_user_data.user_id);
         break;
       }
 

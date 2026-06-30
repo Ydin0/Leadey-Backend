@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, count, gte, sql } from "drizzle-orm";
+import { eq, and, count, gte, sql, inArray } from "drizzle-orm";
 import { clerkClient } from "@clerk/express";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
@@ -11,7 +11,7 @@ import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
-import { invalidateOrgMembership } from "../lib/org-membership";
+import { syncUserPrimaryOrg } from "../lib/org-membership";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
@@ -115,24 +115,56 @@ router.get(
       .where(eq(organizations.id, orgId));
     if (!org) throw new ApiError(404, "Organization not found");
 
-    const members = await db
-      .select()
-      .from(users)
-      .where(eq(users.organizationId, orgId));
+    // Source the roster from CLERK — the source of truth for org membership.
+    // Our single-row `users` table only stores one org per user, so a multi-org
+    // member would otherwise be missing from every org's list but one. We pull
+    // this org's real memberships from Clerk and enrich with locally-stored
+    // fields; roles are per-org (from the Clerk membership). DB fallback on a
+    // transient Clerk error.
+    type Member = {
+      id: string; email: string; firstName: string | null; lastName: string | null;
+      imageUrl: string | null; role: string; createdAt: string;
+    };
+    let members: Member[];
+    try {
+      const list = await clerkClient.organizations.getOrganizationMembershipList({
+        organizationId: orgId,
+        limit: 100,
+      });
+      const ids = list.data.map((m) => m.publicUserData?.userId).filter(Boolean) as string[];
+      const rows = ids.length ? await db.select().from(users).where(inArray(users.id, ids)) : [];
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      members = list.data.map((m) => {
+        const pud = m.publicUserData;
+        const row = pud?.userId ? byId.get(pud.userId) : undefined;
+        return {
+          id: pud?.userId || m.id,
+          email: pud?.identifier || row?.email || "",
+          firstName: pud?.firstName ?? row?.firstName ?? null,
+          lastName: pud?.lastName ?? row?.lastName ?? null,
+          imageUrl: pud?.imageUrl ?? row?.imageUrl ?? null,
+          role: m.role || "org:member",
+          createdAt: new Date(m.createdAt).toISOString(),
+        };
+      });
+    } catch {
+      const rows = await db.select().from(users).where(eq(users.organizationId, orgId));
+      members = rows.map((m) => ({
+        id: m.id,
+        email: m.email,
+        firstName: m.firstName,
+        lastName: m.lastName,
+        imageUrl: m.imageUrl,
+        role: m.role || "org:member",
+        createdAt: m.createdAt.toISOString(),
+      }));
+    }
 
     const config = getPlanConfig(org.plan);
 
     res.json({
       data: {
-        members: members.map((m) => ({
-          id: m.id,
-          email: m.email,
-          firstName: m.firstName,
-          lastName: m.lastName,
-          imageUrl: m.imageUrl,
-          role: m.role || "org:member",
-          createdAt: m.createdAt.toISOString(),
-        })),
+        members,
         seatUsage: {
           used: members.length,
           included: org.seatsIncluded || config.seats,
@@ -481,16 +513,12 @@ router.delete(
       }
     }
 
-    // Detach in our DB — GET /team reads from the users table, so this is what
-    // actually removes them from the list (idempotent regardless of Clerk).
-    await db
-      .update(users)
-      .set({ organizationId: null, updatedAt: new Date() })
-      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
-
-    // Drop the cached membership set so the org-membership guard denies their
-    // next request immediately rather than after the cache TTL.
-    invalidateOrgMembership(userId);
+    // Re-point our single-row users record to an org they STILL belong to (or
+    // clear it only if none remain). NEVER blanket-null it — that wiped the
+    // user platform-wide even though they were members of other orgs. Also
+    // invalidates the membership cache so the guard denies the removed org
+    // immediately.
+    await syncUserPrimaryOrg(userId);
 
     res.json({ data: { id: userId, removed: true } });
   }),
