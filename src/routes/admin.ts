@@ -19,6 +19,7 @@ import {
   isSyncInProgress,
 } from "../lib/twilio-cost-sync";
 import { inviteEmailToOrganization, invitePlatformAdmin, ensureOrgMembershipCap } from "../lib/invitations";
+import { syncUserPrimaryOrg } from "../lib/org-membership";
 import { alias } from "drizzle-orm/pg-core";
 
 const accountManagers = alias(users, "account_managers");
@@ -283,6 +284,35 @@ router.get(
       : 0;
     const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0);
 
+    // Source the member roster from CLERK (source of truth) enriched with our
+    // users rows. The `users` table stores a single org per user, so a multi-org
+    // member (e.g. someone in this org AND another) would be missing from
+    // `org.users` whenever their row points at the other org — they'd vanish
+    // from this org's member list even though they're a real member. DB fallback
+    // on a transient Clerk error.
+    let members: any[] = org.users;
+    try {
+      const cl = await clerkFetch(`/organizations/${org.id}/memberships?limit=100`);
+      const list = Array.isArray(cl?.data) ? cl.data : [];
+      const byId = new Map((org.users as any[]).map((u) => [u.id, u]));
+      members = list.map((m: any) => {
+        const pud = m.public_user_data || {};
+        const row: any = byId.get(pud.user_id) || {};
+        return {
+          id: pud.user_id || row.id,
+          email: pud.identifier || row.email || "",
+          firstName: pud.first_name ?? row.firstName ?? null,
+          lastName: pud.last_name ?? row.lastName ?? null,
+          imageUrl: pud.image_url ?? row.imageUrl ?? null,
+          role: m.role || row.role || "org:member",
+          organizationId: org.id,
+          createdAt: m.created_at ? new Date(m.created_at).toISOString() : row.createdAt ?? null,
+        };
+      });
+    } catch {
+      /* keep DB-sourced org.users as a fallback */
+    }
+
     res.json({
       data: {
         id: org.id,
@@ -309,8 +339,8 @@ router.get(
         callRecording: planConfig.callRecording,
         aiSummaries: planConfig.aiSummaries,
         mrrPence,
-        memberCount: org.users.length,
-        members: org.users,
+        memberCount: members.length,
+        members,
         accountManagerId: org.accountManagerId,
         accountManager: org.accountManager
           ? {
@@ -1252,10 +1282,9 @@ router.delete(
       { method: "DELETE" },
     );
 
-    await db
-      .update(users)
-      .set({ organizationId: null, role: null, updatedAt: new Date() })
-      .where(eq(users.id, req.params.userId));
+    // Re-point to a still-valid org instead of blanket-nulling — nulling wiped
+    // a multi-org user platform-wide even though they remained in other orgs.
+    await syncUserPrimaryOrg(req.params.userId);
 
     await recordAudit({
       actorUserId: actor,
