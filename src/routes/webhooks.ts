@@ -13,7 +13,7 @@ import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { createId, scoreLead } from "../lib/helpers";
 import crypto from "crypto";
-import { setLeadCustomFields } from "../lib/custom-fields-service";
+import { setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields-service";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
@@ -110,6 +110,8 @@ router.post("/smartlead", async (req: Request, res: Response) => {
 /** Standard lead fields a webhook payload can target. */
 const STANDARD_LEAD_FIELDS = new Set([
   "name",
+  "firstName",
+  "lastName",
   "email",
   "company",
   "title",
@@ -117,13 +119,31 @@ const STANDARD_LEAD_FIELDS = new Set([
   "linkedinUrl",
 ]);
 
-/** Convenience aliases so common payload keys map without explicit config. */
+/** Convenience aliases so common payload keys map without explicit config —
+ *  covers the field names Facebook Lead Ads / Zapier commonly emit. */
 const FIELD_ALIASES: Record<string, string> = {
   full_name: "name",
   fullname: "name",
+  first_name: "firstName",
+  firstname: "firstName",
+  fname: "firstName",
+  last_name: "lastName",
+  lastname: "lastName",
+  lname: "lastName",
+  surname: "lastName",
+  email_address: "email",
+  work_email: "email",
   company_name: "company",
+  organization: "company",
+  organisation: "company",
+  business: "company",
+  business_name: "company",
   job_title: "title",
+  position: "title",
   phone_number: "phone",
+  mobile_number: "phone",
+  mobile: "phone",
+  telephone: "phone",
   linkedin_url: "linkedinUrl",
   linkedin_profile: "linkedinUrl",
   linkedin: "linkedinUrl",
@@ -185,8 +205,12 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
     }
 
     const email = (standard.email || "").toLowerCase();
+    // Compose a display name from first/last when no explicit `name` was sent
+    // (Facebook Lead Ads provides first_name + last_name, not full_name).
+    const composedName =
+      standard.name || [standard.firstName, standard.lastName].filter(Boolean).join(" ");
     // Require at least an email or a name to create a meaningful lead.
-    if (!email && !standard.name) {
+    if (!email && !composedName) {
       res
         .status(422)
         .json({ ok: false, error: "payload must include an email or name" });
@@ -212,7 +236,9 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
       leadId = existing.id;
       created = false;
       const patch: Partial<typeof leads.$inferInsert> = { updatedAt: new Date() };
-      if (standard.name) patch.name = standard.name;
+      if (composedName) patch.name = composedName;
+      if (standard.firstName) patch.firstName = standard.firstName;
+      if (standard.lastName) patch.lastName = standard.lastName;
       if (standard.company) patch.company = standard.company;
       if (standard.title) patch.title = standard.title;
       if (standard.phone) patch.phone = standard.phone;
@@ -224,7 +250,9 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
       await db.insert(leads).values({
         id: leadId,
         funnelId,
-        name: standard.name || standard.company || email || "Unknown",
+        name: composedName || standard.company || email || "Unknown",
+        firstName: standard.firstName || null,
+        lastName: standard.lastName || null,
         title: standard.title || "",
         company: standard.company || "",
         email,
@@ -236,7 +264,7 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
         source: "Webhook",
         sourceType: "webhook",
         score: scoreLead({
-          name: standard.name,
+          name: composedName,
           email,
           phone: standard.phone,
           linkedinUrl: standard.linkedinUrl,
@@ -248,8 +276,11 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
       });
     }
 
-    // Persist mapped custom field values.
+    // Persist mapped custom field values. Auto-provision the definition for any
+    // mapped custom key that doesn't exist yet (safety net) so a webhook value
+    // is never silently dropped just because the field wasn't pre-created.
     if (Object.keys(customValues).length > 0) {
+      await Promise.all(Object.keys(customValues).map((k) => ensureFieldDefinition(orgId, k)));
       await setLeadCustomFields(orgId, leadId, customValues);
     }
 

@@ -60,7 +60,7 @@ import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
-import { getCustomFieldsForLeads, setLeadCustomFields } from "../lib/custom-fields-service";
+import { getCustomFieldsForLeads, setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields-service";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
@@ -983,6 +983,13 @@ router.patch(
         if (k && v) clean[k] = v;
       }
       patch.webhookFieldMap = clean;
+      // Auto-create any mapped custom field so it's usable immediately (shows in
+      // Settings + lead profiles) without a separate Settings trip.
+      await Promise.all(
+        Object.values(clean)
+          .filter((t) => t.startsWith("custom:"))
+          .map((t) => ensureFieldDefinition(orgId, t.slice("custom:".length))),
+      );
     }
 
     if (Object.keys(patch).length > 0) {

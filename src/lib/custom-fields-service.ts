@@ -137,6 +137,45 @@ export async function saveFieldDefinitions(
   return listFieldDefinitions(orgId);
 }
 
+/** Turn a field key into a human label, e.g. "funding_stage" → "Funding Stage". */
+function humanizeKey(key: string): string {
+  return key
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Ensure a custom field definition exists for the org, creating a simple text
+ *  field if it doesn't. Idempotent and INSERT-only — never deletes or alters an
+ *  existing definition. Used so a webhook can map to a custom field without it
+ *  having to be pre-created in Settings. Returns the resolved field key. */
+export async function ensureFieldDefinition(
+  orgId: string,
+  key: string,
+  label?: string,
+): Promise<string | null> {
+  const k = slugifyFieldKey(key) || key.trim();
+  if (!k) return null;
+  const existing = await db.query.leadFieldDefinitions.findFirst({
+    where: and(eq(leadFieldDefinitions.organizationId, orgId), eq(leadFieldDefinitions.key, k)),
+  });
+  if (existing) return k;
+  const count = await db.$count(leadFieldDefinitions, eq(leadFieldDefinitions.organizationId, orgId));
+  await db.insert(leadFieldDefinitions).values({
+    id: createId("lfd"),
+    organizationId: orgId,
+    key: k,
+    label: (label && label.trim()) || humanizeKey(k),
+    fieldType: "text",
+    options: [],
+    isRequired: false,
+    sortOrder: count,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  return k;
+}
+
 export interface LeadCustomField {
   key: string;
   label: string;
