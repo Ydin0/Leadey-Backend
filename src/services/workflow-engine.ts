@@ -25,16 +25,20 @@ type Enrollment = typeof workflowEnrollments.$inferSelect;
 
 /** Map a Trigger node's selected label to a canonical trigger key. */
 export type TriggerType =
-  | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "manual";
+  | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "meeting_booked" | "manual";
 function triggerTypeFromLabel(label: string): TriggerType {
   switch (label) {
     case "Status changes": return "status_changed";
     case "Tag added": return "tag_added";
     case "Reply received": return "reply_received";
+    case "Meeting booked": return "meeting_booked";
     case "Manually added": return "manual";
     default: return "lead_enters_campaign";
   }
 }
+
+/** Context carried by a trigger so its config can filter (status-to, tag, …). */
+export interface TriggerCtx { status?: string; tag?: string }
 
 function graphOf(w: { graph: WorkflowGraph | null }): WorkflowGraph {
   return w.graph && Array.isArray(w.graph.nodes) ? w.graph : { nodes: [], edges: [] };
@@ -192,6 +196,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         stepIndex: 0, meta: { source: "workflow" }, timestamp: new Date(),
       });
       await logRun(enr, node, "done", { status: key });
+      void fireTriggerForLead(lead.id, "status_changed", { status: key }); // chain status-change workflows
       return;
     }
     case "tag": {
@@ -201,7 +206,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const next = d.mode === "remove" ? current.filter((t) => t !== tag) : Array.from(new Set([...current, tag]));
       await db.update(leads).set({ tags: next, updatedAt: new Date() }).where(eq(leads.id, lead.id));
       await logRun(enr, node, "done", { tag, mode: d.mode });
-      if (d.mode !== "remove") void notifyWorkflowEvent(lead.id, "tag_added"); // may trigger tag workflows
+      if (d.mode !== "remove") void fireTriggerForLead(lead.id, "tag_added", { tag }); // chain tag-added workflows
       return;
     }
     case "field": {
@@ -416,7 +421,7 @@ export function startWorkflowEngine(): void {
 /** Enroll one or more leads into every active workflow in the funnel whose
  *  Trigger matches `type`. Fire-and-forget safe — never throws to the caller. */
 export async function fireTrigger(
-  orgId: string, funnelId: string, leadIds: string | string[], type: TriggerType,
+  orgId: string, funnelId: string, leadIds: string | string[], type: TriggerType, ctx?: TriggerCtx,
 ): Promise<void> {
   try {
     const ids = Array.isArray(leadIds) ? leadIds : [leadIds];
@@ -426,7 +431,17 @@ export async function fireTrigger(
       const g = graphOf(wf);
       const trigger = g.nodes.find((n) => n.type === "trigger");
       if (!trigger) continue;
-      if (triggerTypeFromLabel(String((trigger.data as any)?.label || "")) !== type) continue;
+      const tdata = (trigger.data || {}) as Record<string, unknown>;
+      if (triggerTypeFromLabel(String(tdata.label || "")) !== type) continue;
+      // Per-trigger config filters: only enroll on the configured target.
+      if (type === "status_changed") {
+        const want = String(tdata.statusTo || "").trim();
+        if (want && ctx?.status !== want) continue; // empty = any status change
+      }
+      if (type === "tag_added") {
+        const want = String(tdata.tag || "").trim();
+        if (want && ctx?.tag !== want) continue; // empty = any tag
+      }
       await enrollInto(wf, ids);
     }
   } catch (e) {
@@ -470,13 +485,13 @@ export async function enrollLeadsDirect(orgId: string, workflowId: string, leadI
 
 /** Convenience for callers that only have a leadId (reply hooks): resolve the
  *  lead's org + funnel and fire the trigger. */
-export async function fireTriggerForLead(leadId: string, type: TriggerType): Promise<void> {
+export async function fireTriggerForLead(leadId: string, type: TriggerType, ctx?: TriggerCtx): Promise<void> {
   try {
     const [lead] = await db.select({ funnelId: leads.funnelId }).from(leads).where(eq(leads.id, leadId));
     if (!lead) return;
     const [f] = await db.select({ orgId: funnels.organizationId }).from(funnels).where(eq(funnels.id, lead.funnelId));
     if (!f) return;
-    await fireTrigger(f.orgId, lead.funnelId, leadId, type);
+    await fireTrigger(f.orgId, lead.funnelId, leadId, type, ctx);
   } catch { /* best effort */ }
 }
 

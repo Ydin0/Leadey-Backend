@@ -18,7 +18,7 @@ import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
 import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
-import { fireTrigger, notifyWorkflowEvent } from "../services/workflow-engine";
+import { fireTrigger, fireTriggerForLead, notifyWorkflowEvent } from "../services/workflow-engine";
 
 const router = Router();
 
@@ -953,8 +953,12 @@ router.post("/calendly/:accountId", async (req: Request, res: Response) => {
           meta: { channel: "calendly", title, startTime: startTime?.toISOString() || null, joinUrl, inviteeEmail },
           timestamp: new Date(),
         });
-        // Wake wait-for-event steps + apply exit-on-meeting for active workflows.
-        if (status !== "canceled") void notifyWorkflowEvent(leadId, "meeting_booked");
+        // Wake wait-for-event steps + apply exit-on-meeting, and enroll into any
+        // "meeting booked" trigger workflows.
+        if (status !== "canceled") {
+          void notifyWorkflowEvent(leadId, "meeting_booked");
+          void fireTriggerForLead(leadId, "meeting_booked");
+        }
         try {
           const { createNotification } = await import("./notifications");
           await createNotification({

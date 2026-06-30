@@ -1442,8 +1442,9 @@ router.patch(
         ),
       );
 
-    // Enroll into any active "status changes" workflows (fire-and-forget).
-    void fireTrigger(orgId, funnel.id, lead.id, "status_changed");
+    // Enroll into any active "status changes" workflows (fire-and-forget) —
+    // pass the new status so a "changes to X" trigger only fires on a match.
+    void fireTrigger(orgId, funnel.id, lead.id, "status_changed", { status });
 
     res.json({ data: { id: lead.id, status, company: lead.company } });
   }),
