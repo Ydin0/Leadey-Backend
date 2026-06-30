@@ -44,6 +44,7 @@ import adminRouter, { adminMeRouter } from "./routes/admin";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
 import { requireApiAuth, requireAdmin } from "./lib/admin-auth";
+import { requireOrgMembership } from "./lib/org-membership";
 
 const app = express();
 
@@ -84,7 +85,13 @@ app.use("/api/admin", requireAdmin, adminRouter);
 app.use(emailPublicRouter);
 app.use(calendlyPublicRouter);
 
-// Authenticated API routes
+// Authenticated API routes. requireOrgMembership runs first for every /api/*
+// request: it verifies the caller is STILL a member (per Clerk) of the org in
+// their token, so a removed member can't keep using a stale token/session to
+// reach the old org's data. (Registered after the /api/admin routers above, so
+// it doesn't affect global admin endpoints.)
+app.use("/api", requireAuth(), requireOrgMembership);
+
 app.use("/api", requireAuth(), dashboardRouter);
 app.use("/api", requireAuth(), leadsRouter);
 app.use("/api", requireAuth(), apiRouter);

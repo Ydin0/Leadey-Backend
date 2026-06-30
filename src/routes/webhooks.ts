@@ -17,6 +17,7 @@ import { setLeadCustomFields } from "../lib/custom-fields-service";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
+import { invalidateOrgMembership } from "../lib/org-membership";
 
 const router = Router();
 
@@ -488,6 +489,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
       case "organizationMembership.created": {
         const pud = data.public_user_data || {};
         const userId = pud.user_id;
+        invalidateOrgMembership(userId);
         // Upsert — the user.created webhook may not have landed yet, in which
         // case a plain UPDATE would silently miss and leave them orgless.
         await db
@@ -512,6 +514,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
         break;
       }
       case "organizationMembership.updated": {
+        invalidateOrgMembership(data.public_user_data.user_id);
         await db
           .update(users)
           .set({
@@ -522,6 +525,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
         break;
       }
       case "organizationMembership.deleted": {
+        invalidateOrgMembership(data.public_user_data.user_id);
         await db
           .update(users)
           .set({

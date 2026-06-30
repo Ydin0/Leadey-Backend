@@ -11,6 +11,7 @@ import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
+import { invalidateOrgMembership } from "../lib/org-membership";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
@@ -486,6 +487,10 @@ router.delete(
       .update(users)
       .set({ organizationId: null, updatedAt: new Date() })
       .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+
+    // Drop the cached membership set so the org-membership guard denies their
+    // next request immediately rather than after the cache TTL.
+    invalidateOrgMembership(userId);
 
     res.json({ data: { id: userId, removed: true } });
   }),
