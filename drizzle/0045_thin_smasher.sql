@@ -1,0 +1,1 @@
+CREATE INDEX "dialer_queue_items_status_called_at" ON "dialer_queue_items" USING btree ("status","called_at");

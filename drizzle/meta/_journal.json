@@ -309,6 +309,20 @@
       "when": 1782744845940,
       "tag": "0043_married_random",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1782817406499,
+      "tag": "0044_tearful_gauntlet",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1782817521960,
+      "tag": "0045_thin_smasher",
+      "breakpoints": true
     }
   ]
 }

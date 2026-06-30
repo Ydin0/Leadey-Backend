@@ -113,9 +113,13 @@ export const dialerSessions = pgTable(
     filtersJson: jsonb("filters_json")
       .$type<{
         excludeDoNotCall: boolean;
+        excludeClosed: boolean;
         excludeRecentlyCalled: boolean;
+        /** Recency window in HOURS (replaces the old day-granular field). */
+        recentlyCalledHours?: number;
+        /** Legacy day-granular window — read for in-flight sessions only. */
+        recentlyCalledDays?: number;
         respectTimezone: boolean;
-        maxAttempts: number | null;
       }>()
       .notNull(),
     startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
@@ -161,9 +165,18 @@ export const dialerQueueItems = pgTable(
     }),
     notes: text("notes"),
     calledAt: timestamp("called_at", { withTimezone: true }),
+    /** When this item entered in_progress/awaiting_disposition — the live
+     *  ownership claim. Cross-session collision treats a claim as live only
+     *  while claimedAt is within CLAIM_TTL, so crashed/closed sessions
+     *  auto-release instead of locking a lead forever. */
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
   },
   (t) => [
     uniqueIndex("dialer_queue_items_session_position").on(t.sessionId, t.position),
     index("dialer_queue_items_session_status").on(t.sessionId, t.status),
+    // Cross-session ownership/recency lookups by lead within an org.
+    index("dialer_queue_items_lead_status").on(t.leadId, t.status),
+    // Bounds the org-wide "recently completed" recency scan to the time window.
+    index("dialer_queue_items_status_called_at").on(t.status, t.calledAt),
   ],
 );

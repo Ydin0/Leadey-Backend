@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, jsonb, real, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, jsonb, real, boolean, index } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 import { phoneLines } from "./phone-lines";
 
@@ -72,4 +72,9 @@ export const callRecords = pgTable("call_records", {
   twilioPriceSyncedAt: timestamp("twilio_price_synced_at", { withTimezone: true }),
   calledAt: timestamp("called_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Dialer recency scans filter by org over a recent time window.
+  index("call_records_org_called_at").on(t.organizationId, t.calledAt),
+  // Per-lead recency lookups.
+  index("call_records_lead_id").on(t.leadId),
+]);
