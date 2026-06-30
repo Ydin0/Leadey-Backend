@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, asc, desc, gte } from "drizzle-orm";
+import { eq, and, asc, desc, gte, sql } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -251,6 +251,36 @@ router.get(
       if (!t.contactName && r.leadName) { t.contactName = r.leadName; t.company = r.leadCompany ?? null; }
     }
     res.json({ data: [...threads.values()] });
+  }),
+);
+
+// GET /api/sms/thread-by-phone?phone=... — the full conversation with one
+// counterparty number (matched on the last 10 digits), oldest first. Powers
+// the inbox chat panel for numbers that aren't linked to a lead.
+router.get(
+  "/sms/thread-by-phone",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const last10 = String(req.query.phone || "").replace(/[^\d]/g, "").slice(-10);
+    if (!last10) throw new ApiError(400, "phone required");
+    const rows = await db
+      .select()
+      .from(smsMessages)
+      .where(
+        and(
+          eq(smsMessages.organizationId, orgId),
+          sql`(right(regexp_replace(${smsMessages.fromNumber}, '[^0-9]', '', 'g'), 10) = ${last10}
+               OR right(regexp_replace(${smsMessages.toNumber}, '[^0-9]', '', 'g'), 10) = ${last10})`,
+        ),
+      )
+      .orderBy(smsMessages.createdAt)
+      .limit(500);
+    res.json({
+      data: rows.map((m) => ({
+        id: m.id, direction: m.direction, fromNumber: m.fromNumber, toNumber: m.toNumber,
+        body: m.body, status: m.status, userId: m.userId, createdAt: m.createdAt.toISOString(),
+      })),
+    });
   }),
 );
 
