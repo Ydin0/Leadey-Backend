@@ -11,7 +11,7 @@ import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
-import { syncUserPrimaryOrg } from "../lib/org-membership";
+import { syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
@@ -519,6 +519,9 @@ router.delete(
     // invalidates the membership cache so the guard denies the removed org
     // immediately.
     await syncUserPrimaryOrg(userId);
+    // Detach them from this org's campaigns / leads / tasks so they don't
+    // linger as "Unknown" assignees.
+    await cleanupUserOrgAssignments(orgId, userId);
 
     res.json({ data: { id: userId, removed: true } });
   }),

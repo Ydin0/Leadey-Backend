@@ -19,7 +19,7 @@ import {
   isSyncInProgress,
 } from "../lib/twilio-cost-sync";
 import { inviteEmailToOrganization, invitePlatformAdmin, ensureOrgMembershipCap } from "../lib/invitations";
-import { syncUserPrimaryOrg } from "../lib/org-membership";
+import { syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
 import { alias } from "drizzle-orm/pg-core";
 
 const accountManagers = alias(users, "account_managers");
@@ -1285,6 +1285,8 @@ router.delete(
     // Re-point to a still-valid org instead of blanket-nulling — nulling wiped
     // a multi-org user platform-wide even though they remained in other orgs.
     await syncUserPrimaryOrg(req.params.userId);
+    // Detach from this org's campaigns / leads / tasks (no "Unknown" lingering).
+    await cleanupUserOrgAssignments(req.params.id, req.params.userId);
 
     await recordAudit({
       actorUserId: actor,

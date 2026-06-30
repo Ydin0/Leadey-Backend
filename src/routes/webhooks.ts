@@ -17,7 +17,7 @@ import { setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
-import { invalidateOrgMembership, syncUserPrimaryOrg } from "../lib/org-membership";
+import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
 import { fireTrigger, notifyWorkflowEvent } from "../services/workflow-engine";
 
 const router = Router();
@@ -564,6 +564,11 @@ router.post("/clerk", async (req: Request, res: Response) => {
         // which would wipe a multi-org user platform-wide. (Also invalidates
         // the membership cache.)
         await syncUserPrimaryOrg(data.public_user_data.user_id);
+        // Detach from that org's campaigns / leads / tasks so they don't show
+        // as "Unknown" assignees after removal (e.g. via the Clerk dashboard).
+        if (data.organization?.id) {
+          await cleanupUserOrgAssignments(data.organization.id, data.public_user_data.user_id);
+        }
         break;
       }
 

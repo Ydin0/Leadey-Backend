@@ -1,9 +1,35 @@
 import { Request, Response, NextFunction } from "express";
 import { getAuth, clerkClient } from "@clerk/express";
-import { eq } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { users } from "../db/schema/organizations";
+import { funnels, funnelMembers } from "../db/schema/funnels";
+import { leads } from "../db/schema/leads";
+import { leadTasks } from "../db/schema/lead-tasks";
 import { ApiError } from "./helpers";
+
+/**
+ * Detach a removed member from everything they were assigned to WITHIN one org,
+ * so they stop appearing (as "Unknown") on campaigns, leads and tasks. Scoped
+ * to the org's funnels, so a user who is still a member of OTHER orgs keeps
+ * their assignments there. Best-effort — never throws to the caller.
+ */
+export async function cleanupUserOrgAssignments(orgId: string, userId: string): Promise<void> {
+  try {
+    const orgFunnels = await db.select({ id: funnels.id }).from(funnels).where(eq(funnels.organizationId, orgId));
+    const fids = orgFunnels.map((f) => f.id);
+    if (fids.length) {
+      // Campaign assignment (the "Assigned reps" avatars + filter).
+      await db.delete(funnelMembers).where(and(eq(funnelMembers.userId, userId), inArray(funnelMembers.funnelId, fids)));
+      // Lead ownership.
+      await db.update(leads).set({ ownerId: null, updatedAt: new Date() }).where(and(eq(leads.ownerId, userId), inArray(leads.funnelId, fids)));
+    }
+    // Open tasks assigned to them become unassigned.
+    await db.update(leadTasks).set({ assigneeId: null, updatedAt: new Date() }).where(and(eq(leadTasks.assigneeId, userId), eq(leadTasks.organizationId, orgId)));
+  } catch (e) {
+    console.error("[cleanupUserOrgAssignments] failed:", e instanceof Error ? e.message : e);
+  }
+}
 
 /**
  * Authoritative per-request check that the caller is STILL a member of the org
