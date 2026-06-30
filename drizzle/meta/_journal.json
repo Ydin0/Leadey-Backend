@@ -337,6 +337,13 @@
       "when": 1782849866264,
       "tag": "0047_breezy_nico_minoru",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1782859812134,
+      "tag": "0048_plain_skullbuster",
+      "breakpoints": true
     }
   ]
 }

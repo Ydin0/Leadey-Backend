@@ -43,9 +43,12 @@ import callsRouter from "./routes/calls";
 import callOutcomesRouter from "./routes/call-outcomes";
 import workflowsRouter from "./routes/workflows";
 import adminRouter, { adminMeRouter } from "./routes/admin";
+import apiKeysRouter from "./routes/api-keys";
+import v1Router from "./routes/v1/index";
 import { readVoicemailFile } from "./lib/voicemail-storage";
 import { planGuard } from "./lib/plan-guard";
 import { requireApiAuth, requireAdmin } from "./lib/admin-auth";
+import { requireApiKeyAuth } from "./lib/api-key-auth";
 import { requireOrgMembership } from "./lib/org-membership";
 
 const app = express();
@@ -88,6 +91,10 @@ app.use(emailPublicRouter);
 app.use(calendlyPublicRouter);
 app.use(calendarPublicRouter);
 
+// Public, versioned API. Authenticated by org-scoped API key (Bearer), NOT Clerk.
+// Distinct /v1 prefix, so ordering vs the /api routers below is irrelevant.
+app.use("/v1", requireApiKeyAuth, v1Router);
+
 // Authenticated API routes. requireOrgMembership runs first for every /api/*
 // request: it verifies the caller is STILL a member (per Clerk) of the org in
 // their token, so a removed member can't keep using a stale token/session to
@@ -108,6 +115,7 @@ app.use("/api", requireAuth(), creditsRouter);
 app.use("/api", requireAuth(), smartViewsRouter);
 app.use("/api", requireAuth(), masterRouter);
 app.use("/api", requireAuth(), teamRouter);
+app.use("/api", requireAuth(), apiKeysRouter);
 app.use("/api", requireAuth(), planGuard(), contactsRouter);
 app.use("/api", requireAuth(), planGuard(), templatesRouter);
 app.use("/api", requireAuth(), dialerRouter);
