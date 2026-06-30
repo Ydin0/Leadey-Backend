@@ -11,7 +11,7 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { sendEmail } from "../lib/email";
 import { sendEmailVia } from "../lib/email-providers";
-import { setLeadCustomFields } from "../lib/custom-fields-service";
+import { setLeadCustomFields, getCustomFieldsForLeads } from "../lib/custom-fields-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { createId } from "../lib/helpers";
 
@@ -49,15 +49,46 @@ function triggerStart(g: WorkflowGraph): string | null {
   return nextNodeId(g, trigger.id, "out");
 }
 
-function renderTokens(text: string, lead: Lead): string {
-  const first = lead.firstName || (lead.name || "").split(" ")[0] || "there";
-  const last = lead.lastName || (lead.name || "").split(" ").slice(1).join(" ");
+/** Build the {{snake_case}} token → value map for a lead, including every
+ *  custom field by its key. Mirrors the app's personalize catalog so workflow
+ *  steps and saved templates are interchangeable. */
+function buildTokens(lead: Lead, customFields: { key: string; value: string }[]): Record<string, string> {
+  const full = lead.name || [lead.firstName, lead.lastName].filter(Boolean).join(" ") || "";
+  const parts = full.split(" ").filter(Boolean);
+  const domain = lead.companyDomain || (lead.email?.split("@")[1] ?? "");
+  const map: Record<string, string> = {
+    first_name: lead.firstName || parts[0] || "",
+    last_name: lead.lastName || parts.slice(1).join(" ") || "",
+    full_name: full,
+    name: full,
+    company: lead.company || "",
+    title: lead.title || "",
+    email: lead.email || "",
+    domain,
+  };
+  for (const f of customFields) map[f.key] = f.value;
+  return map;
+}
+
+/** Replace {{snake_case}} tokens (the app/template convention), plus a legacy
+ *  fallback for the old {firstName}/{company}/… single-brace tokens so existing
+ *  steps keep working. Unknown {{tokens}} are left intact. */
+function renderTokens(text: string, tokens: Record<string, string>): string {
+  const first = tokens.first_name || (tokens.full_name || "").split(" ")[0] || "there";
   return (text || "")
+    .replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key) => (key in tokens ? tokens[key] : `{{${key}}}`))
     .replace(/\{firstName\}/g, first)
-    .replace(/\{lastName\}/g, last)
-    .replace(/\{name\}/g, lead.name || first)
-    .replace(/\{company\}/g, lead.company || "")
-    .replace(/\{email\}/g, lead.email || "");
+    .replace(/\{lastName\}/g, tokens.last_name || "")
+    .replace(/\{name\}/g, tokens.full_name || first)
+    .replace(/\{company\}/g, tokens.company || "")
+    .replace(/\{email\}/g, tokens.email || "");
+}
+
+/** Load a lead's custom field values as a flat {key,value} list. */
+async function leadTokens(lead: Lead): Promise<Record<string, string>> {
+  const map = await getCustomFieldsForLeads([lead.id]).catch(() => null);
+  const cfs = (map?.get(lead.id) || []).map((f) => ({ key: f.key, value: f.value }));
+  return buildTokens(lead, cfs);
 }
 
 const twilio = () => twilioSdk(process.env.TWILIO_ACCOUNT_SID!, process.env.TWILIO_AUTH_TOKEN!);
@@ -84,12 +115,15 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
   switch (node.type) {
     case "email": {
       if (!lead.email) { await logRun(enr, node, "skipped", { reason: "no email" }); return; }
-      const subject = renderTokens(String(d.subject || ""), lead);
-      const bodyText = renderTokens(String(d.body || ""), lead);
+      const tokens = await leadTokens(lead);
+      const subject = renderTokens(String(d.subject || ""), tokens);
+      const bodyText = renderTokens(String(d.body || ""), tokens);
       const html = bodyText.replace(/\n/g, "<br>");
       const accounts = await db.select().from(emailAccounts).where(eq(emailAccounts.organizationId, orgId));
+      const accountId = typeof d.accountId === "string" ? d.accountId : "";
       const fromAddr = typeof d.from === "string" ? d.from : "";
       const account =
+        (accountId ? accounts.find((a) => a.id === accountId) : undefined) ||
         (fromAddr ? accounts.find((a) => a.email === fromAddr) : undefined) ||
         accounts.find((a) => a.isDefault) || accounts[0];
       try {
@@ -117,12 +151,14 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
     }
     case "sms": {
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
-      const body = renderTokens(String(d.message || ""), lead);
+      const tokens = await leadTokens(lead);
+      const body = renderTokens(String(d.message || ""), tokens);
       const orgLines = await db.select().from(phoneLines).where(eq(phoneLines.organizationId, orgId));
       const active = orgLines.filter((l) => l.status === "active");
       const dest = phoneCountry(lead.phone);
       const same = (l: { number: string }) => dest === "other" || phoneCountry(l.number) === dest;
-      const line = active.find(same) || active[0];
+      const lineId = typeof d.lineId === "string" ? d.lineId : "";
+      const line = (lineId ? active.find((l) => l.id === lineId) : undefined) || active.find(same) || active[0];
       if (!line) { await logRun(enr, node, "skipped", { reason: "no phone line" }); return; }
       try {
         const base = process.env.PUBLIC_API_URL || process.env.API_BASE_URL || "";
