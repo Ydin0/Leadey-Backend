@@ -1,4 +1,4 @@
-import { eq, and, inArray, sql } from "drizzle-orm";
+import { eq, and, inArray, gte, sql } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/workflows";
@@ -285,7 +285,7 @@ async function leadHasOutcome(leadId: string, since: Date, outcome: string): Pro
   const rows = await db
     .select({ id: leadEvents.id })
     .from(leadEvents)
-    .where(and(eq(leadEvents.leadId, leadId), eq(leadEvents.outcome, outcome), sql`${leadEvents.timestamp} >= ${since}`))
+    .where(and(eq(leadEvents.leadId, leadId), eq(leadEvents.outcome, outcome), gte(leadEvents.timestamp, since)))
     .limit(1);
   return rows.length > 0;
 }
