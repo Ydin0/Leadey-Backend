@@ -8,7 +8,7 @@ import { leads } from "../db/schema/leads";
 import { desc } from "drizzle-orm";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
-import { enrollLeadsDirect } from "../services/workflow-engine";
+import { enrollLeadsDirect, triggerStart } from "../services/workflow-engine";
 
 const router = Router();
 
@@ -249,6 +249,30 @@ router.get(
         lead: { id: r.leadId, name: r.leadName || "Unknown", company: r.leadCompany || "", email: r.leadEmail || "" },
       })),
     });
+  }),
+);
+
+// ─── POST .../enrollments/:enrollmentId/retry ───────────────────────────
+// Re-run a finished/failed enrollment: reactivate it (resume at its current
+// step, or the start if it has none) and clear the error so the engine picks
+// it up on the next tick.
+router.post(
+  "/funnels/:funnelId/workflows/:workflowId/enrollments/:enrollmentId/retry",
+  asyncHandler<WorkflowParams & { enrollmentId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
+    const [enr] = await db
+      .select()
+      .from(workflowEnrollments)
+      .where(and(eq(workflowEnrollments.id, req.params.enrollmentId), eq(workflowEnrollments.workflowId, w.id)));
+    if (!enr) throw new ApiError(404, "Enrollment not found");
+    const resumeNode = enr.currentNodeId || triggerStart(w.graph as WorkflowGraph);
+    if (!resumeNode) throw new ApiError(400, "Workflow has no runnable steps");
+    await db
+      .update(workflowEnrollments)
+      .set({ status: "active", currentNodeId: resumeNode, nextRunAt: new Date(), waitingFor: null, lastError: null, completedAt: null })
+      .where(eq(workflowEnrollments.id, enr.id));
+    res.json({ data: { id: enr.id, status: "active" } });
   }),
 );
 
