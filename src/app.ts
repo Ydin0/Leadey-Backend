@@ -37,6 +37,7 @@ import smsRouter from "./routes/sms";
 import notificationsRouter from "./routes/notifications";
 import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts";
 import calendlyRouter, { calendlyPublicRouter } from "./routes/calendly";
+import calendarRouter, { calendarPublicRouter } from "./routes/calendar";
 import assistantRouter from "./routes/assistant";
 import callsRouter from "./routes/calls";
 import callOutcomesRouter from "./routes/call-outcomes";
@@ -85,6 +86,7 @@ app.use("/api/admin", requireAdmin, adminRouter);
 // registered BEFORE the authed /api routers so they aren't gated by requireAuth.
 app.use(emailPublicRouter);
 app.use(calendlyPublicRouter);
+app.use(calendarPublicRouter);
 
 // Authenticated API routes. requireOrgMembership runs first for every /api/*
 // request: it verifies the caller is STILL a member (per Clerk) of the org in
@@ -125,6 +127,7 @@ app.use("/api", requireAuth(), smsRouter);
 app.use("/api", requireAuth(), notificationsRouter);
 app.use("/api", requireAuth(), emailAccountsRouter);
 app.use("/api", requireAuth(), calendlyRouter);
+app.use("/api", requireAuth(), calendarRouter);
 app.use("/api", requireAuth(), assistantRouter);
 app.use("/api", requireAuth(), callsRouter);
 app.use("/api", requireAuth(), callOutcomesRouter);
