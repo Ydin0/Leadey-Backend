@@ -43,6 +43,18 @@ function nameFromEmail(email: string): string {
     .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
     .join(" ");
 }
+/** Readable company name from a domain ("digital-dust.co.uk" → "Digital Dust").
+ *  Used as a placeholder before enrichment and as the fallback when enrichment
+ *  can't resolve the company. */
+function companyFromDomain(domain: string): string {
+  const sld = normalizeDomain(domain).split(".")[0] || "";
+  if (!sld) return "";
+  return sld
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+    .join(" ");
+}
 import {
   ApiError,
   createId,
@@ -1192,10 +1204,12 @@ router.post(
         // No name column → derive a readable name from the email (placeholder
         // until person-enrichment); fall back to the raw email.
         if (!name) name = nameFromEmail(email) || email;
-        // A corporate domain becomes a temporary company label that enrichment
-        // replaces with the real name. Personal emails (gmail/outlook/…) have no
-        // company domain — leave the company blank; they import but aren't enriched.
-        if (!cName) cName = cDomainRaw;
+        // A corporate domain becomes a readable placeholder company that
+        // enrichment replaces with the real name (and which stays as a sensible
+        // fallback if enrichment can't resolve it). Personal emails
+        // (gmail/outlook/…) have no company domain — leave the company blank;
+        // they import but aren't enriched.
+        if (!cName) cName = cDomainRaw ? companyFromDomain(cDomainRaw) : "";
       }
       const cLinkedin = getField(row, LBL.cLinkedin);
       const cIndustry = getField(row, LBL.cIndustry);
@@ -2678,7 +2692,13 @@ router.post(
       if (!c) continue;
       const patch: Partial<typeof leads.$inferInsert> = {};
       const realName = (c.name || "").trim();
-      if (realName && (!l.company || l.company.toLowerCase() === d)) patch.company = realName;
+      // Replace the company only when it's still a placeholder — blank, the raw
+      // domain, or the readable-from-domain name we set at import.
+      const isPlaceholder =
+        !l.company ||
+        l.company.toLowerCase() === d ||
+        l.company === companyFromDomain(d);
+      if (realName && isPlaceholder) patch.company = realName;
       if (!l.companyDomain) patch.companyDomain = normalizeDomain(c.domain || d) || null;
       if (!l.companyIndustry && c.industry) patch.companyIndustry = c.industry;
       if (l.companyEmployeeCount == null && c.employee_count) {
@@ -2723,7 +2743,25 @@ router.post(
           createdAt: now,
           updatedAt: now,
         })
-        .onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
+        // The import may have created a placeholder company for this domain —
+        // correct it with the enriched firmographics.
+        .onConflictDoUpdate({
+          target: [masterCompanies.organizationId, masterCompanies.domain],
+          set: {
+            name: c.name.trim(),
+            linkedinUrl: c.linkedin_url || null,
+            industry: c.industry || null,
+            employeeCount: c.employee_count ? Math.min(Math.round(c.employee_count), EMPLOYEE_CAP) : null,
+            revenue: c.annual_revenue_usd ? Math.round(c.annual_revenue_usd) : null,
+            fundingStage: c.funding_stage || null,
+            country: c.country || null,
+            city: c.city || null,
+            logo: c.logo || null,
+            description: c.long_description ? c.long_description.slice(0, 2000) : null,
+            lastSeenAt: now,
+            updatedAt: now,
+          },
+        });
     }
 
     res.json({
