@@ -465,7 +465,14 @@ export function computeNextStepSchedule(
   currentStepIndex: number,
   now: number,
 ) {
-  const currentOffset = steps[currentStepIndex].dayOffset;
+  const currentStep = steps[currentStepIndex];
+  // Sequence-less campaign (or out-of-range step): nothing to schedule, and
+  // the lead must NOT be marked completed — "completed" means "finished the
+  // sequence", which can't happen when there isn't one.
+  if (!currentStep) {
+    return { nextDate: new Date(now).toISOString(), nextAction: "", completed: false };
+  }
+  const currentOffset = currentStep.dayOffset;
   const nextStep = steps[currentStepIndex + 1];
 
   if (!nextStep) {

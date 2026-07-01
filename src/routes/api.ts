@@ -564,11 +564,13 @@ router.post(
       throw new ApiError(400, "Funnel name is required");
     }
 
-    if (!Array.isArray(steps) || steps.length === 0) {
-      throw new ApiError(400, "At least one funnel step is required");
-    }
+    // Sequence steps are OPTIONAL. A campaign with no steps is a manual
+    // campaign: leads stay in "pending", are worked via calls/statuses, and
+    // are never auto-advanced or auto-completed by a sequence.
+    const stepsInput: Array<{ channel?: string; label?: string; dayOffset?: number; subject?: string; emailBody?: string; action?: string }> =
+      Array.isArray(steps) ? steps : [];
 
-    const normalizedSteps = steps
+    const normalizedSteps = stepsInput
       .map(
         (
           step: { channel?: string; label?: string; dayOffset?: number; subject?: string; emailBody?: string; action?: string },
@@ -844,9 +846,8 @@ router.patch(
     }> | null = null;
 
     if (hasSteps) {
-      if (body.steps.length === 0) {
-        throw new ApiError(400, "At least one funnel step is required");
-      }
+      // An empty steps array is valid — it removes the sequence, turning this
+      // into a manual campaign (leads keep their current position/status).
       normalizedSteps = body.steps
         .map(
           (
@@ -1106,9 +1107,6 @@ router.post(
       await loadFunnel(orgId, req.params.funnelId),
       req.params.funnelId,
     );
-    if (!funnel.steps || funnel.steps.length === 0) {
-      throw new ApiError(400, "Funnel has no steps configured");
-    }
 
     // Resolve a value by any of the accepted field labels (back-compat aware).
     const getField = (row: Record<string, unknown>, labels: string[]): string => {
@@ -1316,7 +1314,9 @@ router.post(
       newLeads.push({
         id: leadId, funnelId: funnel.id, importId, name, firstName: fnFinal, lastName: lnFinal, title, company: canonicalCompany, email, phone, linkedinUrl,
         currentStep: 1, totalSteps: funnel.steps.length, status: "pending",
-        nextAction: firstStep.label, nextDate: new Date(now + firstStep.dayOffset * DAY_MS),
+        // Sequence-less campaigns have no first step — leads land workable
+        // with no scheduled action instead of being rejected (or completed).
+        nextAction: firstStep?.label ?? "", nextDate: firstStep ? new Date(now + firstStep.dayOffset * DAY_MS) : null,
         source: "CSV Import", sourceType: "csv",
         score: scoreLead({ name, title, company: canonicalCompany, email, phone, linkedinUrl }),
         // Company fields backfilled after the loop from the final aggregate.
@@ -1508,7 +1508,11 @@ router.patch(
     const status = normalizeString(req.body && req.body.status).toLowerCase();
 
     const statuses = await getMergedLeadStatuses(orgId);
-    if (!status || !statuses.some((s) => s.key === status)) {
+    // "pending" is the operational in-sequence status (not part of the org's
+    // display list) — allowing it here lets a rep pull a lead back out of a
+    // terminal state like "completed" and make it workable again.
+    const isKnown = status === "pending" || statuses.some((s) => s.key === status);
+    if (!status || !isKnown) {
       throw new ApiError(400, "Invalid lead status");
     }
 
@@ -1532,11 +1536,18 @@ router.patch(
       timestamp: new Date(now),
     });
 
+    // Reverting to "pending" puts the lead back in the working queue — point
+    // it at its current step again (if the campaign has one) so the cockpit
+    // picks it up instead of leaving a stale "Sequence complete" next action.
+    const revertStep = funnel.steps[clamp((lead.currentStep || 1) - 1, 0, Math.max(funnel.steps.length - 1, 0))];
+    const revertFields =
+      status === "pending" ? { nextAction: revertStep?.label ?? "", nextDate: new Date(now) } : {};
+
     // Status is company-level: apply to EVERY contact at this company in the
     // funnel so the company reads as one status.
     await db
       .update(leads)
-      .set({ status, updatedAt: new Date(now) })
+      .set({ status, ...revertFields, updatedAt: new Date(now) })
       .where(
         and(
           eq(leads.funnelId, funnel.id),
@@ -1623,6 +1634,12 @@ router.post(
       } else {
         newNextAction = "Sequence complete";
       }
+    } else if (funnel.steps.length === 0) {
+      // Sequence-less campaign: log the touch but never auto-advance or
+      // auto-complete — the lead stays workable until a rep sets a status.
+      newStatus = "pending";
+      newNextAction = "";
+      newNextDate = new Date(now);
     } else {
       const schedule = computeNextStepSchedule(
         funnel.steps,
