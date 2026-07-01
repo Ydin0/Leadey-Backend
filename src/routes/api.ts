@@ -48,7 +48,7 @@ import {
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getUserRole, canViewFunnel } from "../lib/permissions";
-import { getBalance, deductCredits, InsufficientCreditsError } from "../lib/credits";
+import { getBalance, deductCredits, InsufficientCreditsError, CREDIT_COSTS } from "../lib/credits";
 import {
   buildFunnelPayload,
   computeNextStepSchedule,
@@ -65,7 +65,7 @@ import { getCustomFieldsForLeads, setLeadCustomFields, setLeadCustomFieldsBatch,
 import { fireTrigger } from "../services/workflow-engine";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
-import { TheirStackClient, type TheirStackJob } from "../lib/theirstack-client";
+import { TheirStackClient, type TheirStackJob, type TheirStackCompanyRecord } from "../lib/theirstack-client";
 import { leadHiringRoles } from "../db/schema/hiring-roles";
 import { upsertMasterContact } from "../lib/master-db";
 
@@ -1038,7 +1038,11 @@ router.post(
   "/funnels/:funnelId/imports/csv",
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
-    const { fileName, mappings, rows, groupBy: groupByRaw, dryRun } = req.body || {};
+    const { fileName, mappings, rows, groupBy: groupByRaw, dryRun, enrichCompanies } = req.body || {};
+    // When company enrichment is requested, a row identified only by an email is
+    // valid: the lead name falls back to the email and the company to the email
+    // domain (a placeholder the enrichment step replaces with the real name).
+    const enrichMode = enrichCompanies === true;
     const normalizedFileName = normalizeString(fileName) || "uploaded.csv";
     const groupBy: "domain" | "name" | "linkedin" =
       groupByRaw === "name" || groupByRaw === "linkedin" ? groupByRaw : "domain";
@@ -1164,10 +1168,17 @@ router.post(
       const lastName = getField(row, LBL.lastName);
       // Full name comes from a mapped "Lead Name" column, else compose it from
       // the separate first/last columns so either mapping style works.
-      const name = getField(row, LBL.name) || [firstName, lastName].filter(Boolean).join(" ");
-      const cName = getField(row, LBL.cName);
+      let name = getField(row, LBL.name) || [firstName, lastName].filter(Boolean).join(" ");
+      let cName = getField(row, LBL.cName);
       const email = getField(row, LBL.email).toLowerCase();
       const cDomainRaw = normalizeDomain(getField(row, LBL.cDomain)) || domainFromEmail(email);
+
+      if (enrichMode) {
+        // Identify the lead by email until person-enrichment fills the name.
+        if (!name) name = email;
+        // Placeholder company = the email/company domain; enrichment replaces it.
+        if (!cName) cName = cDomainRaw || (email.split("@")[1] || "");
+      }
       const cLinkedin = getField(row, LBL.cLinkedin);
       const cIndustry = getField(row, LBL.cIndustry);
       const cLocation = getField(row, LBL.cLocation);
@@ -2520,6 +2531,182 @@ router.post(
         jobsFound,
         rolesCreated,
         leadsEnriched: leadsEnriched.size,
+      },
+    });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/enrich-companies ───────────────────────────
+// "Magic Enrich → Company data from domain": for each lead's domain (from its
+// company domain, else its business email), look up firmographics on TheirStack
+// and fill the company fields. Bills CREDIT_COSTS.company_enrichment per DISTINCT
+// company resolved. Pass leadIds to target a specific set (e.g. a fresh import),
+// or omit to enrich the whole campaign.
+const EMPLOYEE_CAP = 2_000_000_000;
+function formatRevenueUsd(n: number | null | undefined): string | null {
+  if (!n || !Number.isFinite(n) || n <= 0) return null;
+  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `$${Math.round(n / 1_000)}K`;
+  return `$${Math.round(n)}`;
+}
+
+router.post(
+  "/funnels/:funnelId/enrich-companies",
+  asyncHandler<{ funnelId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+    const body = req.body as { leadIds?: string[] };
+
+    const [funnel] = await db
+      .select({ id: funnels.id })
+      .from(funnels)
+      .where(and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)))
+      .limit(1);
+    if (!funnel) throw new ApiError(404, "Campaign not found");
+
+    const token = process.env.THEIRSTACK_API_KEY;
+    if (!token) throw new ApiError(500, "THEIRSTACK_API_KEY is not configured");
+
+    // Target leads: the passed ids (scoped to this funnel) or the whole funnel.
+    const leadRows = await db
+      .select()
+      .from(leads)
+      .where(
+        Array.isArray(body.leadIds) && body.leadIds.length > 0
+          ? and(eq(leads.funnelId, funnelId), inArray(leads.id, body.leadIds))
+          : eq(leads.funnelId, funnelId),
+      );
+
+    // Resolve each lead's domain (explicit company domain, else business email).
+    const domainByLead = new Map<string, string>();
+    for (const l of leadRows) {
+      const d = normalizeDomain(l.companyDomain || "") || domainFromEmail(l.email || "");
+      if (d) domainByLead.set(l.id, d);
+    }
+    const distinctDomains = Array.from(new Set(domainByLead.values()));
+    const ENRICH_CAP = 200;
+    const capped = distinctDomains.length > ENRICH_CAP;
+    let domains = distinctDomains.slice(0, ENRICH_CAP);
+
+    if (domains.length === 0) {
+      res.json({
+        data: { domainsQueried: 0, companiesEnriched: 0, leadsUpdated: 0, capped: false, creditsCharged: 0 },
+      });
+      return;
+    }
+
+    // Credit pre-flight — need at least one company's worth. Then cap the domains
+    // we query to what the balance can actually pay for (3 credits per company).
+    const unit = CREDIT_COSTS.company_enrichment;
+    const balance = await getBalance(orgId);
+    if (balance < unit) throw new InsufficientCreditsError(unit, balance);
+    const affordable = Math.floor(balance / unit);
+    if (domains.length > affordable) domains = domains.slice(0, affordable);
+
+    const client = new TheirStackClient(token);
+    const userId = getAuth(req)?.userId || null;
+
+    // Query in chunks; limit must be >= chunk size so every domain can resolve.
+    const CHUNK = 25;
+    const byDomain = new Map<string, TheirStackCompanyRecord>();
+    for (let i = 0; i < domains.length; i += CHUNK) {
+      const chunk = domains.slice(i, i + CHUNK);
+      try {
+        const resp = await client.searchCompanies({ company_domain_or: chunk, limit: chunk.length });
+        for (const c of resp.data || []) {
+          const keys = [c.domain, ...(c.possible_domains || [])]
+            .map((d) => normalizeDomain(d || ""))
+            .filter(Boolean);
+          for (const k of keys) if (!byDomain.has(k)) byDomain.set(k, c);
+        }
+      } catch (err) {
+        console.warn(`[enrich-companies] chunk failed:`, err instanceof Error ? err.message : err);
+      }
+    }
+
+    const uniqueCompanies = new Map([...byDomain.values()].map((c) => [c.id, c]));
+    const companiesEnriched = uniqueCompanies.size;
+
+    // Bill BEFORE writes so an out-of-credits org can't get free enrichment.
+    if (companiesEnriched > 0) {
+      await deductCredits({
+        orgId,
+        action: "company_enrichment",
+        quantity: companiesEnriched,
+        userId,
+        description: "Company enrichment from domain",
+        metadata: { funnelId },
+      });
+    }
+
+    // Back-fill each lead's company fields from its matched company. Only fill
+    // blanks (never clobber user-provided data); replace the placeholder company
+    // name (equal to the domain) with the real one.
+    const now = new Date();
+    let leadsUpdated = 0;
+    for (const l of leadRows) {
+      const d = domainByLead.get(l.id);
+      if (!d) continue;
+      const c = byDomain.get(d);
+      if (!c) continue;
+      const patch: Partial<typeof leads.$inferInsert> = {};
+      const realName = (c.name || "").trim();
+      if (realName && (!l.company || l.company.toLowerCase() === d)) patch.company = realName;
+      if (!l.companyDomain) patch.companyDomain = normalizeDomain(c.domain || d) || null;
+      if (!l.companyIndustry && c.industry) patch.companyIndustry = c.industry;
+      if (l.companyEmployeeCount == null && c.employee_count) {
+        patch.companyEmployeeCount = Math.min(Math.round(c.employee_count), EMPLOYEE_CAP);
+      }
+      const loc = [c.city, c.country].filter(Boolean).join(", ");
+      if (!l.companyLocation && loc) patch.companyLocation = loc;
+      if (!l.companyDescription && c.long_description) patch.companyDescription = c.long_description.slice(0, 1000);
+      if (!l.companyLinkedin && c.linkedin_url) patch.companyLinkedin = c.linkedin_url;
+      if (!l.companyAnnualRevenue) {
+        const rev = formatRevenueUsd(c.annual_revenue_usd);
+        if (rev) patch.companyAnnualRevenue = rev;
+      }
+      if (Object.keys(patch).length > 0) {
+        patch.updatedAt = now;
+        await db.update(leads).set(patch).where(eq(leads.id, l.id));
+        leadsUpdated += 1;
+      }
+    }
+
+    // Upsert the resolved companies into the org's master company DB.
+    for (const c of uniqueCompanies.values()) {
+      const dom = normalizeDomain(c.domain || "");
+      if (!c.name || !dom) continue;
+      await db
+        .insert(masterCompanies)
+        .values({
+          id: createId("company"),
+          organizationId: orgId,
+          name: c.name.trim(),
+          domain: dom,
+          linkedinUrl: c.linkedin_url || null,
+          industry: c.industry || null,
+          employeeCount: c.employee_count ? Math.min(Math.round(c.employee_count), EMPLOYEE_CAP) : null,
+          revenue: c.annual_revenue_usd ? Math.round(c.annual_revenue_usd) : null,
+          fundingStage: c.funding_stage || null,
+          country: c.country || null,
+          city: c.city || null,
+          logo: c.logo || null,
+          description: c.long_description ? c.long_description.slice(0, 2000) : null,
+          lastSeenAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
+    }
+
+    res.json({
+      data: {
+        domainsQueried: domains.length,
+        companiesEnriched,
+        leadsUpdated,
+        creditsCharged: companiesEnriched * unit,
+        capped: capped || distinctDomains.length > domains.length,
       },
     });
   }),

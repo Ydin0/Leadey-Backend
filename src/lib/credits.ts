@@ -11,6 +11,7 @@ export const CREDIT_COSTS = {
   phone_enrichment: 33,
   email_enrichment: 3,
   job_scraping: 1,
+  company_enrichment: 3,
 } as const;
 
 /** Cents charged per credit on a top-up (strict 1:1, no bonus). */

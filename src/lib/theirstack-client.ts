@@ -164,6 +164,48 @@ export interface TheirStackJobSearchResponse {
   data: TheirStackJob[];
 }
 
+// ─── Company Search (POST /v1/companies/search) ─────────────────────────
+
+/** A company record from the company-search endpoint. Subset of the full
+ *  schema — the firmographic fields we map onto leads / master companies. */
+export interface TheirStackCompanyRecord {
+  id: string;
+  name: string;
+  domain?: string | null;
+  possible_domains?: string[] | null;
+  industry?: string | null;
+  employee_count?: number | null;
+  employee_count_range?: string | null;
+  annual_revenue_usd?: number | null;
+  total_funding_usd?: number | null;
+  funding_stage?: string | null;
+  founded_year?: number | null;
+  country?: string | null;
+  country_code?: string | null;
+  city?: string | null;
+  logo?: string | null;
+  linkedin_url?: string | null;
+  long_description?: string | null;
+  technology_names?: string[] | null;
+}
+
+export interface TheirStackCompanySearchParams {
+  /** Domains, full URLs, or emails — TheirStack extracts the domain. OR filter. */
+  company_domain_or?: string[];
+  limit?: number;
+  page?: number;
+  include_total_results?: boolean;
+  order_by?: Array<{ field: string; desc?: boolean }>;
+}
+
+export interface TheirStackCompanySearchResponse {
+  data: TheirStackCompanyRecord[];
+  metadata?: {
+    total_companies?: number;
+    total_results?: number;
+  };
+}
+
 // ─── Client ───────────────────────────────────────────────────────────
 
 export class TheirStackClient {
@@ -171,6 +213,28 @@ export class TheirStackClient {
 
   constructor(token: string) {
     this.token = token;
+  }
+
+  /** Search companies by firmographics / domain. Billed by TheirStack at 3
+   *  API credits per company returned. */
+  async searchCompanies(
+    params: TheirStackCompanySearchParams,
+  ): Promise<TheirStackCompanySearchResponse> {
+    const res = await fetch(`${THEIRSTACK_API_BASE}/v1/companies/search`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const msg = body?.error?.title || body?.error?.description || res.statusText;
+      throw new Error(`TheirStack API error ${res.status}: ${msg}`);
+    }
+    return res.json();
   }
 
   async searchJobs(
