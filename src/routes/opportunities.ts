@@ -173,9 +173,20 @@ router.get(
       arr.push(s);
       byPipeline.set(s.pipelineId, arr);
     }
+    // Opportunity count per pipeline — the settings delete flow needs it to
+    // decide whether to prompt for a move/delete strategy.
+    const counts = pipelineIds.length
+      ? await db
+          .select({ pipelineId: opportunities.pipelineId, count: sql<number>`COUNT(*)` })
+          .from(opportunities)
+          .where(inArray(opportunities.pipelineId, pipelineIds))
+          .groupBy(opportunities.pipelineId)
+      : [];
+    const countByPipeline = new Map(counts.map((c) => [c.pipelineId, Number(c.count)]));
     res.json({
       data: rows.map((p) => ({
         ...serializePipeline(p),
+        opportunityCount: countByPipeline.get(p.id) || 0,
         stages: (byPipeline.get(p.id) || []).map(serializeStage),
       })),
     });
@@ -258,21 +269,71 @@ router.delete(
       .from(pipelines)
       .where(and(eq(pipelines.id, id), eq(pipelines.organizationId, orgId)));
     if (!existing) throw new ApiError(404, "Pipeline not found");
-    // Block delete if open opportunities exist on this pipeline.
-    const [openCount] = await db
+    if (existing.isDefault) {
+      throw new ApiError(400, "The default pipeline can't be deleted.");
+    }
+
+    const body = (req.body || {}) as {
+      strategy?: "move" | "delete";
+      targetPipelineId?: string;
+      targetStageId?: string;
+    };
+
+    const [{ count }] = await db
       .select({ count: sql<number>`COUNT(*)` })
       .from(opportunities)
-      .innerJoin(pipelineStages, eq(pipelineStages.id, opportunities.stageId))
-      .where(
-        and(
-          eq(opportunities.pipelineId, id),
-          eq(pipelineStages.type, "open"),
-        ),
-      );
-    if (Number(openCount?.count || 0) > 0) {
-      throw new ApiError(400, "Cannot delete a pipeline with open opportunities. Move or close them first.");
-    }
-    await db.delete(pipelines).where(eq(pipelines.id, id));
+      .where(eq(opportunities.pipelineId, id));
+    const oppCount = Number(count || 0);
+
+    await db.transaction(async (tx) => {
+      if (oppCount > 0) {
+        if (body.strategy === "move") {
+          const targetPipelineId = (body.targetPipelineId || "").trim();
+          const targetStageId = (body.targetStageId || "").trim();
+          if (!targetPipelineId || !targetStageId) {
+            throw new ApiError(400, "Select a pipeline and stage to move opportunities to.");
+          }
+          if (targetPipelineId === id) {
+            throw new ApiError(400, "Choose a different pipeline to move opportunities to.");
+          }
+          const [target] = await tx
+            .select()
+            .from(pipelines)
+            .where(and(eq(pipelines.id, targetPipelineId), eq(pipelines.organizationId, orgId)));
+          if (!target) throw new ApiError(404, "Target pipeline not found");
+          const [stage] = await tx
+            .select()
+            .from(pipelineStages)
+            .where(and(eq(pipelineStages.id, targetStageId), eq(pipelineStages.pipelineId, targetPipelineId)));
+          if (!stage) throw new ApiError(400, "The selected stage must belong to the target pipeline.");
+
+          // Reassign every opportunity to the target pipeline + stage. Set or
+          // clear closedAt to match the destination stage's terminal semantics.
+          const isTerminal = stage.type === "won" || stage.type === "lost";
+          await tx
+            .update(opportunities)
+            .set({
+              pipelineId: targetPipelineId,
+              stageId: targetStageId,
+              closedAt: isTerminal ? sql`coalesce(${opportunities.closedAt}, now())` : null,
+              updatedAt: new Date(),
+            })
+            .where(eq(opportunities.pipelineId, id));
+        } else if (body.strategy === "delete") {
+          // Cascades to opportunity_contacts + opportunity_events.
+          await tx.delete(opportunities).where(eq(opportunities.pipelineId, id));
+        } else {
+          throw new ApiError(
+            400,
+            "This pipeline has opportunities. Choose to move them to another pipeline or delete them.",
+          );
+        }
+      }
+      // Stages cascade on pipeline delete; opportunities have already been
+      // moved or deleted, so the restrict FK won't block.
+      await tx.delete(pipelines).where(eq(pipelines.id, id));
+    });
+
     res.status(204).end();
   }),
 );
