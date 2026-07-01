@@ -1207,9 +1207,10 @@ router.post(
         // A corporate domain becomes a readable placeholder company that
         // enrichment replaces with the real name (and which stays as a sensible
         // fallback if enrichment can't resolve it). Personal emails
-        // (gmail/outlook/…) have no company domain — leave the company blank;
-        // they import but aren't enriched.
-        if (!cName) cName = cDomainRaw ? companyFromDomain(cDomainRaw) : "";
+        // (gmail/outlook/…) aren't a company — treat the lead as an individual
+        // whose company is their own name, so each is its own single-contact
+        // account (never lumped under "gmail.com" or a blank company).
+        if (!cName) cName = cDomainRaw ? companyFromDomain(cDomainRaw) : name;
       }
       const cLinkedin = getField(row, LBL.cLinkedin);
       const cIndustry = getField(row, LBL.cIndustry);
@@ -1233,13 +1234,17 @@ router.post(
         return;
       }
 
-      // Group key for the company. Falls back to the email so blank-company
-      // leads (personal emails in enrich mode) stay separate rather than all
-      // collapsing into one empty company.
-      const groupVal =
-        (groupBy === "domain" ? (cDomainRaw || cName.toLowerCase())
-        : groupBy === "linkedin" ? (cLinkedin.toLowerCase() || cDomainRaw || cName.toLowerCase())
-        : cName.toLowerCase()) || email;
+      // Group key for the company. Enrich-mode leads with no corporate domain are
+      // individuals (personal email) — group each on its OWN email so it becomes a
+      // single-contact company named after the person, instead of collapsing all
+      // of them under the email provider or one blank company. Everything else
+      // groups by the chosen key (domain / name / linkedin).
+      const isIndividual = enrichMode && !cDomainRaw;
+      const groupVal = isIndividual
+        ? (email || cName.toLowerCase())
+        : ((groupBy === "domain" ? (cDomainRaw || cName.toLowerCase())
+          : groupBy === "linkedin" ? (cLinkedin.toLowerCase() || cDomainRaw || cName.toLowerCase())
+          : cName.toLowerCase()) || email);
 
       let agg = companyMap.get(groupVal);
       if (!agg) {
