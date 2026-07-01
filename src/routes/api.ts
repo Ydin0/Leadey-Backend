@@ -61,7 +61,7 @@ import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
-import { getCustomFieldsForLeads, setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields-service";
+import { getCustomFieldsForLeads, setLeadCustomFields, setLeadCustomFieldsBatch, ensureFieldDefinition } from "../lib/custom-fields-service";
 import { fireTrigger } from "../services/workflow-engine";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
@@ -1060,9 +1060,14 @@ router.post(
       }))
       .filter((e: MappingEntry) => e.csvColumn && e.mappedField && e.mappedField !== "--- Skip ---");
 
-    const fieldMappings = allMappings.filter((e) => e.mappedField !== "Notes");
     const notesMappings = allMappings.filter((e) => e.mappedField === "Notes");
-    if (fieldMappings.length === 0 && notesMappings.length === 0) {
+    // Custom field columns map to "custom:<key>" (same convention as webhooks).
+    const customMappings = allMappings.filter((e) => e.mappedField.startsWith("custom:"));
+    // Standard lead/company columns — everything that isn't Notes or a custom field.
+    const fieldMappings = allMappings.filter(
+      (e) => e.mappedField !== "Notes" && !e.mappedField.startsWith("custom:"),
+    );
+    if (fieldMappings.length === 0 && notesMappings.length === 0 && customMappings.length === 0) {
       throw new ApiError(400, "At least one valid field mapping is required");
     }
 
@@ -1147,6 +1152,9 @@ router.post(
     // gets the full, unioned company data (e.g. all hiring roles).
     const newLeadAggs: CompanyAgg[] = [];
     const newEvents: Array<typeof leadEvents.$inferInsert> = [];
+    // Mapped custom field values per new lead, keyed by lead id — written after
+    // the transaction commits (see setLeadCustomFieldsBatch below).
+    const customByLeadId = new Map<string, Record<string, string>>();
     const firstStep = funnel.steps[0];
 
     rows.forEach((rawRow: unknown, index: number) => {
@@ -1264,6 +1272,15 @@ router.post(
       });
       newLeadAggs.push(agg);
       newEvents.push({ id: createId("event"), leadId, type: "imported", outcome: null, stepIndex: 0, meta: { importId }, timestamp: new Date(now) });
+      // Collect mapped custom field values for this row (custom:<key> → value).
+      if (customMappings.length > 0) {
+        const cv: Record<string, string> = {};
+        for (const cm of customMappings) {
+          const v = normalizeString(row[cm.csvColumn]);
+          if (v) cv[cm.mappedField.slice("custom:".length)] = v;
+        }
+        if (Object.keys(cv).length > 0) customByLeadId.set(leadId, cv);
+      }
       importedRows += 1;
       addedLeadIds.push(leadId);
     });
@@ -1338,7 +1355,7 @@ router.post(
       await tx.insert(imports).values({
         id: importId, funnelId: funnel.id, fileName: normalizedFileName,
         totalRows: rows.length, importedRows, skippedRows,
-        mappings: fieldMappings, errors: errors.slice(0, 100), createdAt: new Date(now),
+        mappings: [...fieldMappings, ...customMappings], errors: errors.slice(0, 100), createdAt: new Date(now),
       });
 
       // Upsert master companies so "company already exists" works across imports.
@@ -1373,6 +1390,22 @@ router.post(
         await tx.insert(leadEvents).values(eventsToInsert.slice(i, i + INSERT_CHUNK));
       }
     });
+
+    // Persist mapped custom field values for the leads that were actually
+    // inserted (concurrent-dup survivors). Auto-provision any mapped custom
+    // field so a value is never silently dropped.
+    if (customMappings.length > 0 && leadsToInsert.length > 0) {
+      const customKeys = Array.from(
+        new Set(customMappings.map((cm) => cm.mappedField.slice("custom:".length)).filter(Boolean)),
+      );
+      await Promise.all(customKeys.map((k) => ensureFieldDefinition(orgId, k)));
+      await setLeadCustomFieldsBatch(
+        orgId,
+        leadsToInsert
+          .map((l) => ({ leadId: l.id!, values: customByLeadId.get(l.id!) || {} }))
+          .filter((e) => Object.keys(e.values).length > 0),
+      );
+    }
 
     // Push leads to Smartlead if campaign exists
     if (funnel.smartleadCampaignId && leadsToInsert.length > 0) {

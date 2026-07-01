@@ -269,3 +269,50 @@ export async function setLeadCustomFields(
       });
   }
 }
+
+/** Batch-write custom field values for many leads at once. Loads the org's
+ *  field definitions once and inserts all values in chunks — the efficient path
+ *  for bulk operations like CSV import (avoids a per-lead definition lookup).
+ *  Unknown keys and empty values are skipped. */
+export async function setLeadCustomFieldsBatch(
+  orgId: string,
+  entries: Array<{ leadId: string; values: Record<string, string> }>,
+): Promise<void> {
+  const relevant = entries.filter((e) => Object.keys(e.values).length > 0);
+  if (relevant.length === 0) return;
+
+  const defs = await db.query.leadFieldDefinitions.findMany({
+    where: eq(leadFieldDefinitions.organizationId, orgId),
+  });
+  const defByKey = new Map(defs.map((d) => [d.key, d]));
+
+  const rows: (typeof leadFieldValues.$inferInsert)[] = [];
+  for (const { leadId, values } of relevant) {
+    for (const [key, raw] of Object.entries(values)) {
+      const def = defByKey.get(key);
+      if (!def) continue;
+      const value = String(raw ?? "").trim();
+      if (!value) continue;
+      rows.push({
+        id: createId("lfv"),
+        leadId,
+        fieldDefinitionId: def.id,
+        value,
+        updatedAt: new Date(),
+      });
+    }
+  }
+  if (rows.length === 0) return;
+
+  // Postgres caps bind params per statement — chunk the insert. Imported leads
+  // are always new, so a conflict can't occur; do-nothing is a safe guard.
+  const CHUNK = 500;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    await db
+      .insert(leadFieldValues)
+      .values(rows.slice(i, i + CHUNK))
+      .onConflictDoNothing({
+        target: [leadFieldValues.leadId, leadFieldValues.fieldDefinitionId],
+      });
+  }
+}
