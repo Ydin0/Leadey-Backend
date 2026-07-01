@@ -1,0 +1,1 @@
+ALTER TABLE "call_records" ADD COLUMN "transcription_attempts" integer DEFAULT 0 NOT NULL;

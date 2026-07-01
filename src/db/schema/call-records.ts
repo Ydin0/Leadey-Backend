@@ -61,6 +61,10 @@ export const callRecords = pgTable("call_records", {
   speakers: jsonb("speakers").$type<TranscriptSpeaker[]>(),
   /** Sectioned AI summary (TL;DR + breakdown + next steps). */
   summaryStructured: jsonb("summary_structured").$type<CallSummaryStructured>(),
+  /** Failed transcription attempts — the backfill sweeper retries a recording
+   *  until this hits its cap, so a transient OpenAI outage (quota, rate limit,
+   *  downtime) doesn't permanently strand calls without transcripts. */
+  transcriptionAttempts: integer("transcription_attempts").notNull().default(0),
   // Rep who made/received the call
   userId: text("user_id"),
   userName: text("user_name"),
