@@ -235,6 +235,85 @@ router.post(
   }),
 );
 
+router.post(
+  "/pipelines/:id/duplicate",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const sourceId = req.params.id as string;
+    const [source] = await db
+      .select()
+      .from(pipelines)
+      .where(and(eq(pipelines.id, sourceId), eq(pipelines.organizationId, orgId)));
+    if (!source) throw new ApiError(404, "Pipeline not found");
+
+    const sourceStages = await db
+      .select()
+      .from(pipelineStages)
+      .where(eq(pipelineStages.pipelineId, sourceId))
+      .orderBy(asc(pipelineStages.sortOrder));
+
+    // Pick a unique name: "<name> (copy)", then "(copy 2)", "(copy 3)"… so
+    // repeated duplication never trips the (org, name) unique constraint.
+    const existingNames = new Set(
+      (
+        await db
+          .select({ name: pipelines.name })
+          .from(pipelines)
+          .where(eq(pipelines.organizationId, orgId))
+      ).map((r) => r.name),
+    );
+    let newName = `${source.name} (copy)`;
+    for (let n = 2; existingNames.has(newName); n++) {
+      newName = `${source.name} (copy ${n})`;
+    }
+
+    const newId = createId("pl");
+    await db.transaction(async (tx) => {
+      const [maxRow] = await tx
+        .select({ maxOrder: sql<number>`MAX(${pipelines.sortOrder})` })
+        .from(pipelines)
+        .where(eq(pipelines.organizationId, orgId));
+      await tx.insert(pipelines).values({
+        id: newId,
+        organizationId: orgId,
+        name: newName,
+        description: source.description,
+        isDefault: false, // a duplicate is never the default
+        sortOrder: (maxRow?.maxOrder ?? -1) + 1,
+      });
+      // Copy the stage structure (not the opportunities) with fresh ids.
+      if (sourceStages.length) {
+        await tx.insert(pipelineStages).values(
+          sourceStages.map((s) => ({
+            id: createId("ps"),
+            pipelineId: newId,
+            slug: s.slug,
+            label: s.label,
+            sortOrder: s.sortOrder,
+            type: s.type,
+            defaultProbability: s.defaultProbability,
+            color: s.color,
+          })),
+        );
+      }
+    });
+
+    const [created] = await db.select().from(pipelines).where(eq(pipelines.id, newId));
+    const stages = await db
+      .select()
+      .from(pipelineStages)
+      .where(eq(pipelineStages.pipelineId, newId))
+      .orderBy(asc(pipelineStages.sortOrder));
+    res.status(201).json({
+      data: {
+        ...serializePipeline(created),
+        opportunityCount: 0,
+        stages: stages.map(serializeStage),
+      },
+    });
+  }),
+);
+
 router.patch(
   "/pipelines/:id",
   asyncHandler(async (req, res) => {
