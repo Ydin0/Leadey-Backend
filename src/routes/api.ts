@@ -28,6 +28,21 @@ function domainFromEmail(email: string): string {
   const d = (email.split("@")[1] || "").toLowerCase();
   return d && !FREE_EMAIL_DOMAINS.has(d) ? d : "";
 }
+/** Best-effort readable name from an email's local part when no name column is
+ *  mapped (e.g. "john.smith@acme.com" → "John Smith"). A placeholder until
+ *  person-level enrichment fills the real name; returns "" if not sensible. */
+function nameFromEmail(email: string): string {
+  const local = (email.split("@")[0] || "").trim();
+  if (!local) return "";
+  const parts = local
+    .replace(/\+.*$/, "") // drop +tags
+    .split(/[._-]+/)
+    .filter((p) => /[a-z]/i.test(p)); // ignore pure-number segments
+  if (parts.length === 0) return "";
+  return parts
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+    .join(" ");
+}
 import {
   ApiError,
   createId,
@@ -1174,10 +1189,13 @@ router.post(
       const cDomainRaw = normalizeDomain(getField(row, LBL.cDomain)) || domainFromEmail(email);
 
       if (enrichMode) {
-        // Identify the lead by email until person-enrichment fills the name.
-        if (!name) name = email;
-        // Placeholder company = the email/company domain; enrichment replaces it.
-        if (!cName) cName = cDomainRaw || (email.split("@")[1] || "");
+        // No name column → derive a readable name from the email (placeholder
+        // until person-enrichment); fall back to the raw email.
+        if (!name) name = nameFromEmail(email) || email;
+        // A corporate domain becomes a temporary company label that enrichment
+        // replaces with the real name. Personal emails (gmail/outlook/…) have no
+        // company domain — leave the company blank; they import but aren't enriched.
+        if (!cName) cName = cDomainRaw;
       }
       const cLinkedin = getField(row, LBL.cLinkedin);
       const cIndustry = getField(row, LBL.cIndustry);
@@ -1188,9 +1206,11 @@ router.post(
       const cRevenue = getField(row, LBL.cRevenue);
       const cHiringRoles = parseRoles(getField(row, LBL.cHiring));
 
-      if (!name || !cName) {
+      // In enrich mode a company isn't required (personal-email leads import with
+      // a blank company); otherwise both name and company are required.
+      if (!name || (!cName && !enrichMode)) {
         skippedRows += 1; invalidRows += 1;
-        errors.push({ row: index + 2, reason: "Missing required Lead Name or Company Name" });
+        errors.push({ row: index + 2, reason: enrichMode ? "Missing required Email" : "Missing required Lead Name or Company Name" });
         return;
       }
       if (email && !/^\S+@\S+\.\S+$/.test(email)) {
@@ -1199,11 +1219,13 @@ router.post(
         return;
       }
 
-      // Group key for the company.
+      // Group key for the company. Falls back to the email so blank-company
+      // leads (personal emails in enrich mode) stay separate rather than all
+      // collapsing into one empty company.
       const groupVal =
-        groupBy === "domain" ? (cDomainRaw || cName.toLowerCase())
+        (groupBy === "domain" ? (cDomainRaw || cName.toLowerCase())
         : groupBy === "linkedin" ? (cLinkedin.toLowerCase() || cDomainRaw || cName.toLowerCase())
-        : cName.toLowerCase();
+        : cName.toLowerCase()) || email;
 
       let agg = companyMap.get(groupVal);
       if (!agg) {
@@ -1311,11 +1333,14 @@ router.post(
     });
 
     const companies = [...companyMap.values()].filter((c) => c.leadCount > 0);
-    const existingCompanies = companies.filter((c) => c.existing).length;
-    const newCompanies = companies.length - existingCompanies;
+    // Blank-named aggregates (personal-email leads with no company) aren't real
+    // companies — exclude them from the counts and the master-company upsert.
+    const namedCompanies = companies.filter((c) => c.name.trim());
+    const existingCompanies = namedCompanies.filter((c) => c.existing).length;
+    const newCompanies = namedCompanies.length - existingCompanies;
     const summary = {
       totalRows: rows.length, importedRows, skippedRows, duplicateLeads, invalidRows,
-      companiesTotal: companies.length, existingCompanies, newCompanies, groupBy,
+      companiesTotal: namedCompanies.length, existingCompanies, newCompanies, groupBy,
     };
 
     // Dry run → return the review preview without writing anything.
@@ -1371,6 +1396,7 @@ router.post(
 
       // Upsert master companies so "company already exists" works across imports.
       for (const c of companies) {
+        if (!c.name.trim()) continue; // skip blank-company (personal-email) leads
         if (c.existing) {
           await tx.update(masterCompanies)
             .set({
