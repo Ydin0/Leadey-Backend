@@ -2104,8 +2104,8 @@ router.post(
 
 // ─── PATCH /funnels/:funnelId/leads/:leadId/company ───────────────────────
 // Edit company/About info. Company fields are shared, so they fan out to ALL
-// contacts at the same company in this funnel. Renaming `company` applies only
-// to the focused row (avoids accidental merges).
+// contacts at the same company in this funnel — including a `company` rename,
+// which renames the company for every contact currently under it.
 router.patch(
   "/funnels/:funnelId/leads/:leadId/company",
   asyncHandler<LeadAdvanceParams>(async (req, res) => {
@@ -2138,7 +2138,10 @@ router.patch(
       await db.update(leads).set(updates).where(and(eq(leads.funnelId, funnel.id), eq(leads.company, lead.company)));
     }
     if (renameCompany && renameCompany !== lead.company) {
-      await db.update(leads).set({ company: renameCompany, updatedAt: new Date() }).where(eq(leads.id, lead.id));
+      await db
+        .update(leads)
+        .set({ company: renameCompany, updatedAt: new Date() })
+        .where(and(eq(leads.funnelId, funnel.id), eq(leads.company, lead.company)));
     }
 
     const refreshed = getFunnelOrThrow(
