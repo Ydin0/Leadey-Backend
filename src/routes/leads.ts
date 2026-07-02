@@ -220,17 +220,24 @@ router.get(
         phonesByCompany.get(lp.company)!.add(d);
         allPhones.add(d);
       }
-      // Org calls grouped by normalized phone.
+      // Org calls grouped by normalized phone — constrained to this page's
+      // phone set so the digit expression index serves it (previously this
+      // aggregated the org's ENTIRE call log on every page).
       const callsByPhone = new Map<string, number>();
       if (allPhones.size) {
+        const toDigits = sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`;
         const callRows = await db
           .select({
-            phone: sql<string>`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`,
+            phone: sql<string>`${toDigits}`,
             n: sql<number>`count(*)::int`,
           })
           .from(callRecords)
-          .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
-          .groupBy(sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`);
+          .where(and(
+            eq(callRecords.organizationId, orgId),
+            eq(callRecords.direction, "outbound"),
+            inArray(toDigits, [...allPhones]),
+          ))
+          .groupBy(toDigits);
         for (const r of callRows) if (r.phone && allPhones.has(r.phone)) callsByPhone.set(r.phone, r.n);
       }
       // Email events per company (matched on the company's lead rows).

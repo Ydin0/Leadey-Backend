@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 import morgan from "morgan";
 import createError from "http-errors";
 import { clerkMiddleware, requireAuth } from "@clerk/express";
@@ -56,7 +57,16 @@ import { requireOrgMembership } from "./lib/org-membership";
 
 const app = express();
 
-app.use(morgan("dev"));
+// Compress every JSON response — the funnel payload is ~30 identical keys ×
+// N leads and shrinks ~85-90%; without this a 1000-lead campaign ships ~1MB raw.
+app.use(compression({ threshold: 1024, level: 6 }));
+
+const isProd = process.env.NODE_ENV === "production";
+app.use(
+  morgan(isProd ? "tiny" : "dev", {
+    skip: (req) => req.method === "OPTIONS",
+  }),
+);
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN?.split(",") || [
@@ -67,6 +77,10 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    // Let browsers cache the preflight — every authed request otherwise pays
+    // an extra OPTIONS round trip (Authorization header forces preflights).
+    maxAge: 86400,
+    optionsSuccessStatus: 204,
   }),
 );
 // Raw body needed for webhook signature verification — must be before express.json()
@@ -105,47 +119,47 @@ app.use("/v1", requireApiKeyAuth, v1Router);
 // it doesn't affect global admin endpoints.)
 app.use("/api", requireAuth(), requireOrgMembership);
 
-app.use("/api", requireAuth(), dashboardRouter);
-app.use("/api", requireAuth(), leadsRouter);
-app.use("/api", requireAuth(), apiRouter);
-app.use("/api", requireAuth(), settingsRouter);
-app.use("/api", requireAuth(), unipileRouter);
-app.use("/api", requireAuth(), twilioAuthRouter);
-app.use("/api", requireAuth(), phoneLineRouter);
-app.use("/api", requireAuth(), scraperRouter);
-app.use("/api", requireAuth(), billingRouter);
-app.use("/api", requireAuth(), creditsRouter);
-app.use("/api", requireAuth(), smartViewsRouter);
-app.use("/api", requireAuth(), masterRouter);
-app.use("/api", requireAuth(), teamRouter);
-app.use("/api", requireAuth(), apiKeysRouter);
-app.use("/api", requireAuth(), planGuard(), contactsRouter);
-app.use("/api", requireAuth(), planGuard(), templatesRouter);
-app.use("/api", requireAuth(), dialerRouter);
-app.use("/api", requireAuth(), opportunitiesRouter);
-app.use("/api", requireAuth(), leadTasksRouter);
-app.use("/api", requireAuth(), leadDocumentsRouter);
-app.use("/api", requireAuth(), leadCampaignsRouter);
-app.use("/api", requireAuth(), inboxRouter);
-app.use("/api", requireAuth(), hiringRolesRouter);
-app.use("/api", requireAuth(), companiesRouter);
-app.use("/api", requireAuth(), companyProfileRouter);
-app.use("/api", requireAuth(), leadStatusesRouter);
-app.use("/api", requireAuth(), customFieldsRouter);
-app.use("/api", requireAuth(), emailDomainsRouter);
-app.use("/api", requireAuth(), emailMailboxesRouter);
-app.use("/api", requireAuth(), searchRouter);
-app.use("/api", requireAuth(), knowledgeBaseRouter);
-app.use("/api", requireAuth(), importsRouter);
-app.use("/api", requireAuth(), smsRouter);
-app.use("/api", requireAuth(), notificationsRouter);
-app.use("/api", requireAuth(), emailAccountsRouter);
-app.use("/api", requireAuth(), calendlyRouter);
-app.use("/api", requireAuth(), calendarRouter);
-app.use("/api", requireAuth(), assistantRouter);
-app.use("/api", requireAuth(), callsRouter);
-app.use("/api", requireAuth(), callOutcomesRouter);
-app.use("/api", requireAuth(), workflowsRouter);
+app.use("/api", dashboardRouter);
+app.use("/api", leadsRouter);
+app.use("/api", apiRouter);
+app.use("/api", settingsRouter);
+app.use("/api", unipileRouter);
+app.use("/api", twilioAuthRouter);
+app.use("/api", phoneLineRouter);
+app.use("/api", scraperRouter);
+app.use("/api", billingRouter);
+app.use("/api", creditsRouter);
+app.use("/api", smartViewsRouter);
+app.use("/api", masterRouter);
+app.use("/api", teamRouter);
+app.use("/api", apiKeysRouter);
+app.use("/api", planGuard(), contactsRouter);
+app.use("/api", planGuard(), templatesRouter);
+app.use("/api", dialerRouter);
+app.use("/api", opportunitiesRouter);
+app.use("/api", leadTasksRouter);
+app.use("/api", leadDocumentsRouter);
+app.use("/api", leadCampaignsRouter);
+app.use("/api", inboxRouter);
+app.use("/api", hiringRolesRouter);
+app.use("/api", companiesRouter);
+app.use("/api", companyProfileRouter);
+app.use("/api", leadStatusesRouter);
+app.use("/api", customFieldsRouter);
+app.use("/api", emailDomainsRouter);
+app.use("/api", emailMailboxesRouter);
+app.use("/api", searchRouter);
+app.use("/api", knowledgeBaseRouter);
+app.use("/api", importsRouter);
+app.use("/api", smsRouter);
+app.use("/api", notificationsRouter);
+app.use("/api", emailAccountsRouter);
+app.use("/api", calendlyRouter);
+app.use("/api", calendarRouter);
+app.use("/api", assistantRouter);
+app.use("/api", callsRouter);
+app.use("/api", callOutcomesRouter);
+app.use("/api", workflowsRouter);
 
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);

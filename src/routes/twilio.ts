@@ -243,34 +243,72 @@ webhookRouter.post(
     // "DetectMessageEnd" waits for the beep before firing — slightly slower
     // than "Enable" but lets us play the VM at the right moment.
     // Caller-ID ownership guard: the browser may pass any CallerId, but we must
-    // only ever present a number this org actually owns (legal + STIR/SHAKEN).
-    // Validate against the org's lines; if it's not owned, fall back to the
-    // rep's assigned line, else the org's first line.
-    let safeCallerId: string | undefined = callerId || from || undefined;
-    if (isFromBrowser && callerId) {
+    // only ever present a number WE actually own (legal + STIR/SHAKEN).
+    // Ownership = the number exists in phone_lines at all — every platform
+    // number lives in our single Twilio account. Do NOT scope this to the
+    // users-table home org: that column is single-org while reps can be active
+    // in a DIFFERENT Clerk org, and checking only the (possibly line-less)
+    // home org produced an EMPTY callerId → Twilio 13214 → every call from
+    // those reps died as instant dead air.
+    let safeCallerId: string | undefined = callerId || undefined;
+    if (isFromBrowser) {
       try {
         const { db } = await import("../db");
         const { phoneLines } = await import("../db/schema/phone-lines");
         const { users } = await import("../db/schema/organizations");
-        const { eq: e } = await import("drizzle-orm");
+        const { eq: e, sql: s } = await import("drizzle-orm");
         const userId = from!.slice("client:".length);
-        const [u] = await db.select({ orgId: users.organizationId }).from(users).where(e(users.id, userId)).limit(1);
-        if (u?.orgId) {
-          const lines = await db
-            .select({ number: phoneLines.number, assignedTo: phoneLines.assignedTo })
+        const d = (x: string | null) => (x || "").replace(/[^\d]/g, "");
+        const cid = d(callerId);
+
+        let owned = false;
+        if (cid) {
+          const [line] = await db
+            .select({ id: phoneLines.id })
             .from(phoneLines)
-            .where(e(phoneLines.organizationId, u.orgId));
-          const d = (s: string | null) => (s || "").replace(/[^\d]/g, "");
-          const cid = d(callerId);
-          if (!lines.some((l) => d(l.number) === cid)) {
-            const fb = lines.find((l) => l.assignedTo === userId) || lines[0];
-            safeCallerId = fb?.number;
-            console.warn("[Twilio Voice] CallerId not owned by org — falling back to an owned line.");
+            .where(s`regexp_replace(${phoneLines.number}, '[^0-9]', '', 'g') = ${cid}`)
+            .limit(1);
+          owned = !!line;
+        }
+
+        if (!owned) {
+          // Fall back to a line assigned to this rep (any org), else the first
+          // line of their users-table home org.
+          const [assigned] = await db
+            .select({ number: phoneLines.number })
+            .from(phoneLines)
+            .where(e(phoneLines.assignedTo, userId))
+            .limit(1);
+          let fb: string | undefined = assigned?.number;
+          if (!fb) {
+            const [u] = await db.select({ orgId: users.organizationId }).from(users).where(e(users.id, userId)).limit(1);
+            if (u?.orgId) {
+              const [l] = await db
+                .select({ number: phoneLines.number })
+                .from(phoneLines)
+                .where(e(phoneLines.organizationId, u.orgId))
+                .limit(1);
+              fb = l?.number;
+            }
           }
+          safeCallerId = fb;
+          console.warn("[Twilio Voice] CallerId not an owned number — fallback:", fb ?? "none available");
         }
       } catch (err) {
         console.error("[Twilio Voice] caller-id validation failed:", err);
       }
+    }
+
+    // NEVER emit <Dial> with an empty callerId — Twilio rejects it (13214) and
+    // the rep just hears the call go dead. Say what's wrong instead so it is
+    // diagnosable from the handset.
+    if (isFromBrowser && !safeCallerId) {
+      response.say(
+        "No caller I D is available for this call. Please assign a phone number to your account in Settings, then try again.",
+      );
+      response.hangup();
+      res.type("text/xml").send(response.toString());
+      return;
     }
 
     const dialOptions: Record<string, unknown> = {

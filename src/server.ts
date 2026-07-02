@@ -6,10 +6,17 @@ import { startTranscriptionBackfill } from "./services/transcription-backfill";
 
 const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Leadey API listening on port ${PORT}`);
   startEmailPoller();
   startWorkflowEngine();
   startCalendarSync();
   startTranscriptionBackfill();
 });
+
+// Keep sockets alive LONGER than Railway's edge proxy idle timeout (~60s):
+// if the app closes an idle keep-alive socket first, the proxy can reuse a
+// dead connection and surface intermittent 502s. headersTimeout must exceed
+// keepAliveTimeout.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;

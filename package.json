@@ -19,6 +19,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1078.0",
     "@clerk/express": "^2.0.1",
     "@types/multer": "^2.1.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.39.0",
@@ -37,6 +38,7 @@
     "twilio": "^5.12.2"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/http-errors": "^2.0.4",

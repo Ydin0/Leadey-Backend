@@ -1,4 +1,4 @@
-import { pgTable, text, integer, jsonb, timestamp, boolean, unique } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, jsonb, timestamp, boolean, unique, index } from "drizzle-orm/pg-core";
 
 export const funnels = pgTable("funnels", {
   id: text("id").primaryKey(),
@@ -22,7 +22,10 @@ export const funnels = pgTable("funnels", {
    *  field name (e.g. "email") or a custom field as "custom:<fieldKey>". */
   webhookFieldMap: jsonb("webhook_field_map").$type<Record<string, string>>().notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Every org-scoped query joins or filters on organization_id.
+  index("funnels_organization_id_idx").on(t.organizationId),
+]);
 
 export const funnelSteps = pgTable("funnel_steps", {
   id: text("id").primaryKey(),

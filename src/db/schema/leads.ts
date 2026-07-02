@@ -1,4 +1,5 @@
 import { pgTable, text, integer, jsonb, timestamp, boolean, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { funnels } from "./funnels";
 import { masterCompanies, masterContacts } from "./master";
 
@@ -74,6 +75,13 @@ export const leads = pgTable("leads", {
   index("leads_funnel_id_idx").on(t.funnelId),
   // Company-identity lookups: universal company profile aggregation.
   index("leads_master_company_id_idx").on(t.masterCompanyId),
+  // Cross-campaign sibling matching by identity keys (activity counts,
+  // memberships fallback) — probe org leads by normalized email/phone
+  // instead of scanning org-wide event/call tables.
+  index("leads_email_lower_idx").on(sql`lower(${t.email})`),
+  index("leads_phone_digits_idx").on(sql`regexp_replace(${t.phone}, '[^0-9]', '', 'g')`),
+  // The org leads list orders by lower(company).
+  index("leads_company_lower_idx").on(sql`lower(${t.company})`),
 ]);
 
 export const leadEvents = pgTable("lead_events", {
@@ -90,4 +98,7 @@ export const leadEvents = pgTable("lead_events", {
   // Per-lead timeline reads (lead profile + universal company profile) are
   // keyset-paginated by (lead_id, timestamp DESC).
   index("lead_events_lead_id_ts_idx").on(t.leadId, t.timestamp),
+  // Time-sliced org activity (e.g. the rep dashboard's "today" aggregates)
+  // starts from the small recent slice instead of per-lead probes.
+  index("lead_events_timestamp_idx").on(t.timestamp),
 ]);

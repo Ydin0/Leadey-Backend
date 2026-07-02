@@ -90,6 +90,7 @@ import { resolvePerson, resolvePersonsBulk } from "../lib/person-resolve";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads, setLeadCustomFields, setLeadCustomFieldsBatch, ensureFieldDefinition } from "../lib/custom-fields-service";
+import { createTtlCache } from "../lib/ttl-cache";
 import { fireTrigger } from "../services/workflow-engine";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
@@ -151,91 +152,42 @@ async function loadFunnel(
     await db.update(funnels).set({ webhookToken }).where(eq(funnels.id, result.id));
   }
 
-  // Custom fields: the full set on a full load, just the focused lead's on a
-  // Custom fields for ALL leads (incl. lite) so the leads list / Smart Views can
-  // filter on them. Returns empty cheaply for orgs with no custom fields.
-  const customFieldsByLead = await getCustomFieldsForLeads(result.leads.map((l) => l.id));
+  // Everything below depends only on `result` — run it in ONE round of
+  // parallel queries. NOTE: per-lead call/email activity counts are NOT
+  // computed here anymore — they required org-wide scans on every load and
+  // now live behind GET /funnels/:funnelId/activity-counts (deferred, cached);
+  // the payload ships callCount/emailCount = 0 with `countsDeferred: true`.
+  type EventRow = { id: string; leadId: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
 
   // Events for the focused lead — and every other contact of the SAME COMPANY —
   // when this is a lite load. The lead profile shows one company with all its
-  // contacts, so its activity timeline aggregates the whole company's history
-  // (not just the clicked contact). Falls back to the single lead when it has
-  // no company name.
-  type EventRow = { id: string; leadId: string; type: string; outcome: string | null; stepIndex: number; meta: Record<string, unknown> | null; timestamp: Date };
-  const focusedEvents = new Map<string, EventRow[]>();
-  if (!withEvents && fullLeadId) {
+  // contacts, so its activity timeline aggregates the whole company's history.
+  const loadFocusedEvents = async (): Promise<EventRow[]> => {
+    if (withEvents || !fullLeadId) return [];
     const focusLead = result.leads.find((l) => l.id === fullLeadId);
     const companyKey = (focusLead?.company || "").trim().toLowerCase();
     const groupIds = companyKey
       ? result.leads.filter((l) => (l.company || "").trim().toLowerCase() === companyKey).map((l) => l.id)
       : [fullLeadId];
-    const evs = await db
+    return db
       .select()
       .from(leadEvents)
       .where(inArray(leadEvents.leadId, groupIds))
-      .orderBy(asc(leadEvents.timestamp));
-    for (const e of evs as unknown as EventRow[]) {
-      const arr = focusedEvents.get(e.leadId);
-      if (arr) arr.push(e);
-      else focusedEvents.set(e.leadId, [e]);
-    }
-  }
+      .orderBy(asc(leadEvents.timestamp)) as unknown as Promise<EventRow[]>;
+  };
 
-  // Activity totals shown in the leads table reflect TOTAL contact across the
-  // WHOLE ORG — every rep and every campaign — not just events on this one lead
-  // row (the same person can exist as several lead rows in different campaigns).
-  // Calls come from the authoritative call_records log matched by PHONE; emails
-  // from email events matched by ADDRESS. So a contact called 3× anywhere shows
-  // 3 on every campaign they're in.
-  const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
-  const phoneSet = new Set(result.leads.map((l) => normPhone(l.phone)).filter((p) => p.length > 5));
-  const emailSet = new Set(result.leads.map((l) => (l.email || "").toLowerCase()).filter(Boolean));
-  const callsByPhone = new Map<string, number>();
-  const emailsByAddr = new Map<string, number>();
-  if (phoneSet.size) {
-    // Telephony log (authoritative) by phone…
-    // Count by the COUNTERPARTY (callee for outbound, caller for inbound) across
-    // BOTH directions, so inbound calls also count toward the lead.
-    const counterparty = sql`regexp_replace(case when ${callRecords.direction} = 'outbound' then ${callRecords.toNumber} else ${callRecords.fromNumber} end, '[^0-9]', '', 'g')`;
-    const callRows = await db
-      .select({
-        phone: sql<string>`${counterparty}`,
-        n: sql<number>`count(*)::int`,
-      })
-      .from(callRecords)
-      .where(eq(callRecords.organizationId, orgId))
-      .groupBy(counterparty);
-    for (const r of callRows) if (r.phone && phoneSet.has(r.phone)) callsByPhone.set(r.phone, r.n);
-    // …and logged call events by phone (catches calls recorded only as an event,
-    // not in call_records). Take the MAX so no real call is ever under-counted.
-    const leCallRows = await db
-      .select({
-        phone: sql<string>`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`,
-        n: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
-      })
-      .from(leadEvents)
-      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
-      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(and(eq(funnels.organizationId, orgId), sql`${leads.phone} <> ''`))
-      .groupBy(sql`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`);
-    for (const r of leCallRows) {
-      if (r.phone && phoneSet.has(r.phone)) {
-        callsByPhone.set(r.phone, Math.max(callsByPhone.get(r.phone) ?? 0, r.n));
-      }
-    }
-  }
-  if (emailSet.size) {
-    const emailRows = await db
-      .select({
-        email: sql<string>`lower(${leads.email})`,
-        n: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
-      })
-      .from(leadEvents)
-      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
-      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(and(eq(funnels.organizationId, orgId), sql`${leads.email} <> ''`))
-      .groupBy(sql`lower(${leads.email})`);
-    for (const r of emailRows) if (r.email && emailSet.has(r.email)) emailsByAddr.set(r.email, r.n);
+  const [customFieldsByLead, focusedEventRows] = await Promise.all([
+    // Custom fields for ALL leads (incl. lite) so the leads list / Smart Views
+    // can filter on them. Returns empty cheaply for orgs with no custom fields.
+    getCustomFieldsForLeads(result.leads.map((l) => l.id)),
+    loadFocusedEvents(),
+  ]);
+
+  const focusedEvents = new Map<string, EventRow[]>();
+  for (const e of focusedEventRows) {
+    const arr = focusedEvents.get(e.leadId);
+    if (arr) arr.push(e);
+    else focusedEvents.set(e.leadId, [e]);
   }
 
   return {
@@ -295,8 +247,6 @@ async function loadFunnel(
       customFields: customFieldsByLead.get(l.id) ?? [],
       createdAt: l.createdAt,
       updatedAt: l.updatedAt,
-      callCount: callsByPhone.get(normPhone(l.phone)) ?? 0,
-      emailCount: emailsByAddr.get((l.email || "").toLowerCase()) ?? 0,
       events: (withEvents ? ((l as { events?: EventRow[] }).events ?? []) : (focusedEvents.get(l.id) ?? [])).map((e) => ({
         id: e.id,
         type: e.type,
@@ -452,6 +402,147 @@ router.get(
   }),
 );
 
+// ─── GET /funnels/:funnelId/activity-counts ──────────────────────────────
+// Per-lead call/email totals for the leads table, DEFERRED out of the main
+// funnel payload: these reflect TOTAL contact across the whole org (the same
+// person can be enrolled in several campaigns), which used to require three
+// org-wide table scans on every campaign open. Here the queries are scoped to
+// this funnel's phone/email keys (index-backed) and cached for 60s per org+
+// funnel — the table paints instantly and badges fill in right after.
+const activityCountsCache = createTtlCache<Record<string, { calls: number; emails: number }>>(60_000);
+
+router.get(
+  "/funnels/:funnelId/activity-counts",
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+    const cacheKey = `${orgId}:${funnelId}`;
+    const cached = activityCountsCache.get(cacheKey);
+    if (cached) {
+      res.json({ data: { counts: cached } });
+      return;
+    }
+
+    const [funnelRow] = await db
+      .select({ id: funnels.id })
+      .from(funnels)
+      .where(and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)))
+      .limit(1);
+    if (!funnelRow) throw new ApiError(404, "Funnel not found");
+
+    const funnelLeads = await db
+      .select({ id: leads.id, phone: leads.phone, email: leads.email })
+      .from(leads)
+      .where(eq(leads.funnelId, funnelId));
+
+    const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
+    const phoneList = [...new Set(funnelLeads.map((l) => normPhone(l.phone)).filter((p) => p.length > 5))];
+    const emailList = [...new Set(funnelLeads.map((l) => (l.email || "").toLowerCase()).filter(Boolean))];
+
+    // The CASE-combined counterparty expression matches no index, so query the
+    // two directions separately — each arm rides its own (org, digits)
+    // expression index — and sum them.
+    const toDigits = sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`;
+    const fromDigits = sql`regexp_replace(${callRecords.fromNumber}, '[^0-9]', '', 'g')`;
+    const leadPhoneDigits = sql`regexp_replace(${leads.phone}, '[^0-9]', '', 'g')`;
+    const leadEmailLower = sql`lower(${leads.email})`;
+
+    const [outRows, inRows, siblingRows] = await Promise.all([
+      phoneList.length
+        ? db
+            .select({ phone: sql<string>`${toDigits}`, n: sql<number>`count(*)::int` })
+            .from(callRecords)
+            .where(and(
+              eq(callRecords.organizationId, orgId),
+              eq(callRecords.direction, "outbound"),
+              inArray(toDigits, phoneList),
+            ))
+            .groupBy(toDigits)
+        : Promise.resolve([] as { phone: string; n: number }[]),
+      phoneList.length
+        ? db
+            .select({ phone: sql<string>`${fromDigits}`, n: sql<number>`count(*)::int` })
+            .from(callRecords)
+            .where(and(
+              eq(callRecords.organizationId, orgId),
+              sql`${callRecords.direction} <> 'outbound'`,
+              inArray(fromDigits, phoneList),
+            ))
+            .groupBy(fromDigits)
+        : Promise.resolve([] as { phone: string; n: number }[]),
+      // Every org lead representing the same people (probed by the normalized
+      // phone/email expression indexes) — their events carry the history.
+      phoneList.length || emailList.length
+        ? db
+            .select({ id: leads.id, phone: sql<string>`${leadPhoneDigits}`, email: sql<string>`${leadEmailLower}` })
+            .from(leads)
+            .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+            .where(and(
+              eq(funnels.organizationId, orgId),
+              or(
+                phoneList.length ? inArray(leadPhoneDigits, phoneList) : sql`false`,
+                emailList.length ? inArray(leadEmailLower, emailList) : sql`false`,
+              ),
+            ))
+        : Promise.resolve([] as { id: string; phone: string; email: string }[]),
+    ]);
+
+    // Event buckets for the sibling leads (indexed by lead_id), chunked to
+    // keep the parameter count bounded.
+    const sibIds = siblingRows.map((r) => r.id);
+    const eventRows: { leadId: string; calls: number; emails: number }[] = [];
+    for (let i = 0; i < sibIds.length; i += 5000) {
+      const chunk = sibIds.slice(i, i + 5000);
+      eventRows.push(
+        ...(await db
+          .select({
+            leadId: leadEvents.leadId,
+            calls: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
+            emails: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+          })
+          .from(leadEvents)
+          .where(inArray(leadEvents.leadId, chunk))
+          .groupBy(leadEvents.leadId)),
+      );
+    }
+
+    // Same merge semantics as the old in-payload counters: calls = MAX of the
+    // telephony log and logged call events (never under-count); emails from
+    // events only.
+    const callsByPhone = new Map<string, number>();
+    for (const r of [...outRows, ...inRows]) {
+      if (r.phone) callsByPhone.set(r.phone, (callsByPhone.get(r.phone) ?? 0) + Number(r.n));
+    }
+    const phoneSet = new Set(phoneList);
+    const emailSet = new Set(emailList);
+    const evByLead = new Map(eventRows.map((r) => [r.leadId, r]));
+    const evCallsByPhone = new Map<string, number>();
+    const evEmailsByAddr = new Map<string, number>();
+    for (const s of siblingRows) {
+      const ev = evByLead.get(s.id);
+      if (!ev) continue;
+      if (s.phone && phoneSet.has(s.phone)) {
+        evCallsByPhone.set(s.phone, (evCallsByPhone.get(s.phone) ?? 0) + ev.calls);
+      }
+      if (s.email && emailSet.has(s.email)) {
+        evEmailsByAddr.set(s.email, (evEmailsByAddr.get(s.email) ?? 0) + ev.emails);
+      }
+    }
+
+    const counts: Record<string, { calls: number; emails: number }> = {};
+    for (const l of funnelLeads) {
+      const p = normPhone(l.phone);
+      const e = (l.email || "").toLowerCase();
+      const calls = Math.max(callsByPhone.get(p) ?? 0, evCallsByPhone.get(p) ?? 0);
+      const emails = evEmailsByAddr.get(e) ?? 0;
+      if (calls || emails) counts[l.id] = { calls, emails };
+    }
+
+    activityCountsCache.set(cacheKey, counts);
+    res.json({ data: { counts } });
+  }),
+);
+
 // ─── GET /funnels/:funnelId ──────────────────────────────────────────────
 
 router.get(
@@ -464,17 +555,17 @@ router.get(
     const lite = req.query.lite === "1" || req.query.lite === "true";
     const fullLeadId = typeof req.query.fullLeadId === "string" ? req.query.fullLeadId : null;
 
-    const funnel = getFunnelOrThrow(
-      await loadFunnel(orgId, req.params.funnelId, { withEvents: !lite, fullLeadId }),
-      req.params.funnelId,
-    );
-    // Fetch real members
-    const members = await db.select().from(funnelMembers)
-      .where(eq(funnelMembers.funnelId, req.params.funnelId));
+    // The funnel load, members list and caller role are independent — one
+    // parallel round instead of three serial round trips.
+    const auth = getAuth(req as unknown as Request);
+    const [loadedFunnel, members, role] = await Promise.all([
+      loadFunnel(orgId, req.params.funnelId, { withEvents: !lite, fullLeadId }),
+      db.select().from(funnelMembers).where(eq(funnelMembers.funnelId, req.params.funnelId)),
+      auth?.userId ? getUserRole(auth.userId) : Promise.resolve("rep" as const),
+    ]);
+    const funnel = getFunnelOrThrow(loadedFunnel, req.params.funnelId);
 
     // Visibility gate: a non-member rep can't open a PRIVATE campaign directly.
-    const auth = getAuth(req as unknown as Request);
-    const role = auth?.userId ? await getUserRole(auth.userId) : "rep";
     let isMember = !!auth?.userId && members.some((m) => m.userId === auth.userId);
     // Working a campaign in the power dialer grants access to it: if the caller
     // has (or had) a dialer session for this funnel, let them open its leads
@@ -491,20 +582,27 @@ router.get(
     if (!canViewFunnel(role, funnel.visibility, isMember)) {
       throw new ApiError(403, "You do not have access to this campaign");
     }
-    const memberData = [];
-    for (const m of members) {
-      const [user] = await db.select().from(users).where(eq(users.id, m.userId));
-      memberData.push({
+    // One batched lookup instead of a query per member.
+    const memberUsers = members.length
+      ? await db.select().from(users).where(inArray(users.id, members.map((m) => m.userId)))
+      : [];
+    const userById = new Map(memberUsers.map((u) => [u.id, u]));
+    const memberData = members.map((m) => {
+      const user = userById.get(m.userId);
+      return {
         teamMemberId: m.userId,
         role: m.role,
         addedAt: m.createdAt.toISOString(),
         email: user?.email || "",
         firstName: user?.firstName || null,
         lastName: user?.lastName || null,
-      });
-    }
+      };
+    });
     const payload = buildFunnelPayload(funnel, { includeLeads: true, lite, fullLeadId }) as any;
     payload.members = memberData;
+    // Per-lead call/email counts ship as zeros — the client fetches them from
+    // GET /funnels/:id/activity-counts and fills the badges in after paint.
+    payload.countsDeferred = true;
     res.json({ data: payload });
   }),
 );
