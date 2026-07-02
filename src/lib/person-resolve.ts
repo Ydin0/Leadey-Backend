@@ -86,7 +86,12 @@ export function nameKeyOf(input: {
   const rawDigits = raw.replace(/\D/g, "");
   const phoneDigits = (input.phone || "").replace(/\D/g, "");
   if (rawDigits && phoneDigits && rawDigits === phoneDigits) return null;
-  const key = lower.replace(/[^a-z]/g, "");
+  // Transliterate diacritics (André → andre, Ján → jan) BEFORE the a-z
+  // filter — dropping them made "André Pinho" ≠ "Andre" and split people.
+  const key = lower
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z]/g, "");
   return key.length >= 2 ? key : null;
 }
 
