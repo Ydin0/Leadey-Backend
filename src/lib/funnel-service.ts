@@ -29,6 +29,8 @@ export interface LeadEvent {
 
 export interface Lead {
   id: string;
+  /** Canonical person (master_contacts.id) this enrollment belongs to. */
+  masterContactId?: string | null;
   name: string;
   firstName?: string | null;
   lastName?: string | null;
@@ -93,6 +95,8 @@ export interface Funnel {
 function serializeLead(lead: Lead, lite = false) {
   return {
     id: lead.id,
+    /** Canonical person (master contact) this enrollment belongs to. */
+    personId: lead.masterContactId ?? null,
     name: lead.name,
     firstName: lead.firstName ?? null,
     lastName: lead.lastName ?? null,

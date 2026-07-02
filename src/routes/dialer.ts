@@ -652,9 +652,19 @@ router.post(
         .orderBy(asc(leads.createdAt));
     }
 
+    // Canonical person link first (leads.master_contact_id, one indexed
+    // fetch); the linkedin/email maps below remain as the fallback for rows
+    // the identity backfill couldn't resolve.
+    const linkedMasterIds = [...new Set(candidateLeads.map((l) => l.masterContactId).filter(Boolean) as string[])];
+    const linkedMasters = linkedMasterIds.length
+      ? await db.select().from(masterContacts).where(inArray(masterContacts.id, linkedMasterIds))
+      : [];
+    const masterById = new Map(linkedMasters.map((m) => [m.id, m]));
+
     // Resolve master contacts by linkedinUrl (preferred) then email.
-    const linkedinUrls = candidateLeads.map((l) => l.linkedinUrl).filter(Boolean) as string[];
-    const emails = candidateLeads.map((l) => l.email).filter(Boolean) as string[];
+    const unlinked = candidateLeads.filter((l) => !l.masterContactId);
+    const linkedinUrls = unlinked.map((l) => l.linkedinUrl).filter(Boolean) as string[];
+    const emails = unlinked.map((l) => l.email).filter(Boolean) as string[];
 
     // Build the OR match conditions, skipping any empty side — passing an empty
     // array to `= ANY()` makes Postgres throw "op ANY/ALL (array) requires array
@@ -771,11 +781,15 @@ router.post(
 
     for (const lead of candidateLeads) {
       const master =
+        (lead.masterContactId && masterById.get(lead.masterContactId)) ||
         (lead.linkedinUrl && masterByUrl.get(lead.linkedinUrl)) ||
         (lead.email && masterByEmail.get(lead.email.toLowerCase())) ||
         null;
 
-      if (resolvedFilters.excludeDoNotCall && master?.doNotCall) {
+      // Check BOTH the person flag and the lead row's own flag — a phone-only
+      // person whose master couldn't be matched used to slip through here and
+      // stay dialable after being marked DNC.
+      if (resolvedFilters.excludeDoNotCall && (master?.doNotCall || lead.doNotCall)) {
         excludedDnc++;
         continue;
       }

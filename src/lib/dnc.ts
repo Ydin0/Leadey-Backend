@@ -3,7 +3,7 @@ import { db } from "../db";
 import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { masterContacts } from "../db/schema/master";
-import { createId } from "./helpers";
+import { resolvePerson } from "./person-resolve";
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type DbOrTx = typeof db | Tx;
@@ -20,11 +20,13 @@ export interface DncIdentity {
 /**
  * Flag (or unflag) a single PERSON as Do-Not-Contact across the whole org —
  * NON-DESTRUCTIVELY. The person stays in every campaign; their lead rows just
- * get `doNotCall` toggled (the UI shows them in red and confirms before calls),
- * and the flag is mirrored onto master_contacts so it follows the person.
+ * get `doNotCall` toggled (the UI shows them in red and confirms before calls).
  *
- * Matches by email / linkedin / normalized-phone so the same person is flagged
- * everywhere they appear.
+ * Person-first: the identity resolves to the canonical master contact (created
+ * via resolvePerson when missing — this replaced an ad-hoc insert that used to
+ * create duplicate NULL-linkedin masters), and every lead row linked to that
+ * person is flagged. The key-based heuristic on lead rows is kept as a second
+ * net — DNC is compliance, so over-flagging beats under-flagging.
  */
 export async function flagDoNotCall(
   tx: DbOrTx,
@@ -36,8 +38,25 @@ export async function flagDoNotCall(
   const linkedinUrl = (identity.linkedinUrl || "").trim();
   const phoneDigits = (identity.phone || "").replace(/\D/g, "");
 
+  // Canonical person (find-or-create; null only when there's no identity at
+  // all). Uses its own connection — safe inside or outside a caller's tx.
+  let personId: string | null = null;
+  try {
+    personId = await resolvePerson(orgId, {
+      name: identity.name,
+      title: identity.title,
+      company: identity.company,
+      email: identity.email,
+      phone: identity.phone,
+      linkedinUrl: identity.linkedinUrl,
+    });
+  } catch {
+    personId = null; // fall through to the heuristic nets below
+  }
+
   // Person-identity OR conditions (each non-empty identifier contributes one).
   const leadConds = [];
+  if (personId) leadConds.push(eq(leads.masterContactId, personId));
   if (email) leadConds.push(sql`LOWER(${leads.email}) = ${email}`);
   if (linkedinUrl) leadConds.push(eq(leads.linkedinUrl, linkedinUrl));
   if (phoneDigits.length >= 7) {
@@ -60,45 +79,20 @@ export async function flagDoNotCall(
     flaggedLeads = updated.length;
   }
 
-  // Mirror onto master_contacts so the flag follows the person cross-funnel.
+  // Flag the canonical person + any heuristic master matches (legacy rows the
+  // backfill may not have linked) so the flag follows the person everywhere.
   const masterConds = [];
+  if (personId) masterConds.push(eq(masterContacts.id, personId));
   if (linkedinUrl) masterConds.push(eq(masterContacts.linkedinUrl, linkedinUrl));
   if (email) masterConds.push(sql`LOWER(${masterContacts.email}) = ${email}`);
   if (phoneDigits.length >= 7) {
     masterConds.push(sql`regexp_replace(${masterContacts.phone}, '[^0-9]', '', 'g') = ${phoneDigits}`);
   }
-  let flaggedMaster = 0;
   if (masterConds.length) {
-    const updated = await tx
+    await tx
       .update(masterContacts)
       .set({ doNotCall: value, updatedAt: new Date() })
-      .where(and(eq(masterContacts.organizationId, orgId), or(...masterConds)))
-      .returning({ id: masterContacts.id });
-    flaggedMaster = updated.length;
-  }
-
-  // If flagging and no master row exists yet, create one so it persists.
-  if (value && flaggedMaster === 0) {
-    const [first = "", ...rest] = (identity.name || "").trim().split(/\s+/);
-    await tx
-      .insert(masterContacts)
-      .values({
-        id: createId("mc"),
-        organizationId: orgId,
-        linkedinUrl: linkedinUrl || null,
-        firstName: first || null,
-        lastName: rest.join(" ") || null,
-        fullName: (identity.name || "").trim() || null,
-        currentTitle: (identity.title || "").trim() || null,
-        currentCompany: (identity.company || "").trim() || null,
-        email: email || null,
-        phone: (identity.phone || "").trim() || null,
-        doNotCall: true,
-      })
-      .onConflictDoUpdate({
-        target: [masterContacts.organizationId, masterContacts.linkedinUrl],
-        set: { doNotCall: true, updatedAt: new Date() },
-      });
+      .where(and(eq(masterContacts.organizationId, orgId), or(...masterConds)));
   }
 
   return { flaggedLeads };

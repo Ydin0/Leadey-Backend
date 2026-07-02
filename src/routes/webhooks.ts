@@ -53,20 +53,41 @@ function shouldUpgrade(current: string, incoming: string): boolean {
 router.post("/smartlead", async (req: Request, res: Response) => {
   // Always return 200 to prevent Smartlead retry storms
   try {
-    const { event_type, lead_email, to_email } = req.body || {};
+    const { event_type, lead_email, to_email, sl_lead_id, lead_id, campaign_id } = req.body || {};
 
     const email = (lead_email || to_email || "").toLowerCase().trim();
+    const smartleadLeadId = String(sl_lead_id || lead_id || "");
     const mappedStatus = EVENT_MAP[event_type];
 
-    if (!email || !mappedStatus) {
+    if ((!email && !smartleadLeadId) || !mappedStatus) {
       res.status(200).json({ ok: true, skipped: true });
       return;
     }
 
-    // Find lead by email
-    const lead = await db.query.leads.findFirst({
-      where: eq(leads.email, email),
-    });
+    // Correlate by the Smartlead lead id we stored at push time — exact,
+    // survives contact-edit email fan-out. Email is the fallback, scoped to
+    // the campaign that Smartlead says the event belongs to when provided
+    // (the old global email lookup crossed orgs and picked an arbitrary row
+    // when the same address appeared in several campaigns).
+    let lead =
+      smartleadLeadId
+        ? await db.query.leads.findFirst({ where: eq(leads.smartleadLeadId, smartleadLeadId) })
+        : undefined;
+    if (!lead && email) {
+      const smartleadCampaignId = String(campaign_id || "");
+      if (smartleadCampaignId) {
+        const [scoped] = await db
+          .select({ lead: leads })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(eq(funnels.smartleadCampaignId, smartleadCampaignId), sql`lower(${leads.email}) = ${email}`))
+          .limit(1);
+        lead = scoped?.lead;
+      }
+      if (!lead) {
+        lead = await db.query.leads.findFirst({ where: eq(leads.email, email) });
+      }
+    }
 
     if (!lead) {
       res.status(200).json({ ok: true, skipped: true, reason: "lead_not_found" });

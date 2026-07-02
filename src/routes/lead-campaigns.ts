@@ -35,22 +35,26 @@ function linkedinKey(url: string | null | undefined): string | null {
 
 /**
  * All lead rows across the org's campaigns that are the SAME PERSON as the
- * base lead. Leads are per-campaign rows, so identity is matched on email,
- * phone (last-9-digits key) or LinkedIn URL — the same keys the rest of the
- * app uses to follow a person across campaigns. The base row always matches.
+ * base lead. Person identity is the canonical master_contact_id link; the
+ * key-based heuristic (email / phone last-9 / LinkedIn) remains as the
+ * fallback for rows the identity backfill couldn't resolve (no usable keys).
+ * The base row always matches.
  */
 export async function findMemberships(orgId: string, base: typeof leads.$inferSelect) {
-  const email = (base.email || "").trim().toLowerCase();
-  const phone = phoneKey(base.phone);
-  const linkedin = linkedinKey(base.linkedinUrl);
-
   const identity = [sql`${leads.id} = ${base.id}`];
-  if (email) identity.push(sql`lower(${leads.email}) = ${email}`);
-  if (phone) identity.push(sql`right(regexp_replace(${leads.phone}, '\\D', '', 'g'), 9) = ${phone}`);
-  if (linkedin) {
-    identity.push(
-      sql`lower(regexp_replace(regexp_replace(${leads.linkedinUrl}, '^https?://(www\\.)?', ''), '/+$', '')) = ${linkedin}`,
-    );
+  if (base.masterContactId) {
+    identity.push(sql`${leads.masterContactId} = ${base.masterContactId}`);
+  } else {
+    const email = (base.email || "").trim().toLowerCase();
+    const phone = phoneKey(base.phone);
+    const linkedin = linkedinKey(base.linkedinUrl);
+    if (email) identity.push(sql`lower(${leads.email}) = ${email}`);
+    if (phone) identity.push(sql`right(regexp_replace(${leads.phone}, '\\D', '', 'g'), 9) = ${phone}`);
+    if (linkedin) {
+      identity.push(
+        sql`lower(regexp_replace(regexp_replace(${leads.linkedinUrl}, '^https?://(www\\.)?', ''), '/+$', '')) = ${linkedin}`,
+      );
+    }
   }
 
   const rows = await db

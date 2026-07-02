@@ -1201,9 +1201,10 @@ router.post(
       .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)));
     if (!stage) throw new ApiError(404, "Stage not found in pipeline");
 
-    // Resolve master contact from lead's linkedinUrl OR email
-    let masterContactId: string | null = null;
-    if (lead.linkedinUrl) {
+    // Canonical person link first; linkedin/email lookups remain as the
+    // fallback for legacy rows the identity backfill couldn't resolve.
+    let masterContactId: string | null = lead.masterContactId ?? null;
+    if (!masterContactId && lead.linkedinUrl) {
       const [m] = await db
         .select({ id: masterContacts.id })
         .from(masterContacts)

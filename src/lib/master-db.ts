@@ -102,13 +102,19 @@ export async function upsertMasterContact(
     enrichmentStatus?: string;
   },
 ): Promise<string | null> {
-  if (!data.linkedinUrl) return null; // Can't dedup without LinkedIn URL
-
-  const existing = await db.query.masterContacts.findFirst({
-    where: and(
-      eq(masterContacts.organizationId, orgId),
-      sql`lower(${masterContacts.linkedinUrl}) = lower(${data.linkedinUrl})`,
-    ),
+  // Canonical person resolution (email / phone / linkedin — no longer
+  // LinkedIn-only, which used to return null and strand phone/email-only
+  // contacts without a master).
+  const { findPerson } = await import("./person-resolve");
+  const existing = await findPerson(orgId, {
+    name: data.fullName,
+    firstName: data.firstName,
+    lastName: data.lastName,
+    title: data.currentTitle,
+    company: data.currentCompany,
+    email: data.email,
+    phone: data.phone,
+    linkedinUrl: data.linkedinUrl,
   });
 
   if (existing) {
@@ -136,26 +142,33 @@ export async function upsertMasterContact(
     return existing.id;
   }
 
-  const id = createId("mcon");
-  await db.insert(masterContacts).values({
-    id,
-    organizationId: orgId,
+  // No existing person — create via the resolver (handles identity keys,
+  // disputed/company LinkedIn URLs and races), then attach the discovery
+  // fields the resolver doesn't know about.
+  const { resolvePerson } = await import("./person-resolve");
+  const id = await resolvePerson(orgId, {
+    name: data.fullName,
+    firstName: data.firstName,
+    lastName: data.lastName,
+    title: data.currentTitle,
+    company: data.currentCompany,
+    email: data.email,
+    phone: data.phone,
     linkedinUrl: data.linkedinUrl,
-    firstName: data.firstName || null,
-    lastName: data.lastName || null,
-    fullName: data.fullName || null,
-    headline: data.headline || null,
-    profileImageUrl: data.profileImageUrl || null,
-    currentTitle: data.currentTitle || null,
-    currentCompany: data.currentCompany || null,
-    masterCompanyId: data.masterCompanyId || null,
-    location: data.location || null,
-    email: data.email || null,
-    emailStatus: data.emailStatus || null,
-    phone: data.phone || null,
-    phoneStatus: data.phoneStatus || null,
-    enrichmentStatus: data.enrichmentStatus || "none",
   });
+  if (!id) return null; // no usable identity at all
+
+  const extras: Record<string, unknown> = {};
+  if (data.headline) extras.headline = data.headline;
+  if (data.profileImageUrl) extras.profileImageUrl = data.profileImageUrl;
+  if (data.masterCompanyId) extras.masterCompanyId = data.masterCompanyId;
+  if (data.location) extras.location = data.location;
+  if (data.emailStatus) extras.emailStatus = data.emailStatus;
+  if (data.phoneStatus) extras.phoneStatus = data.phoneStatus;
+  if (data.enrichmentStatus && data.enrichmentStatus !== "none") extras.enrichmentStatus = data.enrichmentStatus;
+  if (Object.keys(extras).length > 0) {
+    await db.update(masterContacts).set({ ...extras, updatedAt: new Date() }).where(eq(masterContacts.id, id));
+  }
 
   return id;
 }

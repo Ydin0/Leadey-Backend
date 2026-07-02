@@ -1016,14 +1016,18 @@ router.get(
       .limit(1);
     if (!c) throw new ApiError(404, "Contact not found");
 
-    // Org-wide master record (DNC, timezone, best enrichment) by LinkedIn URL.
-    const master = c.linkedinUrl
-      ? (await db
-          .select()
-          .from(masterContacts)
-          .where(and(eq(masterContacts.organizationId, orgId), eq(masterContacts.linkedinUrl, c.linkedinUrl)))
-          .limit(1))[0]
-      : undefined;
+    // Org-wide master record (DNC, timezone, best enrichment) — canonical
+    // person match on any identity key, not LinkedIn-only.
+    const { findPerson } = await import("../lib/person-resolve");
+    const master =
+      (await findPerson(orgId, {
+        name: c.fullName,
+        firstName: c.firstName,
+        lastName: c.lastName,
+        email: c.email,
+        phone: c.phone,
+        linkedinUrl: c.linkedinUrl,
+      })) ?? undefined;
 
     const email = (c.email || master?.email || "").toLowerCase();
     const phone = c.phone || master?.phone || null;

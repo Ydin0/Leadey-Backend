@@ -1,4 +1,5 @@
-import { pgTable, text, integer, bigint, timestamp, unique, boolean, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, unique, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { organizations } from "./organizations";
 
 export const masterCompanies = pgTable("master_companies", {
@@ -73,7 +74,14 @@ export const masterContacts = pgTable("master_contacts", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   unique().on(t.organizationId, t.linkedinUrl),
-  index("master_contacts_org_email_key").on(t.organizationId, t.emailKey),
   index("master_contacts_org_phone_key").on(t.organizationId, t.phoneKey),
-  index("master_contacts_org_linkedin_key").on(t.organizationId, t.linkedinKey),
+  // One person per identity key. Partial + added AFTER the identity backfill
+  // deduped historical rows. Phone is deliberately NOT unique — switchboards
+  // are legitimately shared by different people.
+  uniqueIndex("master_contacts_org_email_key_unique")
+    .on(t.organizationId, t.emailKey)
+    .where(sql`email_key IS NOT NULL`),
+  uniqueIndex("master_contacts_org_linkedin_key_unique")
+    .on(t.organizationId, t.linkedinKey)
+    .where(sql`linkedin_key IS NOT NULL`),
 ]);
