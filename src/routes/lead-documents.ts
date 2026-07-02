@@ -89,7 +89,7 @@ router.post(
     }
 
     const id = createId("doc");
-    const storedName = await saveDocumentFile(id, fileName, file.buffer);
+    const storedName = await saveDocumentFile(id, fileName, file.buffer, file.mimetype);
     const [row] = await db
       .insert(leadDocuments)
       .values({
