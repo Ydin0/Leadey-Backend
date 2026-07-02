@@ -351,6 +351,13 @@
       "when": 1782936297509,
       "tag": "0049_happy_talisman",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1782993151482,
+      "tag": "0050_mysterious_darkhawk",
+      "breakpoints": true
     }
   ]
 }

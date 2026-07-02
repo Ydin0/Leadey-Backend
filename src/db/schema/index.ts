@@ -67,3 +67,5 @@ export {
   discoveryRunsRelations,
   scraperContactsRelations,
 } from "./relations";
+
+export { leadDocuments } from "./lead-documents";
