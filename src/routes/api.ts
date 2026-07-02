@@ -891,26 +891,32 @@ router.patch(
       if (normalizedSteps) {
         // Replace the step set, then clamp every lead's progress to the new
         // length so currentStep can't point past the end of the sequence.
+        // An empty set removes the sequence entirely (drizzle's values()
+        // rejects an empty array, so only insert when there are steps).
         await tx.delete(funnelSteps).where(eq(funnelSteps.funnelId, funnel.id));
-        await tx.insert(funnelSteps).values(
-          normalizedSteps.map((step, index) => ({
-            id: step.id,
-            funnelId: funnel.id,
-            channel: step.channel,
-            label: step.label,
-            dayOffset: step.dayOffset,
-            sortOrder: index,
-            subject: step.subject,
-            emailBody: step.emailBody,
-            action: step.action,
-          })),
-        );
+        if (normalizedSteps.length > 0) {
+          await tx.insert(funnelSteps).values(
+            normalizedSteps.map((step, index) => ({
+              id: step.id,
+              funnelId: funnel.id,
+              channel: step.channel,
+              label: step.label,
+              dayOffset: step.dayOffset,
+              sortOrder: index,
+              subject: step.subject,
+              emailBody: step.emailBody,
+              action: step.action,
+            })),
+          );
+        }
         const newLen = normalizedSteps.length;
+        // currentStep is 1-based — keep it at ≥1 even for sequence-less
+        // campaigns so the row stays consistent with freshly-added leads.
         await tx
           .update(leads)
           .set({
             totalSteps: newLen,
-            currentStep: sql`LEAST(${leads.currentStep}, ${newLen})`,
+            currentStep: sql`GREATEST(LEAST(${leads.currentStep}, ${newLen}), 1)`,
             updatedAt: new Date(),
           })
           .where(eq(leads.funnelId, funnel.id));
