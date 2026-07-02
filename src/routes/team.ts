@@ -560,9 +560,11 @@ router.get(
         c: count(),
         // Connected = a PERSON picked up: talk time > 0 (ringing excluded) and
         // not a voicemail/machine. Drives the connect-rate stat.
-        connected: sql<number>`coalesce(count(*) filter (where ${callRecords.duration} > 0 and ${callRecords.disposition} <> 'voicemail'), 0)`,
-        // Calls that reached voicemail (answering machine detected).
-        voicemail: sql<number>`coalesce(count(*) filter (where ${callRecords.disposition} = 'voicemail'), 0)`,
+        connected: sql<number>`coalesce(count(*) filter (where ${callRecords.duration} > 0 and ${callRecords.disposition} <> 'voicemail' and coalesce(${callRecords.outcome}, '') not ilike '%voicemail%'), 0)`,
+        // Calls that reached voicemail: the telephony disposition (VM drop /
+        // dialer voicemail disposition) OR a voicemail sales outcome
+        // (AI-classified or set by the rep on the call card).
+        voicemail: sql<number>`coalesce(count(*) filter (where ${callRecords.disposition} = 'voicemail' or ${callRecords.outcome} ilike '%voicemail%'), 0)`,
         talk: sql<number>`coalesce(sum(${callRecords.duration}), 0)`,
       })
       .from(callRecords)

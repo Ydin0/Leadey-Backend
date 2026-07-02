@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, asc, desc, gte, sql } from "drizzle-orm";
+import { eq, and, asc, desc, gte, sql, inArray } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -8,6 +8,7 @@ import { funnels } from "../db/schema/funnels";
 import { phoneLines } from "../db/schema/phone-lines";
 import { smsMessages } from "../db/schema/sms";
 import { users } from "../db/schema/organizations";
+import { masterContacts } from "../db/schema/master";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 
@@ -226,6 +227,7 @@ router.get(
     type Thread = {
       key: string; phone: string; leadId: string | null; funnelId: string | null;
       contactName: string | null; company: string | null;
+      companyDomain: string | null; masterCompanyId: string | null;
       lastBody: string; lastDirection: string; lastAt: string;
       inboundCount: number; total: number; needsReply: boolean;
     };
@@ -240,6 +242,7 @@ router.get(
         t = {
           key, phone: counterparty, leadId: m.leadId, funnelId: m.funnelId,
           contactName: r.leadName ?? null, company: r.leadCompany ?? null,
+          companyDomain: null, masterCompanyId: null,
           lastBody: m.body, lastDirection: m.direction, lastAt: m.createdAt.toISOString(),
           inboundCount: 0, total: 0, needsReply: m.direction === "inbound",
         };
@@ -250,7 +253,72 @@ router.get(
       if (!t.leadId && m.leadId) { t.leadId = m.leadId; t.funnelId = m.funnelId; }
       if (!t.contactName && r.leadName) { t.contactName = r.leadName; t.company = r.leadCompany ?? null; }
     }
-    res.json({ data: [...threads.values()] });
+    const list = [...threads.values()];
+
+    // Enrich rows for the inbox: full contact name (master contact beats a
+    // partial lead name), company + domain + canonical company id, and match
+    // threads whose messages were never stamped with a leadId against the
+    // org's leads by phone (inbound texts from known contacts).
+    const leadFields = {
+      id: leads.id,
+      funnelId: leads.funnelId,
+      name: leads.name,
+      company: leads.company,
+      companyDomain: leads.companyDomain,
+      masterCompanyId: leads.masterCompanyId,
+      masterContactId: leads.masterContactId,
+    };
+    type LeadRow = { id: string; funnelId: string; name: string; company: string; companyDomain: string | null; masterCompanyId: string | null; masterContactId: string | null };
+
+    const stampedIds = [...new Set(list.map((t) => t.leadId).filter(Boolean) as string[])];
+    const unmatchedKeys = [...new Set(list.filter((t) => !t.leadId && /^\d{7,}$/.test(t.key)).map((t) => t.key))];
+
+    const [stampedRows, phoneRows] = await Promise.all([
+      stampedIds.length
+        ? db.select(leadFields).from(leads).where(inArray(leads.id, stampedIds))
+        : Promise.resolve([] as LeadRow[]),
+      unmatchedKeys.length
+        ? db
+            .select({ ...leadFields, phoneKey: sql<string>`right(regexp_replace(${leads.phone}, '[^0-9]', '', 'g'), 10)` })
+            .from(leads)
+            .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+            .where(and(
+              eq(funnels.organizationId, orgId),
+              inArray(sql`right(regexp_replace(${leads.phone}, '[^0-9]', '', 'g'), 10)`, unmatchedKeys),
+            ))
+            .orderBy(asc(leads.createdAt))
+        : Promise.resolve([] as (LeadRow & { phoneKey: string })[]),
+    ]);
+
+    const byLeadId = new Map(stampedRows.map((l) => [l.id, l]));
+    const byPhoneKey = new Map<string, LeadRow & { phoneKey: string }>();
+    for (const l of phoneRows) if (!byPhoneKey.has(l.phoneKey)) byPhoneKey.set(l.phoneKey, l);
+
+    const masterIds = [
+      ...new Set([...stampedRows, ...phoneRows].map((l) => l.masterContactId).filter(Boolean) as string[]),
+    ];
+    const masters = masterIds.length
+      ? await db
+          .select({ id: masterContacts.id, fullName: masterContacts.fullName })
+          .from(masterContacts)
+          .where(inArray(masterContacts.id, masterIds))
+      : [];
+    const masterName = new Map(masters.map((m) => [m.id, m.fullName]));
+
+    for (const t of list) {
+      const lead = (t.leadId ? byLeadId.get(t.leadId) : undefined) ?? byPhoneKey.get(t.key);
+      if (!lead) continue;
+      if (!t.leadId) { t.leadId = lead.id; t.funnelId = lead.funnelId; }
+      // Prefer the canonical person's full name over a partial lead name
+      // (an SMS-created lead is often just a first name).
+      const full = lead.masterContactId ? masterName.get(lead.masterContactId) : null;
+      t.contactName = full || t.contactName || lead.name || null;
+      t.company = t.company || lead.company || null;
+      t.companyDomain = lead.companyDomain ?? null;
+      t.masterCompanyId = lead.masterCompanyId ?? null;
+    }
+
+    res.json({ data: list });
   }),
 );
 

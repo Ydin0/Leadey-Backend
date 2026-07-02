@@ -1388,6 +1388,18 @@ router.post(
         })
         .where(eq(dialerQueueItems.id, current.id));
 
+      // A voicemail disposition marks the CALL RECORD too, so connect-rate
+      // excludes it and the Team page's voicemail counter counts it.
+      // (Previously only the VM-drop button set this — a hotkey'd "Voicemail"
+      // disposition never showed up in the analytics.)
+      const isVoicemail = !!disposition && /voicemail/i.test(`${disposition.slug} ${disposition.label}`);
+      if (isVoicemail && callRecordId) {
+        await tx
+          .update(callRecords)
+          .set({ disposition: "voicemail" })
+          .where(and(eq(callRecords.id, callRecordId), eq(callRecords.organizationId, s.organizationId)));
+      }
+
       // Bump master_contacts counters
       if (current.masterContactId) {
         await tx
