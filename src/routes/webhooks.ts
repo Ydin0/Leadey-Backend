@@ -1054,8 +1054,11 @@ router.post("/twilio/amd", async (req: Request, res: Response) => {
       return;
     }
 
-    // Inject the VM into the live call.
-    const escaped = vm.recordingUrl
+    // Inject the VM into the live call. Presigned R2 URL when configured —
+    // Twilio pulls the audio from Cloudflare's edge, not through the backend.
+    const { voicemailPlaybackUrl } = await import("../lib/voicemail-storage");
+    const playUrl = await voicemailPlaybackUrl(vm.recordingUrl);
+    const escaped = playUrl
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");

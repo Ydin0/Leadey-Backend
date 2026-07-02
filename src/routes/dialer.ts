@@ -22,6 +22,7 @@ import { flagDoNotCall } from "../lib/dnc";
 import {
   saveVoicemailFile,
   deleteVoicemailFile,
+  voicemailPlaybackUrl,
 } from "../lib/voicemail-storage";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 
@@ -348,7 +349,10 @@ router.post(
       );
     if (!vm) throw new ApiError(404, "Voicemail not found");
 
-    const twiml = `<Response><Play>${escapeXml(vm.recordingUrl)}</Play><Hangup/></Response>`;
+    // Presigned R2 URL when configured — Twilio pulls the audio straight
+    // from Cloudflare's edge instead of streaming it through this backend.
+    const playUrl = await voicemailPlaybackUrl(vm.recordingUrl);
+    const twiml = `<Response><Play>${escapeXml(playUrl)}</Play><Hangup/></Response>`;
     try {
       await twilio.calls(callSid).update({ twiml });
     } catch (err: any) {
