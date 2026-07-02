@@ -1304,21 +1304,47 @@ router.patch(
 
     await db.update(scraperContacts).set(updates).where(eq(scraperContacts.id, id));
 
-    const linkedinUrl = (updates.linkedinUrl as string) ?? existing.linkedinUrl ?? "";
-    if (linkedinUrl) {
-      try {
-        await upsertMasterContact(orgId, {
-          linkedinUrl,
-          fullName: (updates.fullName as string) ?? existing.fullName ?? null,
-          firstName: (updates.firstName as string) ?? existing.firstName ?? null,
-          lastName: (updates.lastName as string) ?? existing.lastName ?? null,
-          currentTitle: (updates.currentTitle as string) ?? existing.currentTitle ?? null,
-          email: (updates.email as string) ?? existing.email ?? null,
-          phone: (updates.phone as string) ?? existing.phone ?? null,
-        });
-      } catch (err) {
-        console.warn("[contact-edit] master mirror failed:", err instanceof Error ? err.message : err);
+    // Sync the canonical person — resolved by any identity key (email/phone/
+    // LinkedIn), not LinkedIn-only as before, and explicit edits overwrite.
+    try {
+      const { resolvePerson, emailKeyOf, linkedinKeyOf, phoneKeyOf } = await import("../lib/person-resolve");
+      const merged = {
+        name: (updates.fullName as string) ?? existing.fullName ?? "",
+        firstName: (updates.firstName as string) ?? existing.firstName,
+        lastName: (updates.lastName as string) ?? existing.lastName,
+        title: (updates.currentTitle as string) ?? existing.currentTitle,
+        email: (updates.email as string) ?? existing.email,
+        phone: (updates.phone as string) ?? existing.phone,
+        linkedinUrl: (updates.linkedinUrl as string) ?? existing.linkedinUrl,
+      };
+      const personId = await resolvePerson(orgId, merged);
+      if (personId) {
+        const masterUpdates: Record<string, unknown> = { updatedAt: new Date() };
+        if (updates.fullName !== undefined) {
+          masterUpdates.fullName = updates.fullName;
+          masterUpdates.firstName = updates.firstName;
+          masterUpdates.lastName = updates.lastName;
+        }
+        if (updates.currentTitle !== undefined) masterUpdates.currentTitle = updates.currentTitle || null;
+        if (updates.email !== undefined) {
+          masterUpdates.email = (updates.email as string) || null;
+          masterUpdates.emailKey = emailKeyOf(updates.email as string);
+        }
+        if (updates.phone !== undefined) {
+          masterUpdates.phone = (updates.phone as string) || null;
+          masterUpdates.phoneKey = phoneKeyOf(updates.phone as string);
+        }
+        if (updates.linkedinUrl !== undefined) {
+          masterUpdates.linkedinUrl = (updates.linkedinUrl as string) || null;
+          masterUpdates.linkedinKey = linkedinKeyOf(updates.linkedinUrl as string);
+        }
+        await db
+          .update(masterContacts)
+          .set(masterUpdates)
+          .where(and(eq(masterContacts.id, personId), eq(masterContacts.organizationId, orgId)));
       }
+    } catch (err) {
+      console.warn("[contact-edit] person sync failed:", err instanceof Error ? err.message : err);
     }
 
     res.json({
@@ -1519,6 +1545,12 @@ router.post(
     }
 
     if (newLeads.length > 0) {
+      // Link every enrollment to its canonical person (bulk resolution).
+      const { resolvePersonsBulk } = await import("../lib/person-resolve");
+      const personIds = await resolvePersonsBulk(orgId, newLeads);
+      for (let i = 0; i < newLeads.length; i++) {
+        newLeads[i].masterContactId = personIds[i];
+      }
       await db.transaction(async (tx) => {
         // Chunk inserts — Postgres caps a statement at 65534 bind params, so
         // large batches must be split or they hit MAX_PARAMETERS_EXCEEDED.

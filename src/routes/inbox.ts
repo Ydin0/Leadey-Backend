@@ -272,9 +272,18 @@ router.post(
 
     const emailNorm = (email || "").trim().toLowerCase();
     const id = createId("lead");
+    // Canonical person link. The display name may be a placeholder (the phone
+    // or email itself) — the resolver's name guard handles that.
+    const { resolvePerson } = await import("../lib/person-resolve");
+    const masterContactId = await resolvePerson(orgId, {
+      name: name?.trim() || "",
+      email: emailNorm,
+      phone: phone?.trim(),
+    }).catch(() => null);
     await db.insert(leads).values({
       id,
       funnelId,
+      masterContactId,
       name: name?.trim() || phone?.trim() || emailNorm || "New contact",
       company: "",
       phone: phone?.trim() || "",

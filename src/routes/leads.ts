@@ -420,9 +420,17 @@ router.post(
         action: "make_call",
       });
 
+      // Carry each source row's canonical person; resolve any not yet linked
+      // (pre-backfill rows) so the copies land person-linked either way.
+      const { resolvePersonsBulk } = await import("../lib/person-resolve");
+      const unlinked = unique.filter((l) => !l.masterContactId);
+      const resolvedIds = await resolvePersonsBulk(orgId, unlinked);
+      const resolvedByRow = new Map(unlinked.map((l, i) => [l.id, resolvedIds[i]]));
+
       const newLeads = unique.map((l) => ({
         id: createId("lead"),
         funnelId,
+        masterContactId: l.masterContactId ?? resolvedByRow.get(l.id) ?? null,
         name: l.name,
         title: l.title,
         company: l.company,

@@ -132,10 +132,27 @@ router.post(
       .from(funnelSteps)
       .where(eq(funnelSteps.funnelId, targetFunnelId));
 
+    // Same person, new enrollment — carry the canonical person id (resolving
+    // it now if this base row predates person linking).
+    const { resolvePerson } = await import("../lib/person-resolve");
+    const masterContactId =
+      base.masterContactId ||
+      (await resolvePerson(orgId, {
+        name: base.name,
+        firstName: base.firstName,
+        lastName: base.lastName,
+        title: base.title,
+        company: base.company,
+        email: base.email,
+        phone: base.phone,
+        linkedinUrl: base.linkedinUrl,
+      }).catch(() => null));
+
     const id = createId("lead");
     await db.insert(leads).values({
       id,
       funnelId: targetFunnelId,
+      masterContactId,
       name: base.name,
       firstName: base.firstName,
       lastName: base.lastName,

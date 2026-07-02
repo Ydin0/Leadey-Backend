@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, timestamp, unique, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, unique, boolean, index } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 export const masterCompanies = pgTable("master_companies", {
@@ -46,6 +46,16 @@ export const masterContacts = pgTable("master_contacts", {
   phoneStatus: text("phone_status"),
   enrichmentStatus: text("enrichment_status").notNull().default("none"),
 
+  /** Normalised identity keys — how a PERSON is recognised across campaigns
+   *  (see lib/person-resolve.ts). email_key is lower(email) but NULL for
+   *  role inboxes (info@, sales@, …); phone_key is the last 9 digits;
+   *  linkedin_key is the protocol/www/slash/case-insensitive profile path.
+   *  Uniqueness (partial, per-org, email+linkedin only) arrives with the
+   *  cutover migration AFTER the backfill dedupes historical rows. */
+  emailKey: text("email_key"),
+  phoneKey: text("phone_key"),
+  linkedinKey: text("linkedin_key"),
+
   /** Dialer / compliance fields. Stored at the master-contact level (not
    *  per-funnel-lead) so flipping DNC once propagates everywhere the same
    *  person appears. */
@@ -63,4 +73,7 @@ export const masterContacts = pgTable("master_contacts", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   unique().on(t.organizationId, t.linkedinUrl),
+  index("master_contacts_org_email_key").on(t.organizationId, t.emailKey),
+  index("master_contacts_org_phone_key").on(t.organizationId, t.phoneKey),
+  index("master_contacts_org_linkedin_key").on(t.organizationId, t.linkedinKey),
 ]);

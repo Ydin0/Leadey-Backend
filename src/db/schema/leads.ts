@@ -1,11 +1,18 @@
-import { pgTable, text, integer, jsonb, timestamp, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, jsonb, timestamp, boolean, index } from "drizzle-orm/pg-core";
 import { funnels } from "./funnels";
+import { masterContacts } from "./master";
 
 export const leads = pgTable("leads", {
   id: text("id").primaryKey(),
   funnelId: text("funnel_id")
     .notNull()
     .references(() => funnels.id, { onDelete: "cascade" }),
+  /** The canonical PERSON this enrollment belongs to (master_contacts).
+   *  A lead row is one person's enrollment in one campaign; identity —
+   *  who they are across campaigns, DNC, timezone — lives on the master.
+   *  Nullable: legacy rows are linked by the person-identity backfill, and
+   *  a row with no email/phone/linkedin may be unresolvable. */
+  masterContactId: text("master_contact_id").references(() => masterContacts.id, { onDelete: "set null" }),
   name: text("name").notNull(),
   /** Explicit first/last name when the source provided them separately (CSV
    *  import, scraper). Lets email templates field-map {{first_name}} /
@@ -55,7 +62,11 @@ export const leads = pgTable("leads", {
   notes: jsonb("notes").$type<Record<string, string>>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Person-identity lookups: memberships, DNC fan-out, sibling sync.
+  index("leads_master_contact_id_idx").on(t.masterContactId),
+  index("leads_funnel_id_idx").on(t.funnelId),
+]);
 
 export const leadEvents = pgTable("lead_events", {
   id: text("id").primaryKey(),

@@ -86,6 +86,7 @@ import {
 } from "../lib/funnel-service";
 import { SmartleadClient, type SmartleadSequence } from "../lib/smartlead-client";
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
+import { resolvePerson, resolvePersonsBulk } from "../lib/person-resolve";
 import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads, setLeadCustomFields, setLeadCustomFieldsBatch, ensureFieldDefinition } from "../lib/custom-fields-service";
@@ -1441,6 +1442,14 @@ router.post(
           }).onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
         }
       }
+      // Resolve every row to its canonical person (bulk: 3 indexed queries,
+      // in-memory matching, one insert batch for missing masters) so each
+      // enrollment lands linked to its master contact from birth.
+      const personIds = await resolvePersonsBulk(orgId, leadsToInsert);
+      for (let i = 0; i < leadsToInsert.length; i++) {
+        leadsToInsert[i].masterContactId = personIds[i];
+      }
+
       // Batch inserts — Postgres caps a single statement at 65534 bind
       // parameters, so a large import (thousands of rows × ~30 cols) must be
       // chunked or it errors with MAX_PARAMETERS_EXCEEDED.
@@ -2019,27 +2028,77 @@ router.patch(
     if (Object.keys(updates).length === 0) throw new ApiError(400, "Nothing to update");
     updates.updatedAt = new Date();
 
+    // Editing a name keeps the split first/last in step on this row and its
+    // siblings (email templates field-map {{first_name}}/{{last_name}}).
+    if (updates.name !== undefined) {
+      const [firstName, ...rest] = (updates.name as string).split(" ");
+      updates.firstName = firstName || null;
+      updates.lastName = rest.join(" ") || null;
+    }
+
     await db.update(leads).set(updates).where(eq(leads.id, lead.id));
 
-    // Mirror to the master contact (keyed by LinkedIn URL) so the edit follows
-    // the person everywhere. Best-effort — never blocks the lead update.
-    const linkedinUrl = (updates.linkedinUrl as string) ?? lead.linkedinUrl ?? "";
-    if (linkedinUrl) {
-      const fullName = (updates.name as string) ?? lead.name ?? "";
-      const [firstName, ...rest] = fullName.split(" ");
-      try {
-        await upsertMasterContact(orgId, {
-          linkedinUrl,
-          fullName: fullName || null,
-          firstName: firstName || null,
-          lastName: rest.join(" ") || null,
-          currentTitle: (updates.title as string) ?? lead.title ?? null,
-          email: (updates.email as string) ?? lead.email ?? null,
-          phone: (updates.phone as string) ?? lead.phone ?? null,
-        });
-      } catch (err) {
-        console.warn("[lead-contact] master mirror failed:", err instanceof Error ? err.message : err);
+    // A contact edit is a PERSON edit: overwrite the canonical master contact
+    // (explicit edits clobber, unlike discovery upserts) and fan the person
+    // fields out to this person's other enrollments org-wide. Best-effort —
+    // never blocks the lead update itself.
+    try {
+      const [fresh] = await db.select().from(leads).where(eq(leads.id, lead.id));
+      if (fresh) {
+        const { resolvePerson, emailKeyOf, linkedinKeyOf, phoneKeyOf } = await import("../lib/person-resolve");
+        let personId = fresh.masterContactId;
+        if (!personId) {
+          personId = await resolvePerson(orgId, fresh);
+          if (personId) await db.update(leads).set({ masterContactId: personId }).where(eq(leads.id, fresh.id));
+        }
+        if (personId) {
+          const masterUpdates: Record<string, unknown> = { updatedAt: new Date() };
+          if (updates.name !== undefined) {
+            masterUpdates.fullName = updates.name;
+            masterUpdates.firstName = updates.firstName;
+            masterUpdates.lastName = updates.lastName;
+          }
+          if (updates.title !== undefined) masterUpdates.currentTitle = updates.title || null;
+          if (updates.email !== undefined) {
+            masterUpdates.email = (updates.email as string) || null;
+            masterUpdates.emailKey = emailKeyOf(updates.email as string);
+          }
+          if (updates.phone !== undefined) {
+            masterUpdates.phone = (updates.phone as string) || null;
+            masterUpdates.phoneKey = phoneKeyOf(updates.phone as string);
+          }
+          if (updates.linkedinUrl !== undefined) {
+            masterUpdates.linkedinUrl = (updates.linkedinUrl as string) || null;
+            masterUpdates.linkedinKey = linkedinKeyOf(updates.linkedinUrl as string);
+          }
+          await db
+            .update(masterContacts)
+            .set(masterUpdates)
+            .where(and(eq(masterContacts.id, personId), eq(masterContacts.organizationId, orgId)));
+
+          // Sibling enrollments: sync person fields. Email is skipped on rows
+          // already pushed to Smartlead — its webhooks correlate by the email
+          // we sent, so rewriting it would orphan those events.
+          const siblingSync: Record<string, unknown> = {};
+          for (const key of ["name", "firstName", "lastName", "title", "phone", "linkedinUrl"] as const) {
+            if (updates[key] !== undefined) siblingSync[key] = updates[key];
+          }
+          if (Object.keys(siblingSync).length > 0) {
+            await db
+              .update(leads)
+              .set({ ...siblingSync, updatedAt: new Date() })
+              .where(and(eq(leads.masterContactId, personId), sql`${leads.id} <> ${lead.id}`));
+          }
+          if (updates.email !== undefined) {
+            await db
+              .update(leads)
+              .set({ email: updates.email as string, updatedAt: new Date() })
+              .where(and(eq(leads.masterContactId, personId), sql`${leads.id} <> ${lead.id}`, isNull(leads.smartleadLeadId)));
+          }
+        }
       }
+    } catch (err) {
+      console.warn("[lead-contact] person sync failed:", err instanceof Error ? err.message : err);
     }
 
     res.json({
@@ -2077,9 +2136,12 @@ router.post(
     const title = normalizeString(body.title as string);
     const linkedinUrl = normalizeString(body.linkedinUrl as string);
 
+    const masterContactId = await resolvePerson(orgId, { name, title, company, email, phone, linkedinUrl });
+
     await db.insert(leads).values({
       id,
       funnelId: funnel.id,
+      masterContactId,
       name,
       company,
       title,

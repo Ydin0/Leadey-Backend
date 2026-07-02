@@ -248,9 +248,24 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
     } else {
       leadId = createId("lead");
       created = true;
+      // Canonical person link — resolved from identity keys at birth. The
+      // composed name may be a placeholder (email/company) — nameKeyOf inside
+      // the resolver guards phone/role-email tiers against that.
+      const { resolvePerson } = await import("../lib/person-resolve");
+      const masterContactId = await resolvePerson(funnel.organizationId, {
+        name: composedName,
+        firstName: standard.firstName,
+        lastName: standard.lastName,
+        title: standard.title,
+        company: standard.company,
+        email,
+        phone: standard.phone,
+        linkedinUrl: standard.linkedinUrl,
+      }).catch(() => null);
       await db.insert(leads).values({
         id: leadId,
         funnelId,
+        masterContactId,
         name: composedName || standard.company || email || "Unknown",
         firstName: standard.firstName || null,
         lastName: standard.lastName || null,
