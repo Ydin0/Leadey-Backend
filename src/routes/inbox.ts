@@ -284,6 +284,8 @@ router.post(
       id,
       funnelId,
       masterContactId,
+      // masterCompanyId stays null: converts carry no company name, and the
+      // company link resolves later if the rep fills the company in.
       name: name?.trim() || phone?.trim() || emailNorm || "New contact",
       company: "",
       phone: phone?.trim() || "",

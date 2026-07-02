@@ -152,11 +152,25 @@ router.post(
         linkedinUrl: base.linkedinUrl,
       }).catch(() => null));
 
+    // Same company, new enrollment — carry the canonical company id (resolving
+    // it now if this base row predates company linking).
+    const { resolveCompanyForLead } = await import("../lib/master-db");
+    const masterCompanyId =
+      base.masterCompanyId ||
+      (await resolveCompanyForLead(orgId, {
+        company: base.company,
+        companyDomain: base.companyDomain,
+        companyLinkedin: base.companyLinkedin,
+        companyIndustry: base.companyIndustry,
+        companyEmployeeCount: base.companyEmployeeCount,
+      }).catch(() => null));
+
     const id = createId("lead");
     await db.insert(leads).values({
       id,
       funnelId: targetFunnelId,
       masterContactId,
+      masterCompanyId,
       name: base.name,
       firstName: base.firstName,
       lastName: base.lastName,

@@ -1442,6 +1442,18 @@ router.post(
                 sql`lower(${leads.company}) = lower(${lead.company})`,
               ),
             );
+          // Record the transition on the dialed lead so the timeline shows
+          // "Status changed from X → Y" (dialer dispositions included).
+          if (leadStatus !== lead.status) {
+            await tx.insert(leadEvents).values({
+              id: createId("le"),
+              leadId: lead.id,
+              type: "status_change",
+              outcome: leadStatus,
+              stepIndex: lead.currentStep,
+              meta: { source: "dialer", from: lead.status, dispositionId: disposition?.id ?? null, userId: s.userId ?? null },
+            });
+          }
         }
 
         // 3) Do-Not-Contact — flag the PERSON (non-destructive). They stay in

@@ -95,7 +95,7 @@ import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob, type TheirStackCompanyRecord } from "../lib/theirstack-client";
 import { leadHiringRoles } from "../db/schema/hiring-roles";
-import { upsertMasterContact } from "../lib/master-db";
+import { upsertMasterContact, resolveCompanyForLead } from "../lib/master-db";
 
 const router = Router();
 
@@ -1174,6 +1174,9 @@ router.post(
       industry: string; location: string; size: number | null;
       description: string; revenue: string; hiringRoles: string[];
       existing: (typeof masterRows)[number] | null; leadCount: number;
+      /** Canonical master_companies.id, resolved during the upsert loop and
+       *  stamped onto every lead in this aggregate (leads.masterCompanyId). */
+      masterId?: string | null;
     }
     const companyMap = new Map<string, CompanyAgg>();
 
@@ -1433,14 +1436,36 @@ router.post(
               employeeCount: c.existing.employeeCount ?? c.size,
             })
             .where(eq(masterCompanies.id, c.existing.id));
+          c.masterId = c.existing.id;
         } else {
-          await tx.insert(masterCompanies).values({
+          const inserted = await tx.insert(masterCompanies).values({
             id: createId("company"), organizationId: orgId, name: c.name,
             domain: c.domain || null, linkedinUrl: c.linkedin || null,
             industry: c.industry || null, employeeCount: c.size,
             lastSeenAt: new Date(now), createdAt: new Date(now), updatedAt: new Date(now),
-          }).onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] });
+          }).onConflictDoNothing({ target: [masterCompanies.organizationId, masterCompanies.domain] })
+            .returning({ id: masterCompanies.id });
+          if (inserted.length > 0) {
+            c.masterId = inserted[0].id;
+          } else if (c.domain) {
+            // Conflict: a concurrent import won the (org, domain) race — link
+            // to the committed winner instead of leaving the leads unlinked.
+            const winner = await tx
+              .select({ id: masterCompanies.id })
+              .from(masterCompanies)
+              .where(and(
+                eq(masterCompanies.organizationId, orgId),
+                sql`lower(${masterCompanies.domain}) = lower(${c.domain})`,
+              ))
+              .limit(1);
+            c.masterId = winner[0]?.id ?? null;
+          }
         }
+      }
+      // Stamp the canonical company link onto every surviving lead row.
+      const aggByLeadId = new Map(newLeads.map((l, i) => [l.id as string, newLeadAggs[i]]));
+      for (const l of leadsToInsert) {
+        l.masterCompanyId = aggByLeadId.get(l.id as string)?.masterId ?? null;
       }
       // Resolve every row to its canonical person (bulk: 3 indexed queries,
       // in-memory matching, one insert batch for missing masters) so each
@@ -1547,7 +1572,8 @@ router.patch(
       type: "status_change",
       outcome: status,
       stepIndex: Math.max((lead.currentStep || 1) - 1, 0),
-      meta: { manual: true, userId: getAuth(req as unknown as Request)?.userId ?? null },
+      // `from` renders the "Status changed from X → Y" transition pills.
+      meta: { manual: true, from: lead.status, userId: getAuth(req as unknown as Request)?.userId ?? null },
       timestamp: new Date(now),
     });
 
@@ -2137,11 +2163,16 @@ router.post(
     const linkedinUrl = normalizeString(body.linkedinUrl as string);
 
     const masterContactId = await resolvePerson(orgId, { name, title, company, email, phone, linkedinUrl });
+    const masterCompanyId = await resolveCompanyForLead(orgId, {
+      company,
+      companyDomain: domainFromEmail(email) || null,
+    }).catch(() => null);
 
     await db.insert(leads).values({
       id,
       funnelId: funnel.id,
       masterContactId,
+      masterCompanyId,
       name,
       company,
       title,
@@ -2227,6 +2258,30 @@ router.patch(
         .update(leads)
         .set({ company: renameCompany, updatedAt: new Date() })
         .where(and(eq(leads.funnelId, funnel.id), eq(leads.company, lead.company)));
+    }
+
+    // Re-resolve the canonical company link — a rename or domain edit can point
+    // this company at a different master_companies row (or create one).
+    if (renameCompany || updates.companyDomain !== undefined) {
+      try {
+        // `in updates` (not ??): an explicit clear stores null, and nullish
+        // coalescing would resurrect the old value the user just removed.
+        const effective = <T>(col: string, current: T): T =>
+          col in updates ? (updates[col] as T) : current;
+        const masterCompanyId = await resolveCompanyForLead(orgId, {
+          company: renameCompany || lead.company,
+          companyDomain: effective("companyDomain", lead.companyDomain),
+          companyLinkedin: effective("companyLinkedin", lead.companyLinkedin),
+          companyIndustry: effective("companyIndustry", lead.companyIndustry),
+          companyEmployeeCount: effective("companyEmployeeCount", lead.companyEmployeeCount),
+        });
+        await db
+          .update(leads)
+          .set({ masterCompanyId })
+          .where(and(eq(leads.funnelId, funnel.id), eq(leads.company, renameCompany || lead.company)));
+      } catch (err) {
+        console.warn("[lead-company] master company re-link failed:", err instanceof Error ? err.message : err);
+      }
     }
 
     const refreshed = getFunnelOrThrow(

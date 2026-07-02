@@ -1555,6 +1555,12 @@ router.post(
       for (let i = 0; i < newLeads.length; i++) {
         newLeads[i].masterContactId = personIds[i];
       }
+      // ...and to its canonical company.
+      const { resolveCompaniesForLeadsBulk } = await import("../lib/master-db");
+      const companyIds = await resolveCompaniesForLeadsBulk(orgId, newLeads);
+      for (let i = 0; i < newLeads.length; i++) {
+        newLeads[i].masterCompanyId = companyIds[i];
+      }
       await db.transaction(async (tx) => {
         // Chunk inserts — Postgres caps a statement at 65534 bind params, so
         // large batches must be split or they hit MAX_PARAMETERS_EXCEEDED.

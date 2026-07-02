@@ -31,5 +31,7 @@ export const smsMessages = pgTable(
   (t) => [
     index("sms_messages_lead_idx").on(t.leadId),
     index("sms_messages_org_idx").on(t.organizationId),
+    // Keyset-paginated timeline reads: (lead_id, created_at DESC).
+    index("sms_messages_lead_created_idx").on(t.leadId, t.createdAt),
   ],
 );

@@ -283,10 +283,16 @@ router.post("/funnels/:funnelId/leads", async (req: Request, res: Response) => {
         phone: standard.phone,
         linkedinUrl: standard.linkedinUrl,
       }).catch(() => null);
+      // Canonical company link — best-effort, never fails the webhook.
+      const { resolveCompanyForLead } = await import("../lib/master-db");
+      const masterCompanyId = await resolveCompanyForLead(funnel.organizationId, {
+        company: standard.company,
+      }).catch(() => null);
       await db.insert(leads).values({
         id: leadId,
         funnelId,
         masterContactId,
+        masterCompanyId,
         name: composedName || standard.company || email || "Unknown",
         firstName: standard.firstName || null,
         lastName: standard.lastName || null,

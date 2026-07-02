@@ -1,6 +1,6 @@
 import { pgTable, text, integer, jsonb, timestamp, boolean, index } from "drizzle-orm/pg-core";
 import { funnels } from "./funnels";
-import { masterContacts } from "./master";
+import { masterCompanies, masterContacts } from "./master";
 
 export const leads = pgTable("leads", {
   id: text("id").primaryKey(),
@@ -13,6 +13,12 @@ export const leads = pgTable("leads", {
    *  Nullable: legacy rows are linked by the person-identity backfill, and
    *  a row with no email/phone/linkedin may be unresolvable. */
   masterContactId: text("master_contact_id").references(() => masterContacts.id, { onDelete: "set null" }),
+  /** The canonical COMPANY this enrollment belongs to (master_companies).
+   *  Set on every lead write path and backfilled (domain → normalized name);
+   *  the universal company profile aggregates by this id, with a
+   *  normalized-name fallback for rows that predate the link. Nullable:
+   *  a lead with an empty company name is unresolvable. */
+  masterCompanyId: text("master_company_id").references(() => masterCompanies.id, { onDelete: "set null" }),
   name: text("name").notNull(),
   /** Explicit first/last name when the source provided them separately (CSV
    *  import, scraper). Lets email templates field-map {{first_name}} /
@@ -66,6 +72,8 @@ export const leads = pgTable("leads", {
   // Person-identity lookups: memberships, DNC fan-out, sibling sync.
   index("leads_master_contact_id_idx").on(t.masterContactId),
   index("leads_funnel_id_idx").on(t.funnelId),
+  // Company-identity lookups: universal company profile aggregation.
+  index("leads_master_company_id_idx").on(t.masterCompanyId),
 ]);
 
 export const leadEvents = pgTable("lead_events", {
@@ -78,4 +86,8 @@ export const leadEvents = pgTable("lead_events", {
   stepIndex: integer("step_index").notNull().default(0),
   meta: jsonb("meta").$type<Record<string, unknown>>(),
   timestamp: timestamp("timestamp", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Per-lead timeline reads (lead profile + universal company profile) are
+  // keyset-paginated by (lead_id, timestamp DESC).
+  index("lead_events_lead_id_ts_idx").on(t.leadId, t.timestamp),
+]);

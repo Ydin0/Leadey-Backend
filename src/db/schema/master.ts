@@ -24,6 +24,8 @@ export const masterCompanies = pgTable("master_companies", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   unique().on(t.organizationId, t.domain),
+  // Name-based company resolution (write paths + profile name-fallback).
+  index("master_companies_org_name_lower_idx").on(t.organizationId, sql`lower(${t.name})`),
 ]);
 
 export const masterContacts = pgTable("master_contacts", {

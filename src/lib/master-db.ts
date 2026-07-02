@@ -1,4 +1,4 @@
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, inArray } from "drizzle-orm";
 import { db } from "../db/index";
 import { masterCompanies, masterContacts } from "../db/schema/master";
 import { createId } from "./helpers";
@@ -76,6 +76,135 @@ export async function upsertMasterCompany(
   });
 
   return id;
+}
+
+/** The lead-shaped company fields every write path already has on hand. */
+export interface LeadCompanyInput {
+  company?: string | null;
+  companyDomain?: string | null;
+  companyLinkedin?: string | null;
+  companyIndustry?: string | null;
+  companyEmployeeCount?: number | null;
+}
+
+/**
+ * Resolve the canonical company (master_companies.id) for a lead being
+ * created or edited. Every lead write path calls this so new rows always
+ * carry `leads.master_company_id`.
+ *
+ * - Empty company name → null (unresolvable).
+ * - With a domain → upsertMasterCompany (dedupes on lower(domain)).
+ * - Without a domain → exact lower(name) lookup FIRST, so we attach to an
+ *   existing real-domain row instead of minting a "<slug>.unknown" duplicate;
+ *   only if no name match exists do we fall through to the slug upsert.
+ */
+export async function resolveCompanyForLead(
+  orgId: string,
+  input: LeadCompanyInput,
+): Promise<string | null> {
+  const name = (input.company || "").trim();
+  if (!name) return null;
+
+  if (!input.companyDomain) {
+    const byName = await db
+      .select({ id: masterCompanies.id })
+      .from(masterCompanies)
+      .where(
+        and(
+          eq(masterCompanies.organizationId, orgId),
+          sql`lower(${masterCompanies.name}) = lower(${name})`,
+        ),
+      )
+      .limit(1);
+    if (byName.length > 0) return byName[0].id;
+  }
+
+  return upsertMasterCompany(orgId, {
+    name,
+    domain: input.companyDomain || null,
+    linkedinUrl: input.companyLinkedin || null,
+    industry: input.companyIndustry || null,
+    employeeCount: input.companyEmployeeCount || null,
+  });
+}
+
+/**
+ * Bulk variant for import-sized batches: two set-based lookups (domain, then
+ * name) against existing master companies, then one upsert per company that
+ * is still unresolved. Returns ids positionally aligned with `rows`.
+ */
+export async function resolveCompaniesForLeadsBulk(
+  orgId: string,
+  rows: LeadCompanyInput[],
+): Promise<(string | null)[]> {
+  const out: (string | null)[] = rows.map(() => null);
+
+  // Group rows by a per-company key so each distinct company resolves once.
+  const groups = new Map<string, { input: LeadCompanyInput; indexes: number[] }>();
+  for (let i = 0; i < rows.length; i++) {
+    const name = (rows[i].company || "").trim();
+    if (!name) continue;
+    const key = rows[i].companyDomain
+      ? `d:${rows[i].companyDomain!.toLowerCase()}`
+      : `n:${name.toLowerCase()}`;
+    const g = groups.get(key);
+    if (g) {
+      g.indexes.push(i);
+      // Keep the richest input (first row with a domain wins).
+      if (!g.input.companyDomain && rows[i].companyDomain) g.input = rows[i];
+    } else {
+      groups.set(key, { input: rows[i], indexes: [i] });
+    }
+  }
+  if (groups.size === 0) return out;
+
+  // Set-based lookups against existing companies.
+  const domains = [...groups.values()]
+    .map((g) => g.input.companyDomain?.toLowerCase())
+    .filter((d): d is string => !!d);
+  const names = [...groups.values()].map((g) => (g.input.company || "").trim().toLowerCase());
+
+  const nameMatch = inArray(sql`lower(${masterCompanies.name})`, names);
+  const existing = await db
+    .select({ id: masterCompanies.id, name: masterCompanies.name, domain: masterCompanies.domain })
+    .from(masterCompanies)
+    .where(
+      and(
+        eq(masterCompanies.organizationId, orgId),
+        domains.length
+          ? sql`(${inArray(sql`lower(${masterCompanies.domain})`, domains)} OR ${nameMatch})`
+          : nameMatch,
+      ),
+    );
+  const byDomain = new Map<string, string>();
+  const byName = new Map<string, string>();
+  for (const c of existing) {
+    if (c.domain) byDomain.set(c.domain.toLowerCase(), c.id);
+    byName.set(c.name.trim().toLowerCase(), c.id);
+  }
+
+  for (const g of groups.values()) {
+    const name = (g.input.company || "").trim();
+    const domainKey = g.input.companyDomain?.toLowerCase();
+    // Same rules as resolveCompanyForLead: a row WITH a domain matches by
+    // domain only (a miss means a genuinely different company — "Acme"
+    // acme.io must not merge into "Acme" acme.com by name); only domainless
+    // rows fall back to the name match.
+    let id = domainKey ? byDomain.get(domainKey) : byName.get(name.toLowerCase());
+    if (!id) {
+      id = await upsertMasterCompany(orgId, {
+        name,
+        domain: g.input.companyDomain || null,
+        linkedinUrl: g.input.companyLinkedin || null,
+        industry: g.input.companyIndustry || null,
+        employeeCount: g.input.companyEmployeeCount || null,
+      });
+      if (g.input.companyDomain) byDomain.set(domainKey!, id);
+      byName.set(name.toLowerCase(), id);
+    }
+    for (const i of g.indexes) out[i] = id;
+  }
+  return out;
 }
 
 /**

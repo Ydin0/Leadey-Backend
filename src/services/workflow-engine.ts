@@ -200,7 +200,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       await db.update(leads).set({ status: key, updatedAt: new Date() }).where(eq(leads.id, lead.id));
       await db.insert(leadEvents).values({
         id: createId("event"), leadId: lead.id, type: "status_change", outcome: key,
-        stepIndex: 0, meta: { source: "workflow" }, timestamp: new Date(),
+        stepIndex: 0, meta: { source: "workflow", from: lead.status }, timestamp: new Date(),
       });
       await logRun(enr, node, "done", { status: key });
       void fireTriggerForLead(lead.id, "status_changed", { status: key }); // chain status-change workflows

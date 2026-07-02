@@ -75,5 +75,7 @@ export const emailMessages = pgTable(
     index("email_messages_lead_idx").on(t.leadId),
     index("email_messages_thread_idx").on(t.providerThreadId),
     index("email_messages_org_idx").on(t.organizationId),
+    // Keyset-paginated timeline reads: (lead_id, created_at DESC).
+    index("email_messages_lead_created_idx").on(t.leadId, t.createdAt),
   ],
 );

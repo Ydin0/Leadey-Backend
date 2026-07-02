@@ -180,6 +180,8 @@ router.get(
         location: sql<string | null>`max(${leads.companyLocation})`.as("location"),
         employees: sql<number | null>`max(${leads.companyEmployeeCount})`.as("employees"),
         statuses: sql<string[]>`array_agg(distinct ${leads.status})`.as("statuses"),
+        // Universal-profile deep link for the Companies tab.
+        masterCompanyId: sql<string | null>`max(${leads.masterCompanyId})`.as("master_company_id"),
       })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
@@ -270,6 +272,7 @@ router.get(
         status: repStatus(r.statuses),
         callCount: activityByCompany.get(r.company)?.calls ?? 0,
         emailCount: activityByCompany.get(r.company)?.emails ?? 0,
+        masterCompanyId: r.masterCompanyId,
       })),
       meta: { page, pageSize, totalCount: Number(total), totalPages: Math.ceil(Number(total) / pageSize) },
     });
@@ -427,10 +430,17 @@ router.post(
       const resolvedIds = await resolvePersonsBulk(orgId, unlinked);
       const resolvedByRow = new Map(unlinked.map((l, i) => [l.id, resolvedIds[i]]));
 
+      // Same for the canonical company link.
+      const { resolveCompaniesForLeadsBulk } = await import("../lib/master-db");
+      const companyUnlinked = unique.filter((l) => !l.masterCompanyId);
+      const companyIds = await resolveCompaniesForLeadsBulk(orgId, companyUnlinked);
+      const companyByRow = new Map(companyUnlinked.map((l, i) => [l.id, companyIds[i]]));
+
       const newLeads = unique.map((l) => ({
         id: createId("lead"),
         funnelId,
         masterContactId: l.masterContactId ?? resolvedByRow.get(l.id) ?? null,
+        masterCompanyId: l.masterCompanyId ?? companyByRow.get(l.id) ?? null,
         name: l.name,
         title: l.title,
         company: l.company,

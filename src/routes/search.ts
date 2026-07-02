@@ -185,14 +185,10 @@ router.get(
           .limit(PER_GROUP),
       ]);
 
-    // Resolve a representative campaign lead for company/contact results so
-    // clicking them opens the Lead View directly (matched by company
-    // name/domain or the contact's email). Bounded: at most PER_GROUP each.
+    // Resolve contact results to a campaign lead (matched by email) so they can
+    // deep-link into the universal company profile pre-filtered to that person.
+    // Company results route straight to /dashboard/companies/:id — no lookup.
     const lookupConds = [];
-    for (const c of companyRows) {
-      if (c.name) lookupConds.push(sql`lower(${leads.company}) = ${c.name.toLowerCase()}`);
-      if (c.domain) lookupConds.push(sql`lower(${leads.companyDomain}) = ${c.domain.toLowerCase()}`);
-    }
     for (const c of contactRows) {
       if (c.email) lookupConds.push(sql`lower(${leads.email}) = ${c.email.toLowerCase()}`);
     }
@@ -201,8 +197,8 @@ router.get(
           .select({
             id: leads.id,
             funnelId: leads.funnelId,
-            company: leads.company,
-            companyDomain: leads.companyDomain,
+            masterCompanyId: leads.masterCompanyId,
+            masterContactId: leads.masterContactId,
             email: leads.email,
           })
           .from(leads)
@@ -211,24 +207,17 @@ router.get(
       : [];
 
     type LookupLead = (typeof lookupLeads)[number];
-    const byCompanyName = new Map<string, LookupLead>();
-    const byCompanyDomain = new Map<string, LookupLead>();
     const byEmail = new Map<string, LookupLead>();
     for (const l of lookupLeads) {
-      if (l.company) {
-        const k = l.company.toLowerCase();
-        if (!byCompanyName.has(k)) byCompanyName.set(k, l);
-      }
-      if (l.companyDomain) {
-        const k = l.companyDomain.toLowerCase();
-        if (!byCompanyDomain.has(k)) byCompanyDomain.set(k, l);
-      }
       if (l.email) {
         const k = l.email.toLowerCase();
         if (!byEmail.has(k)) byEmail.set(k, l);
       }
     }
     const leadHref = (l: LookupLead) => `/dashboard/funnels/${l.funnelId}/leads/${l.id}`;
+    /** Universal profile deep-link, pre-filtered to this person. */
+    const companyContactHref = (l: LookupLead) =>
+      `/dashboard/companies/${l.masterCompanyId}?contact=${encodeURIComponent(l.masterContactId ?? `lead:${l.id}`)}`;
 
     // Opportunities have no standalone page — route them to their source lead's
     // profile (org-scoped). Resolve the source lead → funnel for each.
@@ -275,29 +264,30 @@ router.get(
           href: lead ? `/dashboard/funnels/${lead.funnelId}/leads/${lead.id}` : `/dashboard/opportunities`,
         };
       }),
-      ...companyRows.map((c) => {
-        const match =
-          (c.name && byCompanyName.get(c.name.toLowerCase())) ||
-          (c.domain && byCompanyDomain.get(c.domain.toLowerCase()));
-        return {
-          type: "company" as const,
-          id: c.id,
-          title: c.name,
-          subtitle: joinParts([c.industry, c.domain]) || "Company",
-          href: match ? leadHref(match) : `/dashboard/companies`,
-          domain: c.domain || null,
-        };
-      }),
+      ...companyRows.map((c) => ({
+        type: "company" as const,
+        id: c.id,
+        title: c.name,
+        subtitle: joinParts([c.industry, c.domain]) || "Company",
+        // Universal company profile — every contact + merged timeline.
+        href: `/dashboard/companies/${c.id}`,
+        domain: c.domain || null,
+      })),
       ...contactRows.map((c) => {
-        const match = c.email && byEmail.get(c.email.toLowerCase());
+        const match = c.email ? byEmail.get(c.email.toLowerCase()) : undefined;
         return {
           type: "contact" as const,
           id: c.id,
           title: c.fullName || c.email || "Unknown contact",
           subtitle: joinParts([c.title, c.company]) || "Contact",
-          // Prefer the campaign lead if they're in one; otherwise the standalone
-          // contact profile (works even when not added to a campaign).
-          href: match ? leadHref(match) : `/dashboard/contacts/${c.id}`,
+          // In a campaign with a linked company → the universal profile
+          // pre-filtered to them; in a campaign without a company link → the
+          // lead view; otherwise the standalone discovered-contact profile.
+          href: match
+            ? match.masterCompanyId
+              ? companyContactHref(match)
+              : leadHref(match)
+            : `/dashboard/contacts/${c.id}`,
           domain: emailDomain(c.email),
         };
       }),

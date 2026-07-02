@@ -798,6 +798,63 @@ router.get(
   }),
 );
 
+/** Mirror an opportunity stage/pipeline move onto the source lead's timeline
+ *  so the lead view (and universal company profile) shows
+ *  "Opportunity status changed from [pipeline · stage] → [pipeline · stage]".
+ *  Best-effort: no-op when the opp has no (living) source lead. */
+async function logStageChangeOnLead(opts: {
+  opp: { id: string; name: string; sourceLeadId: string | null };
+  fromPipelineId: string;
+  fromStageId: string;
+  toPipelineId: string;
+  toStageId: string;
+  userId: string | null;
+  userName: string | null;
+}) {
+  const { opp } = opts;
+  if (!opp.sourceLeadId) return;
+  if (opts.fromStageId === opts.toStageId && opts.fromPipelineId === opts.toPipelineId) return;
+  try {
+    // sourceLeadId has no FK — verify the lead still exists before inserting
+    // an event that carries a hard FK to it.
+    const [leadRow] = await db
+      .select({ id: leads.id, currentStep: leads.currentStep })
+      .from(leads)
+      .where(eq(leads.id, opp.sourceLeadId))
+      .limit(1);
+    if (!leadRow) return;
+
+    const pipelineIds = [...new Set([opts.fromPipelineId, opts.toPipelineId])];
+    const stageIds = [...new Set([opts.fromStageId, opts.toStageId])];
+    const [pipes, stages] = await Promise.all([
+      db.select({ id: pipelines.id, name: pipelines.name }).from(pipelines).where(inArray(pipelines.id, pipelineIds)),
+      db.select({ id: pipelineStages.id, label: pipelineStages.label }).from(pipelineStages).where(inArray(pipelineStages.id, stageIds)),
+    ]);
+    const pipelineName = new Map(pipes.map((p) => [p.id, p.name]));
+    const stageLabel = new Map(stages.map((s) => [s.id, s.label]));
+
+    await db.insert(leadEvents).values({
+      id: createId("event"),
+      leadId: leadRow.id,
+      type: "opportunity_stage_change",
+      outcome: stageLabel.get(opts.toStageId) ?? null,
+      stepIndex: Math.max((leadRow.currentStep || 1) - 1, 0),
+      meta: {
+        opportunityId: opp.id,
+        oppName: opp.name,
+        fromPipeline: pipelineName.get(opts.fromPipelineId) ?? null,
+        fromStage: stageLabel.get(opts.fromStageId) ?? null,
+        toPipeline: pipelineName.get(opts.toPipelineId) ?? null,
+        toStage: stageLabel.get(opts.toStageId) ?? null,
+        userId: opts.userId,
+        userName: opts.userName,
+      },
+    });
+  } catch (err) {
+    console.warn("[opportunities] lead timeline mirror failed:", err instanceof Error ? err.message : err);
+  }
+}
+
 router.patch(
   "/opportunities/:id",
   asyncHandler(async (req, res) => {
@@ -905,6 +962,18 @@ router.patch(
           userName,
         })),
       );
+      // Stage / pipeline moves also land on the source lead's timeline.
+      if (updated.stageId !== existing.stageId || updated.pipelineId !== existing.pipelineId) {
+        await logStageChangeOnLead({
+          opp: { id: updated.id, name: updated.name, sourceLeadId: updated.sourceLeadId },
+          fromPipelineId: existing.pipelineId,
+          fromStageId: existing.stageId,
+          toPipelineId: updated.pipelineId,
+          toStageId: updated.stageId,
+          userId,
+          userName,
+        });
+      }
     }
 
     res.json({ data: serializeOpp(updated) });
@@ -966,6 +1035,15 @@ router.post(
         userName,
       });
     });
+    await logStageChangeOnLead({
+      opp: { id: opp.id, name: opp.name, sourceLeadId: opp.sourceLeadId },
+      fromPipelineId: opp.pipelineId,
+      fromStageId: opp.stageId,
+      toPipelineId: opp.pipelineId,
+      toStageId: wonStage.id,
+      userId,
+      userName,
+    });
     const [updated] = await db.select().from(opportunities).where(eq(opportunities.id, id));
     res.json({ data: serializeOpp(updated) });
   }),
@@ -1006,6 +1084,15 @@ router.post(
         userName,
       });
     });
+    await logStageChangeOnLead({
+      opp: { id: opp.id, name: opp.name, sourceLeadId: opp.sourceLeadId },
+      fromPipelineId: opp.pipelineId,
+      fromStageId: opp.stageId,
+      toPipelineId: opp.pipelineId,
+      toStageId: lostStage.id,
+      userId,
+      userName,
+    });
     const [updated] = await db.select().from(opportunities).where(eq(opportunities.id, id));
     res.json({ data: serializeOpp(updated) });
   }),
@@ -1045,6 +1132,15 @@ router.post(
         userId,
         userName,
       });
+    });
+    await logStageChangeOnLead({
+      opp: { id: opp.id, name: opp.name, sourceLeadId: opp.sourceLeadId },
+      fromPipelineId: opp.pipelineId,
+      fromStageId: opp.stageId,
+      toPipelineId: opp.pipelineId,
+      toStageId: openStage.id,
+      userId,
+      userName,
     });
     const [updated] = await db.select().from(opportunities).where(eq(opportunities.id, id));
     res.json({ data: serializeOpp(updated) });

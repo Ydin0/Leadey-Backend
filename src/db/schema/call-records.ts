@@ -1,4 +1,5 @@
 import { pgTable, text, integer, timestamp, jsonb, real, boolean, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { organizations } from "./organizations";
 import { phoneLines } from "./phone-lines";
 
@@ -81,4 +82,15 @@ export const callRecords = pgTable("call_records", {
   index("call_records_org_called_at").on(t.organizationId, t.calledAt),
   // Per-lead recency lookups.
   index("call_records_lead_id").on(t.leadId),
+  // Phone-number matching (lead activity counts, universal company timeline):
+  // calls are matched to people by normalized counterparty digits, so index
+  // the digit expressions on both directions.
+  index("call_records_org_to_digits_idx").on(
+    t.organizationId,
+    sql`regexp_replace(${t.toNumber}, '[^0-9]', '', 'g')`,
+  ),
+  index("call_records_org_from_digits_idx").on(
+    t.organizationId,
+    sql`regexp_replace(${t.fromNumber}, '[^0-9]', '', 'g')`,
+  ),
 ]);
