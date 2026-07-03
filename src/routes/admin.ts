@@ -1818,7 +1818,11 @@ const COST_RATES = {
   voicePerMinFallback: 0.014, // used only for calls not yet price-synced
   smsPerMsgFallback: 0.0079, // used only for messages not yet price-synced
   recordingStoragePerMin: 0.0005, // Twilio recording storage, /min/month (est.)
-  whisperPerMin: 0.006, // OpenAI transcription, per audio minute (est.)
+  // AssemblyAI Universal-3.5 Pro: $0.21/hr = $0.0035/min, billed per second
+  // PER CHANNEL — we transcribe multichannel (2 channels: rep + contact), so
+  // the effective cost is 2× the per-minute rate on recording duration.
+  transcriptionPerMin: 0.0035,
+  transcriptionChannels: 2,
   aiSummaryPerCall: 0.0015, // OpenAI gpt-4o-mini summary, per call (est.)
 };
 // 1 GBP ≈ this many USD — only used to express GBP MRR in a USD-billed Twilio
@@ -1907,7 +1911,7 @@ function buildBreakdown(call: CallAgg, sms: SmsAgg, rentals: number, lineCount: 
   const smsCost = sms.actual + smsEstimated;
   const recordingCost = (call.recordingSeconds / 60) * COST_RATES.recordingStoragePerMin;
   const aiCost =
-    (call.transcribedSeconds / 60) * COST_RATES.whisperPerMin +
+    (call.transcribedSeconds / 60) * COST_RATES.transcriptionPerMin * COST_RATES.transcriptionChannels +
     call.transcribedCount * COST_RATES.aiSummaryPerCall;
   const total = voiceCost + smsCost + rentals + recordingCost + aiCost;
   const round = (n: number) => Math.round(n * 10000) / 10000;
@@ -2701,6 +2705,10 @@ router.patch(
 // invoice; the checkout webhook marks them paid.
 
 export const INVOICE_MULTIPLIER_DEFAULT = 2;
+/** Customer price for call transcription: flat $0.02/min, each call rounded UP
+ *  to the nearest minute (Twilio-style) on the recording duration. NOT scaled
+ *  by the invoice multiplier — this IS the customer rate. */
+export const TRANSCRIPTION_BILL_PER_MIN = 0.02;
 
 function toMinor(majorAmount: number): number {
   return Math.round(majorAmount * 100);
@@ -2736,6 +2744,10 @@ export async function buildTelephonyInvoice(
       unsyncedSecondsIn: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} <> 'outbound'), 0)::float8`,
       countOut: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} = 'outbound')::int`,
       countIn: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} <> 'outbound')::int`,
+      // Billed transcription minutes: each transcribed call rounds UP to the
+      // nearest minute of recording (Twilio-style per-call rounding).
+      transcribedBilledMin: sql<number>`COALESCE(SUM(CEIL(${SANE_REC} / 60.0)) FILTER (WHERE ${callRecords.transcript} IS NOT NULL), 0)::float8`,
+      transcribedCount: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.transcript} IS NOT NULL)::int`,
     })
     .from(callRecords)
     .where(
@@ -2817,6 +2829,14 @@ export async function buildTelephonyInvoice(
       unit: "line",
       amountMinor: toMinor(rentalCost * multiplier),
     });
+  // Transcription is billed at the flat customer rate — NOT × multiplier.
+  if (call.transcribedCount > 0 && call.transcribedBilledMin > 0)
+    lineItems.push({
+      description: `Call transcription — ${call.transcribedCount.toLocaleString()} calls`,
+      quantity: call.transcribedBilledMin,
+      unit: "min",
+      amountMinor: toMinor(call.transcribedBilledMin * TRANSCRIPTION_BILL_PER_MIN),
+    });
 
   const usageMinor = lineItems.reduce((a, l) => a + l.amountMinor, 0);
   // Calling-credit buffer: an extra % on top of usage. When the invoice is
@@ -2848,6 +2868,11 @@ export async function buildTelephonyInvoice(
         smsOut: smsOutCost,
         smsIn: smsInCost,
         rentals: rentalCost,
+      },
+      transcription: {
+        calls: call.transcribedCount,
+        billedMinutes: call.transcribedBilledMin,
+        ratePerMin: TRANSCRIPTION_BILL_PER_MIN,
       },
     },
   };
