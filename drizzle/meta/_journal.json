@@ -428,6 +428,13 @@
       "when": 1783091123128,
       "tag": "0060_fresh_human_cannonball",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1783092574117,
+      "tag": "0061_misty_switch",
+      "breakpoints": true
     }
   ]
 }

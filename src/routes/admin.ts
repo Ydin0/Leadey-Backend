@@ -342,6 +342,10 @@ router.get(
         callRecording: planConfig.callRecording,
         aiSummaries: planConfig.aiSummaries,
         mrrPence,
+        billingEmail: org.billingEmail,
+        billingName: org.billingName,
+        billingAddress: org.billingAddress,
+        billingVat: org.billingVat,
         memberCount: members.length,
         members,
         accountManagerId: org.accountManagerId,
@@ -2504,6 +2508,71 @@ router.post(
 );
 
 
+// PATCH /api/admin/organizations/:id/billing-details — invoice contact/legal
+router.patch(
+  "/organizations/:id/billing-details",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const orgId = req.params.id;
+    const body = req.body as {
+      billingEmail?: string | null;
+      billingName?: string | null;
+      billingAddress?: string | null;
+      billingVat?: string | null;
+    };
+
+    const [org] = await db
+      .select({
+        billingEmail: organizations.billingEmail,
+        billingName: organizations.billingName,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const clean = (v: unknown, max: number) => {
+      const t = normalizeString(v as string | undefined);
+      return t ? t.slice(0, max) : null;
+    };
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    if ("billingEmail" in body) {
+      const email = clean(body.billingEmail, 320);
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new ApiError(400, "billingEmail is not a valid email address");
+      }
+      updates.billingEmail = email;
+    }
+    if ("billingName" in body) updates.billingName = clean(body.billingName, 200);
+    if ("billingAddress" in body) updates.billingAddress = clean(body.billingAddress, 1000);
+    if ("billingVat" in body) updates.billingVat = clean(body.billingVat, 60);
+
+    await db.update(organizations).set(updates).where(eq(organizations.id, orgId));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.update",
+      targetType: "organization",
+      targetId: orgId,
+      before: org,
+      after: { ...org, ...updates, updatedAt: undefined },
+      metadata: { kind: "billing_details" },
+    });
+
+    const [fresh] = await db
+      .select({
+        billingEmail: organizations.billingEmail,
+        billingName: organizations.billingName,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    res.json({ data: fresh });
+  }),
+);
+
 // ─── Telephony credits ─────────────────────────────────────────────────
 // Money wallet (account-currency minor units) fed by paid telephony
 // invoices and drawn down by billed usage. Track-only: may go negative.
@@ -2850,20 +2919,40 @@ router.get(
   "/invoices/:id",
   asyncHandler(async (req, res) => {
     const [row] = await db
-      .select({ invoice: invoices, orgName: organizations.name })
+      .select({
+        invoice: invoices,
+        orgName: organizations.name,
+        billingEmail: organizations.billingEmail,
+        billingName: organizations.billingName,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
       .from(invoices)
       .innerJoin(organizations, eq(invoices.organizationId, organizations.id))
       .where(eq(invoices.id, req.params.id));
     if (!row) throw new ApiError(404, "Invoice not found");
 
-    const [contact] = await db
-      .select({ email: users.email })
-      .from(users)
-      .where(eq(users.organizationId, row.invoice.organizationId))
-      .orderBy(users.createdAt)
-      .limit(1);
+    // Configured billing contact wins; fall back to the earliest member so
+    // an invoice is never contactless.
+    let billingEmail = row.billingEmail;
+    if (!billingEmail) {
+      const [contact] = await db
+        .select({ email: users.email })
+        .from(users)
+        .where(eq(users.organizationId, row.invoice.organizationId))
+        .orderBy(users.createdAt)
+        .limit(1);
+      billingEmail = contact?.email ?? null;
+    }
 
-    res.json({ data: serializeInvoice(row.invoice, row.orgName, contact?.email ?? null) });
+    res.json({
+      data: {
+        ...serializeInvoice(row.invoice, row.orgName, billingEmail),
+        billingName: row.billingName || row.orgName,
+        billingAddress: row.billingAddress,
+        billingVat: row.billingVat,
+      },
+    });
   }),
 );
 

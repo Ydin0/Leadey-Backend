@@ -27,6 +27,12 @@ export const organizations = pgTable("organizations", {
   telephonyCreditBalanceMinor: integer("telephony_credit_balance_minor").notNull().default(0),
   /** Extra % added to telephony invoices as a "calling credit buffer" line. */
   telephonyBufferPct: integer("telephony_buffer_pct").notNull().default(20),
+  /** Billing contact + legal details rendered on Leadey invoices. All
+   *  nullable — invoices fall back to the org name / first member email. */
+  billingEmail: text("billing_email"),
+  billingName: text("billing_name"),
+  billingAddress: text("billing_address"),
+  billingVat: text("billing_vat"),
   // Platform admin assigned to manage this account
   accountManagerId: text("account_manager_id").references(
     (): AnyPgColumn => users.id,
