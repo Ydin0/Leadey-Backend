@@ -414,6 +414,13 @@
       "when": 1783084484256,
       "tag": "0058_perpetual_guardsmen",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1783086672368,
+      "tag": "0059_thick_randall_flagg",
+      "breakpoints": true
     }
   ]
 }

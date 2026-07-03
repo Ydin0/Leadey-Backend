@@ -14,6 +14,9 @@ export type AuditAction =
   | "org.subscription.reactivate"
   | "org.credits.adjust"
   | "org.invoice.refund"
+  | "invoice.create"
+  | "invoice.status.change"
+  | "invoice.payment_link.create"
   // member actions
   | "org.member.invite"
   | "org.member.role.change"

@@ -7,8 +7,9 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
 import { adminAuditLog } from "../db/schema/admin-audit-log";
+import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
 import { creditTransactions } from "../db/schema/credits";
-import { ApiError } from "../lib/helpers";
+import { ApiError, createId } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
 import { getBalance, setOrgBalance } from "../lib/credits";
@@ -2500,4 +2501,435 @@ router.post(
   }),
 );
 
+// ─── Invoices ───────────────────────────────────────────────────────────
+// Leadey-issued invoices: telephony usage billed at a multiplier of the
+// REAL Twilio charges (voice + SMS + rentals; recording/AI estimates are
+// excluded), and plan seat charges. Stripe payment links attach per
+// invoice; the checkout webhook marks them paid.
+
+const INVOICE_MULTIPLIER_DEFAULT = 2;
+
+function toMinor(majorAmount: number): number {
+  return Math.round(majorAmount * 100);
+}
+
+/** Next global invoice number, LEA-<year>-NNNN. Unique index + retry keeps
+ *  concurrent creates safe. */
+async function nextInvoiceNumber(attempt = 0): Promise<string> {
+  const [{ n }] = await db.select({ n: sql<number>`COUNT(*)::int` }).from(invoices);
+  const year = new Date().getUTCFullYear();
+  return `LEA-${year}-${String(n + 1 + attempt).padStart(4, "0")}`;
+}
+
+/** Build the telephony line items for one org + month at a billing
+ *  multiplier. Amounts are 2× (by default) the real Twilio charges in the
+ *  account currency; per-direction splits make the invoice readable. */
+export async function buildTelephonyInvoice(orgId: string, period: string | undefined, multiplier: number) {
+  const range = monthRange(period);
+  const R = COST_RATES;
+
+  const [call] = await db
+    .select({
+      actualOut: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
+      actualIn: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
+      secondsOut: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
+      secondsIn: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
+      unsyncedSecondsOut: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} = 'outbound'), 0)::float8`,
+      unsyncedSecondsIn: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} <> 'outbound'), 0)::float8`,
+      countOut: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} = 'outbound')::int`,
+      countIn: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} <> 'outbound')::int`,
+    })
+    .from(callRecords)
+    .where(
+      and(
+        eq(callRecords.organizationId, orgId),
+        gte(callRecords.calledAt, range.start),
+        lt(callRecords.calledAt, range.end),
+      ),
+    );
+
+  const [smsAgg] = await db
+    .select({
+      actualOut: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}) FILTER (WHERE ${smsMessages.direction} <> 'inbound'), 0)::float8`,
+      actualIn: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}) FILTER (WHERE ${smsMessages.direction} = 'inbound'), 0)::float8`,
+      unsyncedOut: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL AND ${smsMessages.direction} <> 'inbound')::int`,
+      unsyncedIn: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL AND ${smsMessages.direction} = 'inbound')::int`,
+      countOut: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} <> 'inbound')::int`,
+      countIn: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} = 'inbound')::int`,
+    })
+    .from(smsMessages)
+    .where(
+      and(
+        eq(smsMessages.organizationId, orgId),
+        gte(smsMessages.createdAt, range.start),
+        lt(smsMessages.createdAt, range.end),
+      ),
+    );
+
+  const [rental] = await db
+    .select({
+      rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)::float8`,
+      lineCount: sql<number>`COUNT(*)::int`,
+    })
+    .from(phoneLines)
+    .where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.status, "active")));
+
+  // Real Twilio charge per bucket (billed price where synced, per-unit
+  // fallback for the not-yet-synced remainder), then × multiplier.
+  const voiceOutCost = call.actualOut + (call.unsyncedSecondsOut / 60) * R.voicePerMinFallback;
+  const voiceInCost = call.actualIn + (call.unsyncedSecondsIn / 60) * R.voicePerMinFallback;
+  const smsOutCost = smsAgg.actualOut + smsAgg.unsyncedOut * R.smsPerMsgFallback;
+  const smsInCost = smsAgg.actualIn + smsAgg.unsyncedIn * R.smsPerMsgFallback;
+  const rentalCost = rental?.rentals ?? 0;
+  const min = (secs: number) => Math.round((secs / 60) * 10) / 10;
+
+  const lineItems: InvoiceLineItem[] = [];
+  if (call.countOut > 0)
+    lineItems.push({
+      description: `Outbound calls — ${call.countOut.toLocaleString()} calls`,
+      quantity: min(call.secondsOut),
+      unit: "min",
+      amountMinor: toMinor(voiceOutCost * multiplier),
+    });
+  if (call.countIn > 0)
+    lineItems.push({
+      description: `Inbound calls — ${call.countIn.toLocaleString()} calls`,
+      quantity: min(call.secondsIn),
+      unit: "min",
+      amountMinor: toMinor(voiceInCost * multiplier),
+    });
+  if (smsAgg.countOut > 0)
+    lineItems.push({
+      description: "Outbound SMS messages",
+      quantity: smsAgg.countOut,
+      unit: "msg",
+      amountMinor: toMinor(smsOutCost * multiplier),
+    });
+  if (smsAgg.countIn > 0)
+    lineItems.push({
+      description: "Inbound SMS messages",
+      quantity: smsAgg.countIn,
+      unit: "msg",
+      amountMinor: toMinor(smsInCost * multiplier),
+    });
+  if ((rental?.lineCount ?? 0) > 0)
+    lineItems.push({
+      description: "Phone number rental",
+      quantity: rental.lineCount,
+      unit: "line",
+      amountMinor: toMinor(rentalCost * multiplier),
+    });
+
+  const totalMinor = lineItems.reduce((a, l) => a + l.amountMinor, 0);
+  return {
+    period: range.period,
+    lineItems,
+    totalMinor,
+    meta: {
+      multiplier,
+      baseCost: {
+        voiceOut: voiceOutCost,
+        voiceIn: voiceInCost,
+        smsOut: smsOutCost,
+        smsIn: smsInCost,
+        rentals: rentalCost,
+      },
+    },
+  };
+}
+
+function serializeInvoice(row: typeof invoices.$inferSelect, orgName?: string, billingEmail?: string | null) {
+  return {
+    id: row.id,
+    organizationId: row.organizationId,
+    orgName: orgName ?? null,
+    billingEmail: billingEmail ?? null,
+    number: row.number,
+    type: row.type,
+    status: row.status,
+    period: row.period,
+    currency: row.currency,
+    lineItems: row.lineItems,
+    subtotalMinor: row.subtotalMinor,
+    totalMinor: row.totalMinor,
+    notes: row.notes,
+    meta: row.meta,
+    paymentUrl: row.stripePaymentUrl,
+    issuedAt: row.issuedAt.toISOString(),
+    dueAt: row.dueAt ? row.dueAt.toISOString() : null,
+    paidAt: row.paidAt ? row.paidAt.toISOString() : null,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+// GET /api/admin/invoices — global list (filter by org/status/type)
+router.get(
+  "/invoices",
+  asyncHandler(async (req, res) => {
+    const { orgId, status, type } = req.query as Record<string, string | undefined>;
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const conds = [];
+    if (orgId) conds.push(eq(invoices.organizationId, orgId));
+    if (status) conds.push(eq(invoices.status, status));
+    if (type) conds.push(eq(invoices.type, type));
+    const where = conds.length ? and(...conds) : undefined;
+
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({ invoice: invoices, orgName: organizations.name })
+        .from(invoices)
+        .innerJoin(organizations, eq(invoices.organizationId, organizations.id))
+        .where(where)
+        .orderBy(desc(invoices.createdAt))
+        .limit(limit)
+        .offset(offset),
+      db.select({ total: sql<number>`COUNT(*)::int` }).from(invoices).where(where),
+    ]);
+
+    res.json({
+      data: {
+        items: rows.map((r) => serializeInvoice(r.invoice, r.orgName)),
+        total,
+        limit,
+        offset,
+      },
+    });
+  }),
+);
+
+// GET /api/admin/invoices/:id — detail incl. billing contact
+router.get(
+  "/invoices/:id",
+  asyncHandler(async (req, res) => {
+    const [row] = await db
+      .select({ invoice: invoices, orgName: organizations.name })
+      .from(invoices)
+      .innerJoin(organizations, eq(invoices.organizationId, organizations.id))
+      .where(eq(invoices.id, req.params.id));
+    if (!row) throw new ApiError(404, "Invoice not found");
+
+    const [contact] = await db
+      .select({ email: users.email })
+      .from(users)
+      .where(eq(users.organizationId, row.invoice.organizationId))
+      .orderBy(users.createdAt)
+      .limit(1);
+
+    res.json({ data: serializeInvoice(row.invoice, row.orgName, contact?.email ?? null) });
+  }),
+);
+
+// POST /api/admin/organizations/:id/invoices — generate an invoice
+router.post(
+  "/organizations/:id/invoices",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const orgId = req.params.id;
+    const body = req.body as {
+      type?: string;
+      period?: string;
+      seats?: number;
+      unitPricePence?: number;
+      multiplier?: number;
+      dueDays?: number;
+      notes?: string;
+    };
+
+    const [org] = await db.select().from(organizations).where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const type = body.type === "seats" ? "seats" : body.type === "telephony" ? "telephony" : null;
+    if (!type) throw new ApiError(400, "type must be 'telephony' or 'seats'");
+    const dueDays = Number.isFinite(body.dueDays) ? Math.min(Math.max(Number(body.dueDays), 0), 90) : 14;
+
+    let currency: string;
+    let period: string | null;
+    let lineItems: InvoiceLineItem[];
+    let totalMinor: number;
+    let meta: Record<string, unknown>;
+
+    if (type === "telephony") {
+      const multiplier =
+        Number.isFinite(body.multiplier) && Number(body.multiplier) >= 1 && Number(body.multiplier) <= 10
+          ? Number(body.multiplier)
+          : INVOICE_MULTIPLIER_DEFAULT;
+      const built = await buildTelephonyInvoice(orgId, body.period, multiplier);
+      if (!built.lineItems.length) {
+        throw new ApiError(400, `No telephony usage found for ${built.period}`);
+      }
+      currency = (await getAccountCurrency()).toLowerCase();
+      period = built.period;
+      lineItems = built.lineItems;
+      totalMinor = built.totalMinor;
+      meta = built.meta;
+    } else {
+      const seats = Number.isInteger(body.seats) && Number(body.seats) > 0 ? Number(body.seats) : org.seatsIncluded || 0;
+      if (!seats) throw new ApiError(400, "seats is required");
+      const unitPence =
+        Number.isInteger(body.unitPricePence) && Number(body.unitPricePence) > 0
+          ? Number(body.unitPricePence)
+          : PLAN_PRICES_PENCE[org.plan] || 0;
+      if (!unitPence) {
+        throw new ApiError(400, `No seat price configured for the "${org.plan}" plan — pass unitPricePence`);
+      }
+      currency = "gbp";
+      period = body.period && /^\d{4}-\d{2}$/.test(body.period) ? body.period : monthRange().period;
+      const planName = getPlanConfig(org.plan).name;
+      lineItems = [
+        {
+          description: `${planName} plan — ${seats} seat${seats === 1 ? "" : "s"} × £${(unitPence / 100).toFixed(2)}/mo`,
+          quantity: seats,
+          unit: "seat",
+          amountMinor: seats * unitPence,
+        },
+      ];
+      totalMinor = seats * unitPence;
+      meta = { seats, unitPricePence: unitPence, plan: org.plan };
+    }
+
+    // Unique-number retry: two concurrent creates can compute the same
+    // sequence — the unique index rejects the loser, who bumps and retries.
+    let created: typeof invoices.$inferSelect | null = null;
+    for (let attempt = 0; attempt < 3 && !created; attempt++) {
+      const number = await nextInvoiceNumber(attempt);
+      try {
+        const [row] = await db
+          .insert(invoices)
+          .values({
+            id: createId("inv"),
+            organizationId: orgId,
+            number,
+            type,
+            period,
+            currency,
+            lineItems,
+            subtotalMinor: totalMinor,
+            totalMinor,
+            notes: typeof body.notes === "string" ? body.notes.slice(0, 2000) : "",
+            meta,
+            dueAt: new Date(Date.now() + dueDays * 24 * 60 * 60 * 1000),
+          })
+          .returning();
+        created = row;
+      } catch (err: any) {
+        if (attempt === 2 || !String(err?.message ?? "").includes("unique")) throw err;
+      }
+    }
+    if (!created) throw new ApiError(500, "Could not allocate an invoice number");
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "invoice.create",
+      targetType: "invoice",
+      targetId: created.id,
+      after: { number: created.number, type, totalMinor, currency, period },
+      metadata: { orgId },
+    });
+
+    res.status(201).json({ data: serializeInvoice(created, org.name) });
+  }),
+);
+
+// POST /api/admin/invoices/:id/payment-link — Stripe payment link
+router.post(
+  "/invoices/:id/payment-link",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const [row] = await db
+      .select({ invoice: invoices, orgName: organizations.name })
+      .from(invoices)
+      .innerJoin(organizations, eq(invoices.organizationId, organizations.id))
+      .where(eq(invoices.id, req.params.id));
+    if (!row) throw new ApiError(404, "Invoice not found");
+    const inv = row.invoice;
+    if (inv.status !== "open") throw new ApiError(400, `Invoice is ${inv.status}`);
+    if (inv.totalMinor <= 0) throw new ApiError(400, "Invoice total must be positive");
+    if (inv.stripePaymentUrl) {
+      res.json({ data: serializeInvoice(inv, row.orgName) });
+      return;
+    }
+
+    // One-off price + payment link (links never expire, unlike checkout
+    // sessions). Metadata propagates to the checkout session so the webhook
+    // can reconcile the payment to this invoice.
+    const price = await stripe.prices.create({
+      currency: inv.currency,
+      unit_amount: inv.totalMinor,
+      product_data: { name: `Leadey invoice ${inv.number}` },
+    });
+    const link = await stripe.paymentLinks.create({
+      line_items: [{ price: price.id, quantity: 1 }],
+      metadata: { type: "invoice_payment", invoiceId: inv.id, orgId: inv.organizationId },
+      payment_intent_data: {
+        metadata: { type: "invoice_payment", invoiceId: inv.id, orgId: inv.organizationId },
+      },
+    });
+
+    const [updated] = await db
+      .update(invoices)
+      .set({ stripePaymentLinkId: link.id, stripePaymentUrl: link.url })
+      .where(eq(invoices.id, inv.id))
+      .returning();
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "invoice.payment_link.create",
+      targetType: "invoice",
+      targetId: inv.id,
+      after: { paymentLinkId: link.id },
+      metadata: { orgId: inv.organizationId },
+    });
+
+    res.json({ data: serializeInvoice(updated, row.orgName) });
+  }),
+);
+
+// PATCH /api/admin/invoices/:id — manual status change (paid / void / open)
+router.patch(
+  "/invoices/:id",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const status = (req.body as { status?: string }).status;
+    if (status !== "paid" && status !== "void" && status !== "open") {
+      throw new ApiError(400, "status must be 'paid', 'void' or 'open'");
+    }
+    const [inv] = await db.select().from(invoices).where(eq(invoices.id, req.params.id));
+    if (!inv) throw new ApiError(404, "Invoice not found");
+
+    const [updated] = await db
+      .update(invoices)
+      .set({ status, paidAt: status === "paid" ? inv.paidAt ?? new Date() : null })
+      .where(eq(invoices.id, inv.id))
+      .returning();
+
+    // A paid/voided invoice must not stay payable — deactivate its link.
+    if (status !== "open" && inv.stripePaymentLinkId) {
+      try {
+        await stripe.paymentLinks.update(inv.stripePaymentLinkId, { active: false });
+      } catch {
+        /* link may already be inactive */
+      }
+    }
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "invoice.status.change",
+      targetType: "invoice",
+      targetId: inv.id,
+      before: { status: inv.status },
+      after: { status },
+      metadata: { orgId: inv.organizationId },
+    });
+
+    const [org] = await db
+      .select({ name: organizations.name })
+      .from(organizations)
+      .where(eq(organizations.id, inv.organizationId));
+    res.json({ data: serializeInvoice(updated, org?.name) });
+  }),
+);
+
 export default router;
+

@@ -9,6 +9,7 @@ import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
 import { phoneLines } from "../db/schema/phone-lines";
 import { organizations, users } from "../db/schema/organizations";
+import { invoices } from "../db/schema/invoices";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { createId, scoreLead } from "../lib/helpers";
@@ -1381,6 +1382,31 @@ router.post("/stripe", async (req: Request, res: Response) => {
               description: `Credit top-up — ${credits.toLocaleString()} credits`,
             });
             console.log(`[Stripe] Org ${orgId} topped up ${credits} credits → balance ${balance}`);
+          }
+          break;
+        }
+
+        // Leadey invoice payment (via per-invoice payment link) — mark the
+        // invoice paid. Idempotent: an already-paid invoice is left alone, so
+        // webhook replays never double-process. Also deactivates the link.
+        if (session.mode === "payment" && session.metadata?.type === "invoice_payment") {
+          const invoiceId = session.metadata.invoiceId;
+          if (invoiceId) {
+            const [inv] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));
+            if (inv && inv.status !== "paid") {
+              await db
+                .update(invoices)
+                .set({ status: "paid", paidAt: new Date(), stripeSessionId: session.id })
+                .where(eq(invoices.id, invoiceId));
+              if (inv.stripePaymentLinkId) {
+                try {
+                  await stripe.paymentLinks.update(inv.stripePaymentLinkId, { active: false });
+                } catch {
+                  /* already inactive */
+                }
+              }
+              console.log(`[Stripe] Invoice ${inv.number} (${invoiceId}) marked paid via payment link`);
+            }
           }
           break;
         }
