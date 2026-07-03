@@ -48,7 +48,7 @@ function getActorId(req: Request<any>): string {
 }
 
 // Per-seat prices in GBP pence — must match billing.ts
-const PLAN_PRICES_PENCE: Record<string, number> = {
+export const PLAN_PRICES_PENCE: Record<string, number> = {
   starter: 4900,
   growth: 7900,
   scale: 13900,
@@ -1825,7 +1825,7 @@ interface MonthRange {
   end: Date;
   period: string;
 }
-function monthRange(period?: string): MonthRange {
+export function monthRange(period?: string): MonthRange {
   const now = new Date();
   let y = now.getUTCFullYear();
   let m = now.getUTCMonth(); // 0-indexed
@@ -2507,7 +2507,7 @@ router.post(
 // excluded), and plan seat charges. Stripe payment links attach per
 // invoice; the checkout webhook marks them paid.
 
-const INVOICE_MULTIPLIER_DEFAULT = 2;
+export const INVOICE_MULTIPLIER_DEFAULT = 2;
 
 function toMinor(majorAmount: number): number {
   return Math.round(majorAmount * 100);
@@ -2515,7 +2515,7 @@ function toMinor(majorAmount: number): number {
 
 /** Next global invoice number, LEA-<year>-NNNN. Unique index + retry keeps
  *  concurrent creates safe. */
-async function nextInvoiceNumber(attempt = 0): Promise<string> {
+export async function nextInvoiceNumber(attempt = 0): Promise<string> {
   const [{ n }] = await db.select({ n: sql<number>`COUNT(*)::int` }).from(invoices);
   const year = new Date().getUTCFullYear();
   return `LEA-${year}-${String(n + 1 + attempt).padStart(4, "0")}`;

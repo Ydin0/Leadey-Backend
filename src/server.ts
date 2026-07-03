@@ -3,6 +3,7 @@ import { startEmailPoller } from "./services/email-poller";
 import { startWorkflowEngine } from "./services/workflow-engine";
 import { startCalendarSync } from "./services/calendar-sync";
 import { startTranscriptionBackfill } from "./services/transcription-backfill";
+import { startInvoiceAutogen } from "./services/invoice-autogen";
 
 const PORT = process.env.PORT || 3001;
 
@@ -12,6 +13,7 @@ const server = app.listen(PORT, () => {
   startWorkflowEngine();
   startCalendarSync();
   startTranscriptionBackfill();
+  startInvoiceAutogen();
 });
 
 // Keep sockets alive LONGER than Railway's edge proxy idle timeout (~60s):
