@@ -1,0 +1,1 @@
+CREATE INDEX "sms_messages_org_created_idx" ON "sms_messages" USING btree ("organization_id","created_at");

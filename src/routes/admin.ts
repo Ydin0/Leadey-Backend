@@ -2117,41 +2117,98 @@ router.get(
       });
     }
 
-    // Per-line breakdown for the period.
-    const lineRows = await db
-      .select({
-        lineId: callRecords.lineId,
-        actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
-        seconds: sql<number>`COALESCE(SUM(${SANE_DURATION}), 0)::float8`,
-        unsyncedSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::float8`,
-        calls: sql<number>`COUNT(*)::int`,
-      })
-      .from(callRecords)
-      .where(orgCallWhere(range.start, range.end))
-      .groupBy(callRecords.lineId);
-    const lines = await db
-      .select()
-      .from(phoneLines)
-      .where(eq(phoneLines.organizationId, orgId));
-    const lineMeta = new Map(lines.map((l) => [l.id, l]));
-    const perLine = lineRows
-      .filter((r) => r.lineId)
-      .map((r) => {
-        const meta = lineMeta.get(r.lineId!);
-        // Real synced cost + a fallback estimate for any calls not yet priced,
-        // so the column reflects spend instead of $0 before the first sync.
-        const voiceCost = r.actual + (r.unsyncedSeconds / 60) * COST_RATES.voicePerMinFallback;
-        return {
-          lineId: r.lineId,
-          number: meta?.number ?? "—",
-          friendlyName: meta?.friendlyName ?? null,
-          monthlyCost: meta ? Math.round(meta.monthlyCost * 10000) / 10000 : 0,
-          voiceCost: Math.round(voiceCost * 10000) / 10000,
-          calls: r.calls,
-          minutes: Math.round((r.seconds / 60) * 10) / 10,
-        };
-      })
-      .sort((a, b) => b.voiceCost - a.voiceCost);
+    // Per-line economics for the period: calls AND sms grouped by line, with
+    // direction splits ('missed' buckets with inbound — an unanswered inbound
+    // call). Seeded from ALL org lines so rental-only lines still appear, plus
+    // an "Unattributed" row for traffic whose line link is NULL (deleted line
+    // or a client that omitted lineId) — so per-line totals reconcile with the
+    // summary cards instead of silently dropping those records.
+    const [lineRows, smsLineRows, lines] = await Promise.all([
+      db
+        .select({
+          lineId: callRecords.lineId,
+          actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
+          seconds: sql<number>`COALESCE(SUM(${SANE_DURATION}), 0)::float8`,
+          unsyncedSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::float8`,
+          calls: sql<number>`COUNT(*)::int`,
+          inboundCalls: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} <> 'outbound')::int`,
+          outboundCalls: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} = 'outbound')::int`,
+          inboundSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
+          outboundSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
+        })
+        .from(callRecords)
+        .where(orgCallWhere(range.start, range.end))
+        .groupBy(callRecords.lineId),
+      db
+        .select({
+          lineId: smsMessages.lineId,
+          smsCount: sql<number>`COUNT(*)::int`,
+          smsInbound: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} = 'inbound')::int`,
+          smsOutbound: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} <> 'inbound')::int`,
+          smsActual: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}), 0)::float8`,
+          smsUnsynced: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL)::int`,
+        })
+        .from(smsMessages)
+        .where(orgSmsWhere(range.start, range.end))
+        .groupBy(smsMessages.lineId),
+      db.select().from(phoneLines).where(eq(phoneLines.organizationId, orgId)),
+    ]);
+
+    const UNATTRIBUTED = "__unattributed__";
+    const callByLine = new Map(lineRows.map((r) => [r.lineId ?? UNATTRIBUTED, r]));
+    const smsByLine = new Map(smsLineRows.map((r) => [r.lineId ?? UNATTRIBUTED, r]));
+    const round4 = (n: number) => Math.round(n * 10000) / 10000;
+    const toMin = (s: number) => Math.round((s / 60) * 10) / 10;
+
+    const buildLineRow = (
+      key: string,
+      meta: { number: string; friendlyName: string | null; status: string | null; monthlyCost: number },
+    ) => {
+      const c = callByLine.get(key);
+      const s = smsByLine.get(key);
+      const voiceCost = (c?.actual ?? 0) + ((c?.unsyncedSeconds ?? 0) / 60) * COST_RATES.voicePerMinFallback;
+      const smsCost = (s?.smsActual ?? 0) + (s?.smsUnsynced ?? 0) * COST_RATES.smsPerMsgFallback;
+      const minutes = toMin(c?.seconds ?? 0);
+      return {
+        lineId: key === UNATTRIBUTED ? null : key,
+        number: meta.number,
+        friendlyName: meta.friendlyName,
+        status: meta.status,
+        monthlyCost: round4(meta.monthlyCost),
+        voiceCost: round4(voiceCost),
+        calls: c?.calls ?? 0,
+        minutes,
+        inboundCalls: c?.inboundCalls ?? 0,
+        outboundCalls: c?.outboundCalls ?? 0,
+        inboundMinutes: toMin(c?.inboundSeconds ?? 0),
+        outboundMinutes: toMin(c?.outboundSeconds ?? 0),
+        // Effective all-in voice rate from real billed prices — more truthful
+        // than a list rate, which varies by dialed destination, not by line.
+        effectiveCostPerMin: minutes >= 0.1 ? round4(voiceCost / minutes) : null,
+        smsCount: s?.smsCount ?? 0,
+        smsInbound: s?.smsInbound ?? 0,
+        smsOutbound: s?.smsOutbound ?? 0,
+        smsCost: round4(smsCost),
+      };
+    };
+
+    const perLine = lines.map((l) =>
+      buildLineRow(l.id, {
+        number: l.number,
+        friendlyName: l.friendlyName ?? null,
+        status: l.status,
+        monthlyCost: l.monthlyCost,
+      }),
+    );
+    // Traffic on deleted lines / records missing a line link.
+    if (callByLine.has(UNATTRIBUTED) || smsByLine.has(UNATTRIBUTED)) {
+      perLine.push(
+        buildLineRow(UNATTRIBUTED, { number: "Unattributed", friendlyName: null, status: null, monthlyCost: 0 }),
+      );
+    }
+    perLine.sort(
+      (a, b) => b.voiceCost + b.smsCost + b.monthlyCost - (a.voiceCost + a.smsCost + a.monthlyCost),
+    );
 
     // Most expensive calls for the period.
     const topCallRows = await db
@@ -2189,6 +2246,231 @@ router.get(
         trend,
         perLine,
         topCalls,
+      },
+    });
+  }),
+);
+
+// ─── GET /organizations/:id/twilio-costs/daily — per-day usage series ─────
+// Chart feed: for each UTC day of the period, inbound/outbound call counts +
+// minutes and inbound/outbound SMS counts, with cost split into actual
+// (synced Twilio price) vs estimated (fallback rate for unsynced records).
+router.get(
+  "/organizations/:id/twilio-costs/daily",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const orgId = req.params.id;
+    const range = monthRange(req.query.period as string | undefined);
+    const currency = await getAccountCurrency();
+
+    const [org] = await db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .where(eq(organizations.id, orgId))
+      .limit(1);
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const callDay = sql`date_trunc('day', ${callRecords.calledAt} AT TIME ZONE 'UTC')`;
+    const smsDay = sql`date_trunc('day', ${smsMessages.createdAt} AT TIME ZONE 'UTC')`;
+
+    const [callDaily, smsDaily] = await Promise.all([
+      db
+        .select({
+          day: sql<string>`to_char(${callDay}, 'YYYY-MM-DD')`,
+          // 'missed' buckets with inbound — an unanswered inbound call.
+          inboundCalls: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} <> 'outbound')::int`,
+          outboundCalls: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} = 'outbound')::int`,
+          inboundSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
+          outboundSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
+          actual: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
+          unsyncedSeconds: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL), 0)::float8`,
+        })
+        .from(callRecords)
+        .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, range.start), lt(callRecords.calledAt, range.end)))
+        .groupBy(callDay),
+      db
+        .select({
+          day: sql<string>`to_char(${smsDay}, 'YYYY-MM-DD')`,
+          inbound: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} = 'inbound')::int`,
+          outbound: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} <> 'inbound')::int`,
+          actual: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}), 0)::float8`,
+          unsyncedCount: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL)::int`,
+        })
+        .from(smsMessages)
+        .where(and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, range.start), lt(smsMessages.createdAt, range.end)))
+        .groupBy(smsDay),
+    ]);
+
+    const callByDay = new Map(callDaily.map((r) => [r.day, r]));
+    const smsByDay = new Map(smsDaily.map((r) => [r.day, r]));
+    const round4 = (n: number) => Math.round(n * 10000) / 10000;
+    const toMin = (s: number) => Math.round((s / 60) * 10) / 10;
+
+    // Dense series: every day of the month, but the CURRENT month stops at
+    // today (no trailing zero bars for days that haven't happened yet).
+    const tomorrowUtc = new Date();
+    tomorrowUtc.setUTCHours(0, 0, 0, 0);
+    tomorrowUtc.setUTCDate(tomorrowUtc.getUTCDate() + 1);
+    const seriesEnd = range.end < tomorrowUtc ? range.end : tomorrowUtc;
+
+    const days: Array<Record<string, unknown>> = [];
+    for (let d = new Date(range.start); d < seriesEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+      const key = d.toISOString().slice(0, 10);
+      const c = callByDay.get(key);
+      const s = smsByDay.get(key);
+      const voiceEstimated = ((c?.unsyncedSeconds ?? 0) / 60) * COST_RATES.voicePerMinFallback;
+      const smsEstimated = (s?.unsyncedCount ?? 0) * COST_RATES.smsPerMsgFallback;
+      days.push({
+        date: key,
+        voice: {
+          inboundCalls: c?.inboundCalls ?? 0,
+          outboundCalls: c?.outboundCalls ?? 0,
+          inboundMinutes: toMin(c?.inboundSeconds ?? 0),
+          outboundMinutes: toMin(c?.outboundSeconds ?? 0),
+          actual: round4(c?.actual ?? 0),
+          estimated: round4(voiceEstimated),
+          cost: round4((c?.actual ?? 0) + voiceEstimated),
+        },
+        sms: {
+          inbound: s?.inbound ?? 0,
+          outbound: s?.outbound ?? 0,
+          actual: round4(s?.actual ?? 0),
+          estimated: round4(smsEstimated),
+          cost: round4((s?.actual ?? 0) + smsEstimated),
+        },
+      });
+    }
+
+    res.json({ data: { orgId, period: range.period, currency, days } });
+  }),
+);
+
+// ─── GET /organizations/:id/twilio-costs/records — raw usage logs ─────────
+// Paginated per-record drill-down (newest first) so an admin can audit the
+// exact calls/messages behind the aggregates. `synced=false` rows have no
+// billed price yet (price pending the next Twilio sync).
+router.get(
+  "/organizations/:id/twilio-costs/records",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const orgId = req.params.id;
+    const type = req.query.type === "sms" ? "sms" : "call";
+    const range = monthRange(req.query.period as string | undefined);
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));
+    const offset = (page - 1) * pageSize;
+    const currency = await getAccountCurrency();
+
+    const [org] = await db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .where(eq(organizations.id, orgId))
+      .limit(1);
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    // One line map resolves numbers for both tables (tolerates deleted lines
+    // and sms_messages' FK-less text lineId).
+    const lines = await db
+      .select({ id: phoneLines.id, number: phoneLines.number })
+      .from(phoneLines)
+      .where(eq(phoneLines.organizationId, orgId));
+    const lineNumber = new Map(lines.map((l) => [l.id, l.number]));
+    const round4 = (n: number) => Math.round(n * 10000) / 10000;
+
+    if (type === "call") {
+      const where = and(
+        eq(callRecords.organizationId, orgId),
+        gte(callRecords.calledAt, range.start),
+        lt(callRecords.calledAt, range.end),
+      );
+      const [rows, [{ total }]] = await Promise.all([
+        db
+          .select({
+            id: callRecords.id,
+            calledAt: callRecords.calledAt,
+            direction: callRecords.direction,
+            fromNumber: callRecords.fromNumber,
+            toNumber: callRecords.toNumber,
+            duration: sql<number>`(${SANE_DURATION})::int`,
+            price: callRecords.twilioPrice,
+            priceUnit: callRecords.twilioPriceUnit,
+            lineId: callRecords.lineId,
+          })
+          .from(callRecords)
+          .where(where)
+          .orderBy(desc(callRecords.calledAt))
+          .limit(pageSize)
+          .offset(offset),
+        db.select({ total: sql<number>`count(*)::int` }).from(callRecords).where(where),
+      ]);
+      res.json({
+        data: {
+          type,
+          period: range.period,
+          currency,
+          page,
+          pageSize,
+          total,
+          items: rows.map((r) => ({
+            id: r.id,
+            calledAt: r.calledAt.toISOString(),
+            direction: r.direction,
+            fromNumber: r.fromNumber,
+            toNumber: r.toNumber,
+            duration: r.duration,
+            price: r.price != null ? round4(r.price) : null,
+            priceUnit: r.priceUnit,
+            synced: r.price != null,
+            lineId: r.lineId,
+            lineNumber: r.lineId ? lineNumber.get(r.lineId) ?? null : null,
+          })),
+        },
+      });
+      return;
+    }
+
+    const where = and(
+      eq(smsMessages.organizationId, orgId),
+      gte(smsMessages.createdAt, range.start),
+      lt(smsMessages.createdAt, range.end),
+    );
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({
+          id: smsMessages.id,
+          createdAt: smsMessages.createdAt,
+          direction: smsMessages.direction,
+          fromNumber: smsMessages.fromNumber,
+          toNumber: smsMessages.toNumber,
+          status: smsMessages.status,
+          price: smsMessages.twilioPrice,
+          lineId: smsMessages.lineId,
+        })
+        .from(smsMessages)
+        .where(where)
+        .orderBy(desc(smsMessages.createdAt))
+        .limit(pageSize)
+        .offset(offset),
+      db.select({ total: sql<number>`count(*)::int` }).from(smsMessages).where(where),
+    ]);
+    res.json({
+      data: {
+        type,
+        period: range.period,
+        currency,
+        page,
+        pageSize,
+        total,
+        items: rows.map((r) => ({
+          id: r.id,
+          createdAt: r.createdAt.toISOString(),
+          direction: r.direction,
+          fromNumber: r.fromNumber,
+          toNumber: r.toNumber,
+          status: r.status,
+          price: r.price != null ? round4(r.price) : null,
+          synced: r.price != null,
+          lineId: r.lineId,
+          lineNumber: r.lineId ? lineNumber.get(r.lineId) ?? null : null,
+        })),
       },
     });
   }),
