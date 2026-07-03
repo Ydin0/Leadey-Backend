@@ -13,6 +13,8 @@ export type AuditAction =
   | "org.subscription.cancel"
   | "org.subscription.reactivate"
   | "org.credits.adjust"
+  | "org.telephony_credits.adjust"
+  | "org.telephony_buffer.change"
   | "org.invoice.refund"
   | "invoice.create"
   | "invoice.status.change"

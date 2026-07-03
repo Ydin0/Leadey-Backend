@@ -10,6 +10,7 @@ import { callRecords } from "../db/schema/call-records";
 import { phoneLines } from "../db/schema/phone-lines";
 import { organizations, users } from "../db/schema/organizations";
 import { invoices } from "../db/schema/invoices";
+import { creditInvoicePayment } from "../lib/telephony-credits";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { createId, scoreLead } from "../lib/helpers";
@@ -1394,6 +1395,11 @@ router.post("/stripe", async (req: Request, res: Response) => {
           if (invoiceId) {
             const [inv] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));
             if (inv && inv.status !== "paid") {
+              // Credit the telephony wallet BEFORE marking paid: if the credit
+              // failed after a paid write, Stripe's retry would see status
+              // "paid" and skip forever — a lost top-up. Credit-first retries
+              // cleanly (the net-based check no-ops the second credit).
+              await creditInvoicePayment(inv, { stripeSessionId: session.id });
               await db
                 .update(invoices)
                 .set({ status: "paid", paidAt: new Date(), stripeSessionId: session.id })

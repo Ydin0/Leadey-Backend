@@ -1,3 +1,4 @@
+export { telephonyCreditTransactions } from "./telephony-credits";
 export { invoices } from "./invoices";
 export { funnelTags, funnelTagAssignments } from "./funnel-tags";
 export { funnels, funnelSteps, funnelMembers } from "./funnels";

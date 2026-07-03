@@ -20,6 +20,13 @@ export const organizations = pgTable("organizations", {
    *  credits (enrichment / scraping draw from it; top-ups & plan grants add to
    *  it). 1 credit = $0.01. Seeded from remaining plan credits on migration. */
   creditBalance: integer("credit_balance").notNull().default(0),
+  /** Telephony credit wallet — money in the Twilio account currency's minor
+   *  units (USD cents), SEPARATE from creditBalance. Paid telephony invoices
+   *  top it up; billed usage (2× Twilio) draws it down daily. May go negative
+   *  (track-only; no call blocking). Ledger: telephony_credit_transactions. */
+  telephonyCreditBalanceMinor: integer("telephony_credit_balance_minor").notNull().default(0),
+  /** Extra % added to telephony invoices as a "calling credit buffer" line. */
+  telephonyBufferPct: integer("telephony_buffer_pct").notNull().default(20),
   // Platform admin assigned to manage this account
   accountManagerId: text("account_manager_id").references(
     (): AnyPgColumn => users.id,

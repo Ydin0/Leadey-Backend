@@ -1,4 +1,4 @@
-import { and, eq, gte, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db/index";
 import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
 import { organizations } from "../db/schema/organizations";
@@ -8,6 +8,7 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
 import { getPlanConfig } from "../lib/stripe";
 import { createId } from "../lib/helpers";
+import { applyUsageDelta } from "../lib/telephony-credits";
 import {
   buildTelephonyInvoice,
   nextInvoiceNumber,
@@ -97,9 +98,17 @@ async function insertAutoInvoice(values: {
   }
 }
 
-/** Regenerate-or-create one org's auto telephony invoice for a period. */
-async function upsertTelephonyInvoice(orgId: string, period: string, currency: string) {
-  const built = await buildTelephonyInvoice(orgId, period, INVOICE_MULTIPLIER_DEFAULT);
+/** Regenerate-or-create one org's auto telephony invoice for a period, and
+ *  bring the telephony credit ledger's usage draw-down in line with the
+ *  period's billed usage. */
+async function upsertTelephonyInvoice(orgId: string, period: string, currency: string, bufferPct: number) {
+  const built = await buildTelephonyInvoice(orgId, period, INVOICE_MULTIPLIER_DEFAULT, bufferPct);
+
+  // Wallet draw-down FIRST — before any early return. Usage keeps accruing
+  // after a payment link freezes the invoice, and a period whose usage was
+  // revised down still needs its refund delta. usageMinor excludes the buffer.
+  await applyUsageDelta(orgId, period, built.usageMinor);
+
   const existing = await findAutoInvoice(orgId, "telephony", period);
 
   if (!existing) {
@@ -119,7 +128,13 @@ async function upsertTelephonyInvoice(orgId: string, period: string, currency: s
 
   // Frozen: paid/void, or a payment link exists (its amount is fixed).
   if (existing.status !== "open" || existing.stripePaymentLinkId) return;
-  if (existing.totalMinor === built.totalMinor) return; // nothing changed
+  // A buffer-% change can leave the total coincidentally unchanged while the
+  // line items are stale — compare both before short-circuiting.
+  if (
+    existing.totalMinor === built.totalMinor &&
+    (existing.meta as Record<string, unknown>)?.bufferPct === bufferPct
+  )
+    return;
   await db
     .update(invoices)
     .set({
@@ -203,11 +218,22 @@ export async function runInvoiceAutogen(): Promise<void> {
   ]);
   for (const r of [...callOrgs, ...smsOrgs, ...lineOrgs]) if (r.orgId) orgIds.add(r.orgId);
 
+  // Per-org buffer % (configurable in the admin panel; default 20).
+  const bufferByOrg = new Map<string, number>();
+  if (orgIds.size) {
+    const rows = await db
+      .select({ id: organizations.id, bufferPct: organizations.telephonyBufferPct })
+      .from(organizations)
+      .where(inArray(organizations.id, [...orgIds]));
+    for (const r of rows) bufferByOrg.set(r.id, r.bufferPct ?? 0);
+  }
+
   let processed = 0;
   for (const orgId of orgIds) {
     try {
-      await upsertTelephonyInvoice(orgId, previous, currency);
-      await upsertTelephonyInvoice(orgId, current, currency);
+      const bufferPct = bufferByOrg.get(orgId) ?? 0;
+      await upsertTelephonyInvoice(orgId, previous, currency, bufferPct);
+      await upsertTelephonyInvoice(orgId, current, currency, bufferPct);
       processed++;
     } catch (err) {
       console.error(`[InvoiceAutogen] telephony failed for org ${orgId}:`, err);

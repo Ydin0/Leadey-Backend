@@ -421,6 +421,13 @@
       "when": 1783086672368,
       "tag": "0059_thick_randall_flagg",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1783091123128,
+      "tag": "0060_fresh_human_cannonball",
+      "breakpoints": true
     }
   ]
 }

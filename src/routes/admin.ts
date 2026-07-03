@@ -8,8 +8,10 @@ import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
 import { adminAuditLog } from "../db/schema/admin-audit-log";
 import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
+import { creditInvoicePayment, reverseInvoiceCredit, adjustTelephonyBalance, getTelephonyBalance } from "../lib/telephony-credits";
+import { telephonyCreditTransactions } from "../db/schema/telephony-credits";
 import { creditTransactions } from "../db/schema/credits";
-import { ApiError, createId } from "../lib/helpers";
+import { ApiError, createId, normalizeString } from "../lib/helpers";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
 import { getBalance, setOrgBalance } from "../lib/credits";
@@ -2501,6 +2503,128 @@ router.post(
   }),
 );
 
+
+// ─── Telephony credits ─────────────────────────────────────────────────
+// Money wallet (account-currency minor units) fed by paid telephony
+// invoices and drawn down by billed usage. Track-only: may go negative.
+
+// GET /api/admin/organizations/:id/telephony-credits
+router.get(
+  "/organizations/:id/telephony-credits",
+  asyncHandler(async (req, res) => {
+    const orgId = req.params.id;
+    const [org] = await db
+      .select({
+        balance: organizations.telephonyCreditBalanceMinor,
+        bufferPct: organizations.telephonyBufferPct,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const [currency, txns] = await Promise.all([
+      getAccountCurrency().then((c) => c.toLowerCase()).catch(() => "usd"),
+      db
+        .select()
+        .from(telephonyCreditTransactions)
+        .where(eq(telephonyCreditTransactions.organizationId, orgId))
+        .orderBy(desc(telephonyCreditTransactions.createdAt))
+        .limit(20),
+    ]);
+
+    res.json({
+      data: {
+        balanceMinor: org.balance,
+        bufferPct: org.bufferPct,
+        currency,
+        transactions: txns.map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          amountMinor: t.amountMinor,
+          balanceAfterMinor: t.balanceAfterMinor,
+          period: t.period,
+          invoiceId: t.invoiceId,
+          description: t.description,
+          createdAt: t.createdAt.toISOString(),
+        })),
+      },
+    });
+  }),
+);
+
+// POST /api/admin/organizations/:id/telephony-credits — add/remove/set
+router.post(
+  "/organizations/:id/telephony-credits",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const orgId = req.params.id;
+    const body = req.body as { action?: string; amountMinor?: number; reason?: string };
+    const action = body.action;
+    if (action !== "add" && action !== "remove" && action !== "set") {
+      throw new ApiError(400, "action must be 'add', 'remove' or 'set'");
+    }
+    const amountMinor = Number(body.amountMinor);
+    if (!Number.isInteger(amountMinor) || amountMinor < 0) {
+      throw new ApiError(400, "amountMinor must be a non-negative integer");
+    }
+
+    const before = await getTelephonyBalance(orgId);
+    const { balanceMinor, delta } = await adjustTelephonyBalance({
+      orgId,
+      action,
+      amountMinor,
+      userId: actor,
+      description: normalizeString(body.reason) || undefined,
+    });
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.telephony_credits.adjust",
+      targetType: "organization",
+      targetId: orgId,
+      before: { balanceMinor: before },
+      after: { balanceMinor, delta, action, amountMinor },
+      metadata: { reason: normalizeString(body.reason) || null },
+    });
+
+    res.json({ data: { balanceMinor, delta } });
+  }),
+);
+
+// PATCH /api/admin/organizations/:id/telephony-buffer — buffer % setting
+router.patch(
+  "/organizations/:id/telephony-buffer",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const orgId = req.params.id;
+    const bufferPct = Number((req.body as { bufferPct?: number }).bufferPct);
+    if (!Number.isInteger(bufferPct) || bufferPct < 0 || bufferPct > 100) {
+      throw new ApiError(400, "bufferPct must be an integer between 0 and 100");
+    }
+    const [before] = await db
+      .select({ bufferPct: organizations.telephonyBufferPct })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!before) throw new ApiError(404, "Organization not found");
+
+    await db
+      .update(organizations)
+      .set({ telephonyBufferPct: bufferPct, updatedAt: new Date() })
+      .where(eq(organizations.id, orgId));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.telephony_buffer.change",
+      targetType: "organization",
+      targetId: orgId,
+      before: { bufferPct: before.bufferPct },
+      after: { bufferPct },
+    });
+
+    res.json({ data: { bufferPct } });
+  }),
+);
+
 // ─── Invoices ───────────────────────────────────────────────────────────
 // Leadey-issued invoices: telephony usage billed at a multiplier of the
 // REAL Twilio charges (voice + SMS + rentals; recording/AI estimates are
@@ -2524,7 +2648,12 @@ export async function nextInvoiceNumber(attempt = 0): Promise<string> {
 /** Build the telephony line items for one org + month at a billing
  *  multiplier. Amounts are 2× (by default) the real Twilio charges in the
  *  account currency; per-direction splits make the invoice readable. */
-export async function buildTelephonyInvoice(orgId: string, period: string | undefined, multiplier: number) {
+export async function buildTelephonyInvoice(
+  orgId: string,
+  period: string | undefined,
+  multiplier: number,
+  bufferPct = 0,
+) {
   const range = monthRange(period);
   const R = COST_RATES;
 
@@ -2620,13 +2749,30 @@ export async function buildTelephonyInvoice(orgId: string, period: string | unde
       amountMinor: toMinor(rentalCost * multiplier),
     });
 
-  const totalMinor = lineItems.reduce((a, l) => a + l.amountMinor, 0);
+  const usageMinor = lineItems.reduce((a, l) => a + l.amountMinor, 0);
+  // Calling-credit buffer: an extra % on top of usage. When the invoice is
+  // paid, the FULL total lands in the org's telephony credit wallet, so the
+  // buffer is the prepaid float that keeps calling funded between invoices.
+  // Never emitted on its own — an invoice with no usage stays empty.
+  const bufferMinor = lineItems.length > 0 ? Math.round((usageMinor * bufferPct) / 100) : 0;
+  if (bufferMinor > 0) {
+    lineItems.push({
+      description: `Calling credit buffer (${bufferPct}%)`,
+      quantity: bufferPct,
+      unit: "%",
+      amountMinor: bufferMinor,
+    });
+  }
   return {
     period: range.period,
     lineItems,
-    totalMinor,
+    totalMinor: usageMinor + bufferMinor,
+    usageMinor,
+    bufferMinor,
     meta: {
       multiplier,
+      bufferPct,
+      usageMinor,
       baseCost: {
         voiceOut: voiceOutCost,
         voiceIn: voiceInCost,
@@ -2733,6 +2879,7 @@ router.post(
       seats?: number;
       unitPricePence?: number;
       multiplier?: number;
+      bufferPct?: number;
       dueDays?: number;
       notes?: string;
     };
@@ -2755,7 +2902,11 @@ router.post(
         Number.isFinite(body.multiplier) && Number(body.multiplier) >= 1 && Number(body.multiplier) <= 10
           ? Number(body.multiplier)
           : INVOICE_MULTIPLIER_DEFAULT;
-      const built = await buildTelephonyInvoice(orgId, body.period, multiplier);
+      const bufferPct =
+        Number.isInteger(body.bufferPct) && Number(body.bufferPct) >= 0 && Number(body.bufferPct) <= 100
+          ? Number(body.bufferPct)
+          : org.telephonyBufferPct ?? 0;
+      const built = await buildTelephonyInvoice(orgId, body.period, multiplier, bufferPct);
       if (!built.lineItems.length) {
         throw new ApiError(400, `No telephony usage found for ${built.period}`);
       }
@@ -2828,7 +2979,28 @@ router.post(
       metadata: { orgId },
     });
 
-    res.status(201).json({ data: serializeInvoice(created, org.name) });
+    // Double-billing guard: warn (never block) when another telephony invoice
+    // already covers this org+period — paying both would double-credit the
+    // telephony wallet while usage is only debited once.
+    let warning: string | null = null;
+    if (type === "telephony" && period) {
+      const [dupe] = await db
+        .select({ number: invoices.number })
+        .from(invoices)
+        .where(
+          and(
+            eq(invoices.organizationId, orgId),
+            eq(invoices.type, "telephony"),
+            eq(invoices.period, period),
+            sql`${invoices.id} <> ${created.id}`,
+            sql`${invoices.status} <> 'void'`,
+          ),
+        )
+        .limit(1);
+      if (dupe) warning = `Another telephony invoice (${dupe.number}) already covers ${period}`;
+    }
+
+    res.status(201).json({ data: { ...serializeInvoice(created, org.name), warning } });
   }),
 );
 
@@ -2897,6 +3069,12 @@ router.patch(
     }
     const [inv] = await db.select().from(invoices).where(eq(invoices.id, req.params.id));
     if (!inv) throw new ApiError(404, "Invoice not found");
+
+    // Telephony wallet hooks — BEFORE the status write so a failed credit
+    // leaves the invoice open (retryable) instead of paid-but-uncredited.
+    // Both are net-based, so replays and flip-flops converge.
+    if (status === "paid" && inv.status !== "paid") await creditInvoicePayment(inv);
+    if (inv.status === "paid" && status !== "paid") await reverseInvoiceCredit(inv);
 
     const [updated] = await db
       .update(invoices)
