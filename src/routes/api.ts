@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { eq, and, or, inArray, isNull, sql, count, asc } from "drizzle-orm";
 import { db } from "../db/index";
 import { funnels, funnelSteps, funnelMembers } from "../db/schema/funnels";
+import { funnelTags, funnelTagAssignments } from "../db/schema/funnel-tags";
 import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -298,6 +299,7 @@ router.get(
     let statusRows: StatusRow[] = [];
     let sourceRows: SourceRow[] = [];
     let memberRows: { funnelId: string; userId: string; role: string; createdAt: Date }[] = [];
+    let tagRows: { funnelId: string; id: string; name: string; color: string; sortOrder: number }[] = [];
 
     if (ids.length > 0) {
       statusRows = await db
@@ -314,6 +316,17 @@ router.get(
         .select()
         .from(funnelMembers)
         .where(inArray(funnelMembers.funnelId, ids));
+      tagRows = await db
+        .select({
+          funnelId: funnelTagAssignments.funnelId,
+          id: funnelTags.id,
+          name: funnelTags.name,
+          color: funnelTags.color,
+          sortOrder: funnelTags.sortOrder,
+        })
+        .from(funnelTagAssignments)
+        .innerJoin(funnelTags, eq(funnelTagAssignments.tagId, funnelTags.id))
+        .where(inArray(funnelTagAssignments.funnelId, ids));
     }
 
     // Index the count rows by funnel.
@@ -334,6 +347,12 @@ router.get(
       const list = membersByFunnel.get(m.funnelId) ?? [];
       list.push({ teamMemberId: m.userId, role: m.role, addedAt: m.createdAt.toISOString() });
       membersByFunnel.set(m.funnelId, list);
+    }
+    const tagsByFunnel = new Map<string, { id: string; name: string; color: string }[]>();
+    for (const t of tagRows.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name))) {
+      const list = tagsByFunnel.get(t.funnelId) ?? [];
+      list.push({ id: t.id, name: t.name, color: t.color });
+      tagsByFunnel.set(t.funnelId, list);
     }
 
     const webhookBase = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
@@ -380,6 +399,7 @@ router.get(
         },
         sources,
         members: membersByFunnel.get(f.id) ?? [],
+        tags: tagsByFunnel.get(f.id) ?? [],
         webhookToken: f.webhookToken,
         webhookEnabled: f.webhookEnabled,
         webhookFieldMap: f.webhookFieldMap || {},

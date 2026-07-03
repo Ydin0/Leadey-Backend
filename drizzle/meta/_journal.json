@@ -407,6 +407,13 @@
       "when": 1783036855074,
       "tag": "0057_oval_korvac",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1783084484256,
+      "tag": "0058_perpetual_guardsmen",
+      "breakpoints": true
     }
   ]
 }

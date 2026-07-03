@@ -1,3 +1,4 @@
+export { funnelTags, funnelTagAssignments } from "./funnel-tags";
 export { funnels, funnelSteps, funnelMembers } from "./funnels";
 export { leads, leadEvents } from "./leads";
 export { leadFieldDefinitions, leadFieldValues } from "./custom-fields";
