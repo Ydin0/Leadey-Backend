@@ -1233,15 +1233,29 @@ router.post(
   }),
 );
 
-// POST /api/dialer/sessions/:id/dial-started — { itemId }
-// Called by the browser the moment a dial is actually PLACED, and every 60s
-// while the call is live (heartbeat). Two effects, one tx:
+// POST /api/dialer/sessions/:id/dial-started — { itemId, stage? }
+// Called by the browser the moment a dial is placed and every 60s while the
+// call is live (heartbeat). Two effects, one tx:
 //   1. Refreshes the item's claim (claimedAt=now) so the CLAIM_TTL collision
 //      guard covers the true call duration, not just the 3 min after pick.
 //   2. Bumps master_contacts.lastCalledAt so the person is "recently called"
 //      org-wide at DIAL time — the call_records row doesn't exist until the
 //      browser logs it at hangup. (callAttempts is NOT touched — advance and
 //      the hangup call-record sync already count attempts.)
+//
+// stage="preflight" (new clients, sent BEFORE placing the call) additionally
+// RE-VALIDATES the item at dial time. All pick-time guards (findNextDialable)
+// only run when a lead becomes `current` — an item a rep then sits on for an
+// hour is never re-vetted, its claim expires, another rep legitimately takes
+// and calls the person, and the first rep's stale `current` dials them again
+// minutes later (the Betsey/Yididya incident, Jul 3). Preflight blocks when,
+// since our claim, ANOTHER user called this person (call_records by lead or
+// phone), another session completed them inside this session's recency
+// window, or another session holds a live claim on them right now. The
+// requesting rep's OWN prior calls never block (explicit re-dials via Back
+// stay possible). Blocked items are marked skipped and the client advances.
+// Without stage (legacy clients, fire-and-forget after dial) and for
+// stage="heartbeat", behavior is refresh-only — never blocks a live call.
 // Idempotent; safe to repeat. Accepts active AND paused sessions (a rep whose
 // session auto-paused mid-call still owns the lead) and both open item states.
 router.post(
@@ -1251,8 +1265,102 @@ router.post(
     if (s.status !== "active" && s.status !== "paused") {
       throw new ApiError(400, `Session is ${s.status}`);
     }
-    const { itemId } = (req.body ?? {}) as { itemId?: string };
+    const { itemId, stage } = (req.body ?? {}) as { itemId?: string; stage?: string };
     if (!itemId) throw new ApiError(400, "itemId required");
+
+    if (stage === "preflight") {
+      const userId = getUserId(req);
+      const [item] = await db
+        .select()
+        .from(dialerQueueItems)
+        .where(and(eq(dialerQueueItems.id, itemId), eq(dialerQueueItems.sessionId, s.id)));
+      if (!item || (item.status !== "in_progress" && item.status !== "awaiting_disposition")) {
+        throw new ApiError(404, "No open queue item to dial");
+      }
+
+      const now = Date.now();
+      const key = phoneKey(item.leadPhone);
+      const f = (s.filtersJson as { excludeRecentlyCalled?: boolean; recentlyCalledHours?: number; recentlyCalledDays?: number } | null) || {};
+      const recencyOn = f.excludeRecentlyCalled !== false;
+      const recentMs = recencyMsFromFilters(f);
+      let blockedReason: string | null = null;
+
+      // (a) Someone ELSE is live on this person right now (fresh claim in
+      // another active/paused session) — applies even with recency off.
+      const [liveClaim] = await db
+        .select({ id: dialerQueueItems.id })
+        .from(dialerQueueItems)
+        .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+        .where(
+          and(
+            eq(dialerSessions.organizationId, s.organizationId),
+            sql`${dialerQueueItems.sessionId} <> ${s.id}`,
+            inArray(dialerSessions.status, ["active", "paused"]),
+            inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+            gte(dialerQueueItems.claimedAt, new Date(now - CLAIM_TTL_MS)),
+            or(
+              eq(dialerQueueItems.leadId, item.leadId),
+              key ? sql`RIGHT(regexp_replace(${dialerQueueItems.leadPhone}, '[^0-9]', '', 'g'), 10) = ${key}` : sql`FALSE`,
+              item.masterContactId ? eq(dialerQueueItems.masterContactId, item.masterContactId) : sql`FALSE`,
+            ),
+          ),
+        )
+        .limit(1);
+      if (liveClaim) blockedReason = "in_call";
+
+      // (b) Another USER already called this person inside the recency window.
+      if (!blockedReason && recencyOn) {
+        const since = new Date(now - recentMs);
+        const [recentCall] = await db
+          .select({ id: callRecords.id })
+          .from(callRecords)
+          .where(
+            and(
+              eq(callRecords.organizationId, s.organizationId),
+              sql`${callRecords.userId} IS DISTINCT FROM ${userId}`,
+              gte(callRecords.calledAt, since),
+              or(
+                eq(callRecords.leadId, item.leadId),
+                key ? sql`RIGHT(regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g'), 10) = ${key}` : sql`FALSE`,
+              ),
+            ),
+          )
+          .limit(1);
+        if (recentCall) blockedReason = "recently_called";
+
+        if (!blockedReason) {
+          const [recentDone] = await db
+            .select({ id: dialerQueueItems.id })
+            .from(dialerQueueItems)
+            .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
+            .where(
+              and(
+                eq(dialerSessions.organizationId, s.organizationId),
+                sql`${dialerQueueItems.sessionId} <> ${s.id}`,
+                eq(dialerQueueItems.status, "completed"),
+                gte(dialerQueueItems.calledAt, since),
+                or(
+                  eq(dialerQueueItems.leadId, item.leadId),
+                  key ? sql`RIGHT(regexp_replace(${dialerQueueItems.leadPhone}, '[^0-9]', '', 'g'), 10) = ${key}` : sql`FALSE`,
+                  item.masterContactId ? eq(dialerQueueItems.masterContactId, item.masterContactId) : sql`FALSE`,
+                ),
+              ),
+            )
+            .limit(1);
+          if (recentDone) blockedReason = "recently_called";
+        }
+      }
+
+      if (blockedReason) {
+        // Release the stale current so the queue moves on cleanly.
+        await db
+          .update(dialerQueueItems)
+          .set({ status: "skipped", notes: `auto:${blockedReason}`, calledAt: new Date() })
+          .where(eq(dialerQueueItems.id, item.id));
+        res.json({ data: { ok: false, blocked: true, reason: blockedReason } });
+        return;
+      }
+    }
 
     await db.transaction(async (tx) => {
       const [item] = await tx
