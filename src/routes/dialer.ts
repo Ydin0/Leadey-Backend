@@ -1000,7 +1000,7 @@ type DialerTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
  * not skipped. The chosen item is claimed (in_progress + claimedAt) before the
  * lock releases. Returns it, or null when nothing dialable remains.
  */
-async function findNextDialable(
+export async function findNextDialable(
   tx: DialerTx,
   session: typeof dialerSessions.$inferSelect,
 ): Promise<typeof dialerQueueItems.$inferSelect | null> {
@@ -1032,6 +1032,7 @@ async function findNextDialable(
       id: dialerQueueItems.id,
       leadId: dialerQueueItems.leadId,
       leadPhone: dialerQueueItems.leadPhone,
+      masterContactId: dialerQueueItems.masterContactId,
       position: dialerQueueItems.position,
     })
     .from(dialerQueueItems)
@@ -1070,6 +1071,25 @@ async function findNextDialable(
     }
   }
 
+  // Person-level recency from master_contacts.lastCalledAt — bumped the moment
+  // a dial is PLACED (dial-started endpoint) and again at hangup, so a person
+  // another rep is on the phone with RIGHT NOW is "recently called" org-wide
+  // immediately, not only after the browser writes the call_records row at
+  // hangup. Also covers duplicate lead rows for the same person.
+  const recentByMaster = new Map<string, number>();
+  {
+    const masterIds = [...new Set(pending.map((p) => p.masterContactId).filter(Boolean) as string[])];
+    if (masterIds.length) {
+      const rows = await tx
+        .select({ id: masterContacts.id, lastCalledAt: masterContacts.lastCalledAt })
+        .from(masterContacts)
+        .where(inArray(masterContacts.id, masterIds));
+      for (const r of rows) {
+        if (r.lastCalledAt) recentByMaster.set(r.id, r.lastCalledAt.getTime());
+      }
+    }
+  }
+
   // Server-authoritative recency from OTHER sessions' COMPLETED queue items —
   // a lead any rep in the org dispositioned within the window. This does NOT
   // depend on the browser having written the call_records row yet, so it closes
@@ -1080,7 +1100,12 @@ async function findNextDialable(
   {
     const since = new Date(now - recentMs);
     const qiRows = await tx
-      .select({ leadId: dialerQueueItems.leadId, calledAt: dialerQueueItems.calledAt })
+      .select({
+        leadId: dialerQueueItems.leadId,
+        leadPhone: dialerQueueItems.leadPhone,
+        masterContactId: dialerQueueItems.masterContactId,
+        calledAt: dialerQueueItems.calledAt,
+      })
       .from(dialerQueueItems)
       .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
       .where(
@@ -1092,7 +1117,12 @@ async function findNextDialable(
       );
     for (const r of qiRows) {
       const t = r.calledAt?.getTime() ?? 0;
-      if (t && (recentByLead.get(r.leadId) ?? 0) < t) recentByLead.set(r.leadId, t);
+      if (!t) continue;
+      if ((recentByLead.get(r.leadId) ?? 0) < t) recentByLead.set(r.leadId, t);
+      const k = phoneKey(r.leadPhone);
+      if (k && (recentByPhone.get(k) ?? 0) < t) recentByPhone.set(k, t);
+      if (r.masterContactId && (recentByMaster.get(r.masterContactId) ?? 0) < t)
+        recentByMaster.set(r.masterContactId, t);
     }
   }
 
@@ -1102,7 +1132,11 @@ async function findNextDialable(
   // as abandoned (crashed/closed tab) and released so the lead is never locked
   // away forever.
   const collidedRows = await tx
-    .select({ leadId: dialerQueueItems.leadId })
+    .select({
+      leadId: dialerQueueItems.leadId,
+      leadPhone: dialerQueueItems.leadPhone,
+      masterContactId: dialerQueueItems.masterContactId,
+    })
     .from(dialerQueueItems)
     .innerJoin(dialerSessions, eq(dialerQueueItems.sessionId, dialerSessions.id))
     .where(
@@ -1115,6 +1149,12 @@ async function findNextDialable(
       ),
     );
   const collided = new Set(collidedRows.map((r) => r.leadId));
+  // Also key the collision by phone + person, so a duplicate lead row for the
+  // same human (same number, different leadId) can't be double-rung mid-call.
+  const collidedPhones = new Set(collidedRows.map((r) => phoneKey(r.leadPhone)).filter(Boolean));
+  const collidedMasters = new Set(
+    collidedRows.map((r) => r.masterContactId).filter(Boolean) as string[],
+  );
 
   const skipByReason = new Map<string, string[]>();
   const skip = (id: string, reason: string) => {
@@ -1130,10 +1170,19 @@ async function findNextDialable(
     if (excludeDoNotCall && lead?.doNotCall) { skip(item.id, "dnc"); continue; }
     if (excludeClosed && lead && terminalKeys.has(lead.status)) { skip(item.id, "closed"); continue; }
     if (excludeRecentlyCalled) {
-      const last = Math.max(recentByLead.get(item.leadId) ?? 0, key ? recentByPhone.get(key) ?? 0 : 0);
+      const last = Math.max(
+        recentByLead.get(item.leadId) ?? 0,
+        key ? recentByPhone.get(key) ?? 0 : 0,
+        item.masterContactId ? recentByMaster.get(item.masterContactId) ?? 0 : 0,
+      );
       if (last && now - last < recentMs) { skip(item.id, "recently_called"); continue; }
     }
-    if (collided.has(item.leadId)) continue; // another rep on it now — try later
+    if (
+      collided.has(item.leadId) ||
+      (key && collidedPhones.has(key)) ||
+      (item.masterContactId && collidedMasters.has(item.masterContactId))
+    )
+      continue; // another rep is on this person right now — try later
     chosen = item;
     break;
   }
@@ -1184,18 +1233,77 @@ router.post(
   }),
 );
 
+// POST /api/dialer/sessions/:id/dial-started — { itemId }
+// Called by the browser the moment a dial is actually PLACED, and every 60s
+// while the call is live (heartbeat). Two effects, one tx:
+//   1. Refreshes the item's claim (claimedAt=now) so the CLAIM_TTL collision
+//      guard covers the true call duration, not just the 3 min after pick.
+//   2. Bumps master_contacts.lastCalledAt so the person is "recently called"
+//      org-wide at DIAL time — the call_records row doesn't exist until the
+//      browser logs it at hangup. (callAttempts is NOT touched — advance and
+//      the hangup call-record sync already count attempts.)
+// Idempotent; safe to repeat. Accepts active AND paused sessions (a rep whose
+// session auto-paused mid-call still owns the lead) and both open item states.
+router.post(
+  "/dialer/sessions/:id/dial-started",
+  asyncHandler(async (req, res) => {
+    const s = await loadSessionOr404(req, req.params.id as string);
+    if (s.status !== "active" && s.status !== "paused") {
+      throw new ApiError(400, `Session is ${s.status}`);
+    }
+    const { itemId } = (req.body ?? {}) as { itemId?: string };
+    if (!itemId) throw new ApiError(400, "itemId required");
+
+    await db.transaction(async (tx) => {
+      const [item] = await tx
+        .update(dialerQueueItems)
+        .set({ claimedAt: new Date() })
+        .where(
+          and(
+            eq(dialerQueueItems.id, itemId),
+            eq(dialerQueueItems.sessionId, s.id),
+            inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+          ),
+        )
+        .returning({ masterContactId: dialerQueueItems.masterContactId });
+      if (!item) throw new ApiError(404, "No open queue item to mark dialed");
+      if (item.masterContactId) {
+        await tx
+          .update(masterContacts)
+          .set({ lastCalledAt: new Date(), updatedAt: new Date() })
+          .where(eq(masterContacts.id, item.masterContactId));
+      }
+    });
+    res.json({ data: { ok: true } });
+  }),
+);
+
 router.post(
   "/dialer/sessions/:id/end",
   asyncHandler(async (req, res) => {
     const s = await loadSessionOr404(req, req.params.id as string);
-    const [updated] = await db
-      .update(dialerSessions)
-      .set({
-        status: s.completedLeads >= s.totalLeads ? "completed" : "abandoned",
-        endedAt: new Date(),
-      })
-      .where(eq(dialerSessions.id, s.id))
-      .returning();
+    const updated = await db.transaction(async (tx) => {
+      const [u] = await tx
+        .update(dialerSessions)
+        .set({
+          status: s.completedLeads >= s.totalLeads ? "completed" : "abandoned",
+          endedAt: new Date(),
+        })
+        .where(eq(dialerSessions.id, s.id))
+        .returning();
+      // Release the session's own open claim — an ended session no longer owns
+      // any lead, so don't leave an in_progress row lingering.
+      await tx
+        .update(dialerQueueItems)
+        .set({ status: "pending", claimedAt: null })
+        .where(
+          and(
+            eq(dialerQueueItems.sessionId, s.id),
+            inArray(dialerQueueItems.status, ["in_progress", "awaiting_disposition"]),
+          ),
+        );
+      return u;
+    });
     res.json({ data: serializeSession(updated) });
   }),
 );
