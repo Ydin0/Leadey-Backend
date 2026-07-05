@@ -39,7 +39,7 @@ import searchRouter from "./routes/search";
 import knowledgeBaseRouter from "./routes/knowledge-base";
 import importsRouter from "./routes/imports";
 import smsRouter from "./routes/sms";
-import whatsappRouter from "./routes/whatsapp";
+import whatsappRouter, { whatsappPublicRouter } from "./routes/whatsapp";
 import notificationsRouter from "./routes/notifications";
 import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts";
 import calendlyRouter, { calendlyPublicRouter } from "./routes/calendly";
@@ -168,6 +168,7 @@ app.use("/api", workflowsRouter);
 // Unauthenticated webhook routes
 app.use("/webhooks", webhooksRouter);
 app.use("/webhooks", twilioWebhookRouter);
+app.use("/webhooks", whatsappPublicRouter);
 
 // Public voicemail file serve — fetched by Twilio's <Play> verb. NOT
 // authenticated because Twilio can't carry a Clerk session token.

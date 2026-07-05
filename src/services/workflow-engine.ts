@@ -214,6 +214,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
           lead: { id: lead.id, phone: lead.phone, funnelId: lead.funnelId },
           body,
           contentSid,
+          contentBody: typeof d.contentBody === "string" ? d.contentBody : undefined,
           contentVariables: contentSid ? contentVariables : undefined,
           preferredLineId: typeof d.lineId === "string" && d.lineId ? d.lineId : undefined,
           userId: null,

@@ -4,6 +4,8 @@ import { db } from "../db";
 import { smsMessages } from "../db/schema/sms";
 import { whatsappSenders } from "../db/schema/whatsapp";
 import { ApiError, createId } from "../lib/helpers";
+import { getSetting } from "../lib/settings-service";
+import { UnipileClient } from "../lib/unipile-client";
 
 /** Shared WhatsApp send path — used by the manual send route AND the workflow
  *  engine, so the 24h-session rule, sender resolution and message persistence
@@ -24,6 +26,38 @@ const client = twilioSdk(
  *  sender registration entirely (recipients must have joined the sandbox). */
 export function sandboxNumber(): string | null {
   return process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER?.trim() || null;
+}
+
+// ── Unipile-connected WhatsApp (the customer's own number, QR-linked) ──
+// This is the primary customer path (Close.com-style): the org scans a QR
+// with their own WhatsApp, and sends go out from that number via Unipile.
+// No Meta approval, no template/24h rules — but conversational volumes only.
+
+export const UNIPILE_WA_ACCOUNT_KEY = "whatsapp_unipile_account_id";
+export const UNIPILE_WA_PHONE_KEY = "whatsapp_unipile_phone";
+
+export function unipilePlatformClient(): UnipileClient | null {
+  const dsn = process.env.UNIPILE_DSN;
+  const apiKey = process.env.UNIPILE_API_KEY;
+  if (!dsn || !apiKey) return null;
+  return new UnipileClient(dsn, apiKey);
+}
+
+export async function getConnectedUnipileWhatsapp(
+  orgId: string,
+): Promise<{ accountId: string; phone: string | null } | null> {
+  if (!unipilePlatformClient()) return null;
+  const accountId = (await getSetting(orgId, UNIPILE_WA_ACCOUNT_KEY))?.trim();
+  if (!accountId) return null;
+  const phone = (await getSetting(orgId, UNIPILE_WA_PHONE_KEY))?.trim() || null;
+  return { accountId, phone };
+}
+
+/** Fill {{1}}-style slots of a template body with their configured values —
+ *  used when a template-mode workflow step sends through Unipile (which has
+ *  no Content-API concept; the rendered text is sent directly). */
+function fillTemplateSlots(body: string, vars: Record<string, string>): string {
+  return body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_, slot: string) => vars[slot] ?? "");
 }
 
 export interface ResolvedSender {
@@ -104,6 +138,9 @@ export async function sendWhatsapp(opts: {
   lead: { id: string; phone: string; funnelId: string };
   body: string;
   contentSid?: string;
+  /** The template's text body — used verbatim (slots filled) on the Unipile
+   *  path, where Twilio Content templates don't exist. */
+  contentBody?: string;
   contentVariables?: Record<string, string>;
   preferredLineId?: string | null;
   userId?: string | null;
@@ -111,6 +148,42 @@ export async function sendWhatsapp(opts: {
   const { orgId, lead } = opts;
   if (!lead.phone) throw new ApiError(400, "This lead has no phone number");
   const to = toE164(lead.phone);
+
+  // Preferred path: the org's own QR-connected WhatsApp via Unipile —
+  // freeform is always allowed there (it's a normal WhatsApp conversation).
+  const unipile = await getConnectedUnipileWhatsapp(orgId);
+  if (unipile) {
+    const text =
+      (opts.body || "").trim() ||
+      fillTemplateSlots((opts.contentBody || "").trim(), opts.contentVariables || {});
+    if (!text) throw new ApiError(400, "Message body is required");
+    const client = unipilePlatformClient()!;
+    try {
+      await client.sendMessage(unipile.accountId, `${to.replace(/\D/g, "")}@s.whatsapp.net`, text);
+    } catch (err) {
+      throw new ApiError(502, `WhatsApp send failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    }
+    const messageId = createId("sms");
+    const fromNumber = unipile.phone || "whatsapp";
+    await db.insert(smsMessages).values({
+      id: messageId,
+      organizationId: orgId,
+      leadId: lead.id,
+      funnelId: lead.funnelId,
+      lineId: null,
+      userId: opts.userId ?? null,
+      direction: "outbound",
+      channel: "whatsapp",
+      fromNumber,
+      toNumber: to,
+      body: text,
+      status: "sent",
+      twilioSid: null,
+      createdAt: new Date(),
+    });
+    return { messageId, twilioSid: null, status: "sent", fromNumber, toNumber: to };
+  }
+
   const sender = await resolveWhatsappSender(orgId, opts.preferredLineId);
 
   // Template sends are always allowed; freeform only inside the 24h window

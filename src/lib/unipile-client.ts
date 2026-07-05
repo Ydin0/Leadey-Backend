@@ -162,4 +162,53 @@ export class UnipileClient {
       attendees_ids: [providerId],
     });
   }
+
+  async getAccount(accountId: string): Promise<UnipileAccount> {
+    return this.request<UnipileAccount>("GET", `/accounts/${encodeURIComponent(accountId)}`);
+  }
+
+  async deleteAccount(accountId: string): Promise<void> {
+    await this.request<unknown>("DELETE", `/accounts/${encodeURIComponent(accountId)}`);
+  }
+
+  /** Unipile's hosted auth wizard — it renders the WhatsApp QR (and handles
+   *  refresh/expiry) on Unipile's own page, then redirects back and POSTs the
+   *  new account id to notifyUrl. Keeps QR mechanics entirely off our UI. */
+  async createHostedAuthLink(opts: {
+    providers: string[];
+    /** Correlation token echoed back in the notify payload (we pass orgId). */
+    name: string;
+    notifyUrl?: string;
+    successRedirectUrl?: string;
+    failureRedirectUrl?: string;
+  }): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/hosted/accounts/link", {
+      type: "create",
+      providers: opts.providers,
+      api_url: this.baseUrl.replace(/\/api\/v1$/, ""),
+      expiresOn: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      name: opts.name,
+      ...(opts.notifyUrl ? { notify_url: opts.notifyUrl } : {}),
+      ...(opts.successRedirectUrl ? { success_redirect_url: opts.successRedirectUrl } : {}),
+      ...(opts.failureRedirectUrl ? { failure_redirect_url: opts.failureRedirectUrl } : {}),
+    });
+  }
+
+  async listWebhooks(): Promise<{ id: string; request_url: string; source: string }[]> {
+    const result = await this.request<{ items?: { id: string; request_url: string; source: string }[] }>(
+      "GET",
+      "/webhooks",
+    );
+    return result.items || [];
+  }
+
+  /** Register a messaging webhook (new-message events for every account on
+   *  the Unipile workspace). Idempotence is the caller's job (listWebhooks). */
+  async createMessagingWebhook(requestUrl: string): Promise<void> {
+    await this.request<unknown>("POST", "/webhooks", {
+      source: "messaging",
+      request_url: requestUrl,
+      name: "leadey-messaging",
+    });
+  }
 }
