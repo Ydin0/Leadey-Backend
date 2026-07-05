@@ -5,6 +5,7 @@ import { getAuth } from "@clerk/express";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { phoneLines } from "../db/schema/phone-lines";
+import { whatsappSenders } from "../db/schema/whatsapp";
 import { regulatoryBundles, bundleDocuments } from "../db/schema/regulatory-bundles";
 import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
@@ -511,6 +512,22 @@ router.delete(
       .where(and(eq(phoneLines.id, lineId), eq(phoneLines.organizationId, orgId)));
 
     if (!line) throw new ApiError(404, "Phone line not found");
+
+    // If the number is registered as a WhatsApp sender, deregister it with
+    // Meta first (best-effort) — otherwise the released number stays bound to
+    // this WABA and can't be re-registered by its next owner.
+    try {
+      const [waSender] = await db
+        .select()
+        .from(whatsappSenders)
+        .where(eq(whatsappSenders.lineId, line.id));
+      if (waSender) {
+        await client.messaging.v2.channelsSenders(waSender.senderSid).remove().catch(() => {});
+        await db.delete(whatsappSenders).where(eq(whatsappSenders.id, waSender.id));
+      }
+    } catch (err) {
+      console.error("[whatsapp] sender deregistration on line release failed:", err);
+    }
 
     // Release from Twilio (best-effort)
     try {

@@ -189,6 +189,7 @@ router.get(
       .select({
         id: smsMessages.id,
         direction: smsMessages.direction,
+        channel: smsMessages.channel,
         fromNumber: smsMessages.fromNumber,
         toNumber: smsMessages.toNumber,
         body: smsMessages.body,
@@ -345,7 +346,7 @@ router.get(
       .limit(500);
     res.json({
       data: rows.map((m) => ({
-        id: m.id, direction: m.direction, fromNumber: m.fromNumber, toNumber: m.toNumber,
+        id: m.id, direction: m.direction, channel: m.channel, fromNumber: m.fromNumber, toNumber: m.toNumber,
         body: m.body, status: m.status, userId: m.userId, createdAt: m.createdAt.toISOString(),
       })),
     });

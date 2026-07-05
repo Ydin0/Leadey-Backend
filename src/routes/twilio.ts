@@ -380,20 +380,29 @@ webhookRouter.post(
   }),
 );
 
-// POST /webhooks/twilio/sms — inbound SMS from a lead. Routes the text to the
-// org that owns the receiving number, attaches it to the matching lead, logs
-// it on the timeline, and notifies the rep who last texted that lead.
+// POST /webhooks/twilio/sms — inbound SMS OR WhatsApp message from a lead.
+// WhatsApp senders are configured to call this same webhook; their From/To
+// arrive "whatsapp:"-prefixed, so we strip the prefix up front and everything
+// downstream (line matching, phoneKey lead matching) works on bare numbers —
+// the plain-SMS path is byte-identical. Routes the message to the org that
+// owns the receiving number, attaches it to the matching lead, logs it on the
+// timeline, and notifies the rep who last messaged that lead.
 webhookRouter.post(
   "/twilio/sms",
   asyncHandler(async (req, res) => {
-    const from = (req.body?.From as string) || "";
-    const to = (req.body?.To as string) || "";
+    const rawFrom = (req.body?.From as string) || "";
+    const rawTo = (req.body?.To as string) || "";
+    const isWhatsapp = rawFrom.startsWith("whatsapp:") || rawTo.startsWith("whatsapp:");
+    const from = rawFrom.replace(/^whatsapp:/, "");
+    const to = rawTo.replace(/^whatsapp:/, "");
+    const channel = isWhatsapp ? "whatsapp" : "sms";
     const body = (req.body?.Body as string) || "";
     const messageSid = (req.body?.MessageSid as string) || null;
 
     try {
       const { db } = await import("../db");
       const { phoneLines } = await import("../db/schema/phone-lines");
+      const { whatsappSenders } = await import("../db/schema/whatsapp");
       const { leads, leadEvents } = await import("../db/schema/leads");
       const { funnels } = await import("../db/schema/funnels");
       const { smsMessages } = await import("../db/schema/sms");
@@ -401,7 +410,7 @@ webhookRouter.post(
       const { createId, phoneKey } = await import("../lib/helpers");
       const { createNotification } = await import("./notifications");
 
-      // Which org owns the number that was texted?
+      // Which org owns the number that was messaged?
       const toDigits = to.replace(/\D/g, "");
       const allLines = await db
         .select({ id: phoneLines.id, number: phoneLines.number, organizationId: phoneLines.organizationId, assignedTo: phoneLines.assignedTo })
@@ -411,9 +420,31 @@ webhookRouter.post(
         allLines.find((l) => l.number.replace(/\D/g, "") === toDigits) ||
         null;
 
-      if (line) {
-        const orgId = line.organizationId;
-        // Find the lead by the caller's number within that org.
+      // Resolve the owning org: the line, else (WhatsApp only) a registered
+      // sender whose line was released, else the dev sandbox org.
+      let orgId: string | null = line?.organizationId ?? null;
+      let lineId: string | null = line?.id ?? null;
+      if (!orgId && isWhatsapp) {
+        const senders = await db
+          .select({ organizationId: whatsappSenders.organizationId, lineId: whatsappSenders.lineId, number: whatsappSenders.number })
+          .from(whatsappSenders);
+        const sender = senders.find((s) => s.number.replace(/\D/g, "") === toDigits) || null;
+        if (sender) {
+          orgId = sender.organizationId;
+          lineId = sender.lineId;
+        } else if (
+          process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER &&
+          toDigits === process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER.replace(/\D/g, "") &&
+          process.env.TWILIO_WHATSAPP_SANDBOX_ORG_ID
+        ) {
+          orgId = process.env.TWILIO_WHATSAPP_SANDBOX_ORG_ID;
+        } else {
+          console.warn(`[Twilio] inbound whatsapp to unknown number ${to} — skipped`);
+        }
+      }
+
+      if (orgId) {
+        // Find the lead by the sender's number within that org.
         const key = phoneKey(from);
         let lead: { id: string; funnelId: string; name: string } | null = null;
         if (key) {
@@ -430,9 +461,10 @@ webhookRouter.post(
           organizationId: orgId,
           leadId: lead?.id ?? null,
           funnelId: lead?.funnelId ?? null,
-          lineId: line.id,
+          lineId,
           userId: null,
           direction: "inbound",
+          channel,
           fromNumber: from,
           toNumber: to,
           body,
@@ -447,7 +479,7 @@ webhookRouter.post(
             type: "step_outcome",
             outcome: "replied",
             stepIndex: 0,
-            meta: { channel: "sms", direction: "inbound", body },
+            meta: { channel, direction: "inbound", body },
             timestamp: new Date(),
           });
 
@@ -462,13 +494,13 @@ webhookRouter.post(
             .where(a(e(smsMessages.leadId, lead.id), e(smsMessages.direction, "outbound")))
             .orderBy(d(smsMessages.createdAt))
             .limit(1);
-          const targetUserId = lastOut?.userId || line.assignedTo || null;
+          const targetUserId = lastOut?.userId || line?.assignedTo || null;
           if (targetUserId) {
             await createNotification({
               orgId,
               userId: targetUserId,
               type: "sms_reply",
-              title: `${lead.name} replied`,
+              title: `${lead.name} replied${isWhatsapp ? " on WhatsApp" : ""}`,
               body: body.slice(0, 140),
               leadId: lead.id,
               funnelId: lead.funnelId,

@@ -162,8 +162,10 @@ router.get(
       id: string; source: "google" | "outlook" | "calendly";
       title: string; startTime: string | null; endTime: string | null;
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
+      responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
     };
     const meetings: Meeting[] = [];
+    const leadEmail = (lead.email || "").trim().toLowerCase();
 
     if (candidates.size > 0) {
       const rows = await db
@@ -183,6 +185,11 @@ router.get(
         const dedupeKey = `${ev.title}|${ev.startTime?.toISOString() || ""}`;
         if (seenEvent.has(dedupeKey)) continue;
         seenEvent.add(dedupeKey);
+        // The lead's own RSVP, falling back to whichever company contact matched.
+        const responses = ev.attendeeResponses || {};
+        const matched = leadEmail && attendees.includes(leadEmail)
+          ? leadEmail
+          : attendees.find((e) => candidates.has(e));
         meetings.push({
           id: ev.id,
           source: provider === "google" ? "google" : "outlook",
@@ -192,6 +199,7 @@ router.get(
           joinUrl: ev.joinUrl,
           location: ev.location,
           organizerEmail: ev.organizerEmail,
+          responseStatus: (matched && responses[matched]) || null,
         });
       }
     }
@@ -216,6 +224,8 @@ router.get(
         joinUrl: m.joinUrl,
         location: null,
         organizerEmail: null,
+        // The invitee booked this slot themselves, so it's an implicit accept.
+        responseStatus: "accepted",
       });
     }
 

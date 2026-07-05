@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, timestamp, unique, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, unique, boolean, index, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { organizations } from "./organizations";
 
@@ -47,6 +47,11 @@ export const masterContacts = pgTable("master_contacts", {
   emailStatus: text("email_status"),
   phone: text("phone"),
   phoneStatus: text("phone_status"),
+  /** Additional labeled emails/phones (mirrors leads.extra_emails/extra_phones
+   *  so they follow the person across campaigns). Identity keys stay derived
+   *  from the primary email/phone only. */
+  extraEmails: jsonb("extra_emails").$type<{ label: string; value: string }[]>().notNull().default([]),
+  extraPhones: jsonb("extra_phones").$type<{ label: string; value: string }[]>().notNull().default([]),
   enrichmentStatus: text("enrichment_status").notNull().default("none"),
 
   /** Normalised identity keys — how a PERSON is recognised across campaigns

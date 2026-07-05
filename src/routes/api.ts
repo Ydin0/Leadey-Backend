@@ -223,6 +223,8 @@ async function loadFunnel(
       company: l.company,
       email: l.email,
       phone: l.phone,
+      extraEmails: l.extraEmails ?? [],
+      extraPhones: l.extraPhones ?? [],
       linkedinUrl: l.linkedinUrl,
       currentStep: l.currentStep,
       totalSteps: l.totalSteps,
@@ -646,6 +648,8 @@ router.get(
         company: l.company,
         email: l.email,
         phone: l.phone,
+        extraEmails: l.extraEmails ?? [],
+        extraPhones: l.extraPhones ?? [],
         linkedinUrl: l.linkedinUrl,
         currentStep: l.currentStep,
         totalSteps: l.totalSteps,
@@ -2158,7 +2162,8 @@ router.patch(
     const lead = funnel.leads.find((l) => l.id === req.params.leadId);
     if (!lead) throw new ApiError(404, "Lead not found in funnel");
 
-    const body = (req.body || {}) as Partial<Record<"name" | "title" | "email" | "phone" | "linkedinUrl", string>>;
+    const body = (req.body || {}) as Partial<Record<"name" | "title" | "email" | "phone" | "linkedinUrl", string>> &
+      Partial<Record<"extraEmails" | "extraPhones", unknown>>;
     const updates: Record<string, unknown> = {};
     if (body.name !== undefined) {
       const name = normalizeString(body.name);
@@ -2169,6 +2174,24 @@ router.patch(
     if (body.email !== undefined) updates.email = normalizeString(body.email).toLowerCase();
     if (body.phone !== undefined) updates.phone = normalizeString(body.phone);
     if (body.linkedinUrl !== undefined) updates.linkedinUrl = normalizeString(body.linkedinUrl);
+    // Additional labeled emails/phones — replaced wholesale (the edit form
+    // sends the full list). Entries without a value are dropped; capped at 10.
+    const sanitizeExtras = (raw: unknown, lowercase: boolean) => {
+      if (!Array.isArray(raw)) return [];
+      const out: { label: string; value: string }[] = [];
+      for (const item of raw) {
+        if (!item || typeof item !== "object") continue;
+        let value = normalizeString((item as Record<string, unknown>).value as string).slice(0, 200);
+        if (lowercase) value = value.toLowerCase();
+        const label = normalizeString((item as Record<string, unknown>).label as string).slice(0, 40);
+        if (!value) continue;
+        out.push({ label, value });
+        if (out.length >= 10) break;
+      }
+      return out;
+    };
+    if (body.extraEmails !== undefined) updates.extraEmails = sanitizeExtras(body.extraEmails, true);
+    if (body.extraPhones !== undefined) updates.extraPhones = sanitizeExtras(body.extraPhones, false);
     if (Object.keys(updates).length === 0) throw new ApiError(400, "Nothing to update");
     updates.updatedAt = new Date();
 
@@ -2215,6 +2238,8 @@ router.patch(
             masterUpdates.linkedinUrl = (updates.linkedinUrl as string) || null;
             masterUpdates.linkedinKey = linkedinKeyOf(updates.linkedinUrl as string);
           }
+          if (updates.extraEmails !== undefined) masterUpdates.extraEmails = updates.extraEmails;
+          if (updates.extraPhones !== undefined) masterUpdates.extraPhones = updates.extraPhones;
           await db
             .update(masterContacts)
             .set(masterUpdates)
@@ -2224,7 +2249,7 @@ router.patch(
           // already pushed to Smartlead — its webhooks correlate by the email
           // we sent, so rewriting it would orphan those events.
           const siblingSync: Record<string, unknown> = {};
-          for (const key of ["name", "firstName", "lastName", "title", "phone", "linkedinUrl"] as const) {
+          for (const key of ["name", "firstName", "lastName", "title", "phone", "linkedinUrl", "extraEmails", "extraPhones"] as const) {
             if (updates[key] !== undefined) siblingSync[key] = updates[key];
           }
           if (Object.keys(siblingSync).length > 0) {
@@ -2253,8 +2278,32 @@ router.patch(
         email: (updates.email as string) ?? lead.email,
         phone: (updates.phone as string) ?? lead.phone,
         linkedinUrl: (updates.linkedinUrl as string) ?? lead.linkedinUrl,
+        extraEmails: (updates.extraEmails as { label: string; value: string }[]) ?? lead.extraEmails ?? [],
+        extraPhones: (updates.extraPhones as { label: string; value: string }[]) ?? lead.extraPhones ?? [],
       },
     });
+  }),
+);
+
+// ─── DELETE /funnels/:funnelId/leads/:leadId ─────────────────────────────
+// Remove a contact (lead row) from this campaign — the trash action in the
+// lead profile's Contacts section. Deletes only this enrollment: the person's
+// master contact and any enrollments in other campaigns are untouched.
+// Related rows (events, tasks, documents, custom-field values, workflow
+// enrollments) cascade; an opportunity sourced from this lead survives.
+router.delete(
+  "/funnels/:funnelId/leads/:leadId",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnel = getFunnelOrThrow(
+      await loadFunnel(orgId, req.params.funnelId),
+      req.params.funnelId,
+    );
+    const lead = funnel.leads.find((l) => l.id === req.params.leadId);
+    if (!lead) throw new ApiError(404, "Lead not found in funnel");
+
+    await db.delete(leads).where(eq(leads.id, lead.id));
+    res.status(204).end();
   }),
 );
 

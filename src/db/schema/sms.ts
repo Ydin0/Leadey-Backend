@@ -17,6 +17,10 @@ export const smsMessages = pgTable(
     // The rep who sent it (null for inbound).
     userId: text("user_id"),
     direction: text("direction").notNull(), // "outbound" | "inbound"
+    /** Which messaging channel carried this message. WhatsApp messages share
+     *  this table so status callbacks, cost sync, threads and reply triggers
+     *  all work channel-agnostically. */
+    channel: text("channel").notNull().default("sms"), // "sms" | "whatsapp"
     fromNumber: text("from_number").notNull(),
     toNumber: text("to_number").notNull(),
     body: text("body").notNull().default(""),

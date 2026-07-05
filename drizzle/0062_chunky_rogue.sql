@@ -1,0 +1,1 @@
+ALTER TABLE "calendar_events" ADD COLUMN "attendee_responses" jsonb DEFAULT '{}'::jsonb NOT NULL;

@@ -38,6 +38,9 @@ export interface Lead {
   company: string;
   email: string;
   phone: string;
+  /** Additional labeled emails/phones beyond the primary values. */
+  extraEmails?: { label: string; value: string }[];
+  extraPhones?: { label: string; value: string }[];
   linkedinUrl: string;
   currentStep: number;
   totalSteps: number;
@@ -104,6 +107,8 @@ function serializeLead(lead: Lead, lite = false) {
     company: lead.company,
     email: lead.email,
     phone: lead.phone,
+    extraEmails: lead.extraEmails ?? [],
+    extraPhones: lead.extraPhones ?? [],
     linkedinUrl: lead.linkedinUrl,
     currentStep: lead.currentStep,
     totalSteps: lead.totalSteps,

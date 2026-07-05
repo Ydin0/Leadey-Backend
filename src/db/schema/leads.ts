@@ -30,6 +30,11 @@ export const leads = pgTable("leads", {
   company: text("company").notNull(),
   email: text("email").notNull().default(""),
   phone: text("phone").notNull().default(""),
+  /** Additional labeled emails/phones beyond the primary columns above, e.g.
+   *  [{ label: "Personal", value: "x@y.com" }]. The primary email/phone stay
+   *  the values used by the dialer, sending, filtering and identity keys. */
+  extraEmails: jsonb("extra_emails").$type<{ label: string; value: string }[]>().notNull().default([]),
+  extraPhones: jsonb("extra_phones").$type<{ label: string; value: string }[]>().notNull().default([]),
   linkedinUrl: text("linkedin_url").notNull().default(""),
   currentStep: integer("current_step").notNull().default(1),
   totalSteps: integer("total_steps").notNull().default(1),

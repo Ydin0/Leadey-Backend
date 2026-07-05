@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, index, unique } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, index, unique, jsonb } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 /** A rep's connected calendar (Google Calendar / Outlook via Microsoft Graph),
@@ -50,6 +50,11 @@ export const calendarEvents = pgTable(
     organizerEmail: text("organizer_email"),
     /** Normalized lowercase attendee emails (incl. organizer). */
     attendeeEmails: text("attendee_emails").array().notNull().default([]),
+    /** Per-attendee RSVP keyed by normalized email: accepted | declined | tentative | needsAction. */
+    attendeeResponses: jsonb("attendee_responses")
+      .$type<Record<string, "accepted" | "declined" | "tentative" | "needsAction">>()
+      .notNull()
+      .default({}),
     status: text("status").notNull().default("confirmed"), // confirmed | cancelled
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

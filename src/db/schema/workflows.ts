@@ -2,9 +2,9 @@ import { pgTable, text, jsonb, timestamp, index } from "drizzle-orm/pg-core";
 import { funnels } from "./funnels";
 import { leads } from "./leads";
 
-/** A node in the workflow graph. `type` is one of the 16 builder block types
- *  (trigger/email/sms/linkedin/call/wait/waitevent/condition/abtest/status/tag/
- *  field/assign/webhook/goal/end). `data` holds the per-type config. */
+/** A node in the workflow graph. `type` is one of the 17 builder block types
+ *  (trigger/email/sms/whatsapp/linkedin/call/wait/waitevent/condition/abtest/
+ *  status/tag/field/assign/webhook/goal/end). `data` holds the per-type config. */
 export interface WorkflowNode {
   id: string;
   type: string;

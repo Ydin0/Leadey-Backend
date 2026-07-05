@@ -72,6 +72,8 @@ export async function getCalendarAccessToken(account: Account): Promise<string> 
   return next.access;
 }
 
+type RsvpStatus = "accepted" | "declined" | "tentative" | "needsAction";
+
 interface NormalizedEvent {
   providerEventId: string;
   title: string;
@@ -81,7 +83,22 @@ interface NormalizedEvent {
   location: string | null;
   organizerEmail: string | null;
   attendeeEmails: string[];
+  attendeeResponses: Record<string, RsvpStatus>;
   status: "confirmed" | "cancelled";
+}
+
+/** Google attendees[].responseStatus: needsAction | declined | tentative | accepted. */
+function googleRsvp(s: string | undefined): RsvpStatus {
+  if (s === "accepted" || s === "declined" || s === "tentative") return s;
+  return "needsAction";
+}
+
+/** Microsoft attendees[].status.response: none | organizer | tentativelyAccepted | accepted | declined | notResponded. */
+function microsoftRsvp(s: string | undefined): RsvpStatus {
+  if (s === "accepted" || s === "organizer") return "accepted";
+  if (s === "declined") return "declined";
+  if (s === "tentativelyAccepted") return "tentative";
+  return "needsAction";
 }
 
 async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
@@ -104,9 +121,17 @@ async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
     const data = await res.json().catch(() => null);
     if (!res.ok) throw new Error(`Google calendar fetch failed: ${data?.error?.message || res.status}`);
     for (const ev of data.items || []) {
-      const attendees = (ev.attendees || []).map((a: any) => norm(a.email)).filter(Boolean);
+      const responses: Record<string, RsvpStatus> = {};
+      for (const a of ev.attendees || []) {
+        const email = norm(a.email);
+        if (email) responses[email] = a.organizer ? "accepted" : googleRsvp(a.responseStatus);
+      }
+      const attendees = Object.keys(responses);
       const organizer = norm(ev.organizer?.email);
-      if (organizer && !attendees.includes(organizer)) attendees.push(organizer);
+      if (organizer && !attendees.includes(organizer)) {
+        attendees.push(organizer);
+        responses[organizer] = "accepted";
+      }
       out.push({
         providerEventId: String(ev.id),
         title: ev.summary || "(no title)",
@@ -116,6 +141,7 @@ async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
         location: ev.location || null,
         organizerEmail: organizer || null,
         attendeeEmails: attendees,
+        attendeeResponses: responses,
         status: ev.status === "cancelled" ? "cancelled" : "confirmed",
       });
     }
@@ -137,9 +163,17 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
     const data: any = await res.json().catch(() => null);
     if (!res.ok) throw new Error(`Microsoft calendar fetch failed: ${data?.error?.message || res.status}`);
     for (const ev of data.value || []) {
-      const attendees = (ev.attendees || []).map((a: any) => norm(a.emailAddress?.address)).filter(Boolean);
+      const responses: Record<string, RsvpStatus> = {};
+      for (const a of ev.attendees || []) {
+        const email = norm(a.emailAddress?.address);
+        if (email) responses[email] = microsoftRsvp(a.status?.response);
+      }
+      const attendees = Object.keys(responses);
       const organizer = norm(ev.organizer?.emailAddress?.address);
-      if (organizer && !attendees.includes(organizer)) attendees.push(organizer);
+      if (organizer && !attendees.includes(organizer)) {
+        attendees.push(organizer);
+        responses[organizer] = "accepted";
+      }
       out.push({
         providerEventId: String(ev.id),
         title: ev.subject || "(no title)",
@@ -149,6 +183,7 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
         location: ev.location?.displayName || null,
         organizerEmail: organizer || null,
         attendeeEmails: attendees,
+        attendeeResponses: responses,
         status: ev.isCancelled ? "cancelled" : "confirmed",
       });
     }
@@ -178,6 +213,7 @@ export async function syncAccount(account: Account): Promise<void> {
       location: ev.location,
       organizerEmail: ev.organizerEmail,
       attendeeEmails: ev.attendeeEmails,
+      attendeeResponses: ev.attendeeResponses,
       status: ev.status,
       updatedAt: now,
     };
