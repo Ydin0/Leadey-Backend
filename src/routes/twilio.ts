@@ -406,12 +406,43 @@ webhookRouter.post(
       const { leads, leadEvents } = await import("../db/schema/leads");
       const { funnels } = await import("../db/schema/funnels");
       const { smsMessages } = await import("../db/schema/sms");
-      const { eq: e, and: a, desc: d } = await import("drizzle-orm");
+      const { eq: e, and: a, desc: d, inArray: inArray2 } = await import("drizzle-orm");
       const { createId, phoneKey } = await import("../lib/helpers");
       const { createNotification } = await import("./notifications");
 
       // Which org owns the number that was messaged?
       const toDigits = to.replace(/\D/g, "");
+
+      // Hands-free WhatsApp sender verification: Meta texts an OTP (plain SMS)
+      // to the number being registered — a Twilio number, so it lands here.
+      // If that number has a pending registration, extract the code and submit
+      // it to the Senders API automatically. Guarded by the pending-sender
+      // match, so ordinary texts containing digits never trigger this.
+      if (!isWhatsapp) {
+        try {
+          const pendings = await db
+            .select()
+            .from(whatsappSenders)
+            .where(inArray2(whatsappSenders.status, ["pending_verification", "verifying", "creating"]));
+          const pending = pendings.find((s) => s.number.replace(/\D/g, "") === toDigits);
+          const code = pending ? body.match(/(\d{3})[-\s]?(\d{3})/) : null;
+          if (pending && code) {
+            await client.messaging.v2.channelsSenders(pending.senderSid).update({
+              configuration: { verificationCode: `${code[1]}${code[2]}` },
+            });
+            const fresh = await client.messaging.v2.channelsSenders(pending.senderSid).fetch();
+            const status = (fresh.status || "").toLowerCase().replace("online:updating", "online") || pending.status;
+            await db
+              .update(whatsappSenders)
+              .set({ status, lastError: null, updatedAt: new Date() })
+              .where(e(whatsappSenders.id, pending.id));
+            console.log(`[whatsapp] auto-verified sender ${pending.number} → ${status}`);
+          }
+        } catch (err) {
+          console.warn("[whatsapp] auto-verification failed (code can be entered manually):", err instanceof Error ? err.message : err);
+        }
+      }
+
       const allLines = await db
         .select({ id: phoneLines.id, number: phoneLines.number, organizationId: phoneLines.organizationId, assignedTo: phoneLines.assignedTo })
         .from(phoneLines);

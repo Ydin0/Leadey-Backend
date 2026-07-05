@@ -7,7 +7,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { phoneLines } from "../db/schema/phone-lines";
 import { whatsappSenders } from "../db/schema/whatsapp";
-import { users } from "../db/schema/organizations";
+import { users, organizations } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { getSetting, upsertSetting } from "../lib/settings-service";
@@ -19,6 +19,16 @@ import {
 } from "../services/whatsapp-sender";
 
 const WABA_SETTING_KEY = "whatsapp_waba_id";
+
+/** The WhatsApp Business Account senders are registered under. We run a
+ *  white-label platform WABA (env TWILIO_WHATSAPP_WABA_ID — one-time Meta
+ *  Embedded Signup done by US in the Twilio Console), so customers never
+ *  touch Twilio/Meta. A per-org setting can override it for orgs that bring
+ *  their own WABA. */
+async function resolveWabaId(orgId: string): Promise<string> {
+  const orgWaba = (await getSetting(orgId, WABA_SETTING_KEY))?.trim();
+  return orgWaba || process.env.TWILIO_WHATSAPP_WABA_ID?.trim() || "";
+}
 
 const router = Router();
 const client = twilioSdk(
@@ -61,9 +71,15 @@ router.get(
   "/whatsapp/settings",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+    const orgWaba = (await getSetting(orgId, WABA_SETTING_KEY)) || "";
+    const platformWabaConfigured = !!process.env.TWILIO_WHATSAPP_WABA_ID?.trim();
     res.json({
       data: {
-        wabaId: (await getSetting(orgId, WABA_SETTING_KEY)) || "",
+        wabaId: orgWaba,
+        /** Registration is possible (org override or the platform WABA). */
+        wabaConfigured: !!orgWaba.trim() || platformWabaConfigured,
+        /** Platform-managed — the UI hides the WABA card entirely. */
+        platformWabaConfigured,
         sandbox: !!sandboxNumber(),
         sandboxNumber: sandboxNumber(),
       },
@@ -107,9 +123,9 @@ router.post(
     const displayName = String(req.body?.displayName || "").trim();
     if (!lineId) throw new ApiError(400, "lineId is required");
 
-    const wabaId = (await getSetting(orgId, WABA_SETTING_KEY))?.trim();
+    const wabaId = await resolveWabaId(orgId);
     if (!wabaId) {
-      throw new ApiError(400, "Set your WhatsApp Business Account ID first (Settings → WhatsApp)");
+      throw new ApiError(400, "WhatsApp isn't configured on this platform yet — please contact support");
     }
 
     const [line] = await db
@@ -125,13 +141,22 @@ router.post(
       .where(eq(whatsappSenders.number, line.number));
     if (existing) throw new ApiError(409, "This number is already registered as a WhatsApp sender");
 
+    // Meta shows the profile name on WhatsApp and reviews it — the org's real
+    // business name is the sensible default, not the line's internal label.
+    const [org] = await db
+      .select({ name: organizations.name })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+
     const base = process.env.WEBHOOK_BASE_URL;
     let created;
     try {
       created = await client.messaging.v2.channelsSenders.create({
         senderId: `whatsapp:${line.number}`,
-        configuration: { wabaId },
-        profile: { name: displayName || line.friendlyName || line.number },
+        // OTP via SMS: the code lands on our own inbound webhook (it's a
+        // Twilio number), where it's captured and submitted automatically.
+        configuration: { wabaId, verificationMethod: "sms" },
+        profile: { name: displayName || org?.name || line.friendlyName || line.number },
         ...(base
           ? { webhook: { callbackUrl: `${base}/webhooks/twilio/sms`, callbackMethod: "POST" } }
           : {}),
