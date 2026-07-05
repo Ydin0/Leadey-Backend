@@ -8,6 +8,8 @@ import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, dedupeKey } from "../lib/helpers";
 import { buildLeadFilterWhere, decodeFilterParam } from "../lib/lead-filter";
+import { createTtlCache } from "../lib/ttl-cache";
+import { getCustomFieldsForLeads, type LeadCustomField } from "../lib/custom-fields-service";
 
 const router = Router();
 
@@ -95,13 +97,45 @@ function serializeLead(r: typeof leads.$inferSelect & { funnelName?: string | nu
   };
 }
 
+/** Full-fat serialization for the org-wide leads TABLE — everything the shared
+ *  campaign lead table renders (sequence position, firmographics, custom
+ *  fields, extras). Events stay out; activity counts arrive deferred via
+ *  GET /leads/activity-counts. */
+function serializeLeadFull(
+  r: typeof leads.$inferSelect & { funnelName?: string | null },
+  customFields: LeadCustomField[],
+) {
+  return {
+    ...serializeLead(r),
+    personId: r.masterContactId ?? null,
+    firstName: r.firstName,
+    lastName: r.lastName,
+    extraEmails: r.extraEmails ?? [],
+    extraPhones: r.extraPhones ?? [],
+    currentStep: r.currentStep,
+    totalSteps: r.totalSteps,
+    nextAction: r.nextAction,
+    nextDate: r.nextDate ? r.nextDate.toISOString() : null,
+    companyDescription: r.companyDescription,
+    companyLinkedin: r.companyLinkedin,
+    companyAnnualRevenue: r.companyAnnualRevenue,
+    companyHiringRoles: r.companyHiringRoles,
+    notes: r.notes,
+    customFields,
+  };
+}
+
+/** Hard ceiling for the load-all org table — beyond this the response flags
+ *  `truncated` and the UI tells the user to refine/export. */
+const ALL_LEADS_CAP = 20_000;
+
 // ─── GET /leads — every campaign lead across the org, filtered + paginated ──
+// `all=1` switches to the load-all mode that feeds the org leads TABLE: full
+// lead shape (see serializeLeadFull), newest first, capped at ALL_LEADS_CAP.
 router.get(
   "/leads",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 50));
     const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
 
     const [{ total }] = await db
@@ -110,6 +144,32 @@ router.get(
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(and(...conds));
 
+    if (truthy(req.query.all)) {
+      const rows = await db
+        .select({ lead: leads, funnelName: funnels.name })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(...conds))
+        .orderBy(desc(leads.createdAt))
+        .limit(ALL_LEADS_CAP);
+
+      // Custom field values in bounded chunks (org tables can be large).
+      const cfByLead = new Map<string, LeadCustomField[]>();
+      const ids = rows.map((r) => r.lead.id);
+      for (let i = 0; i < ids.length; i += 5000) {
+        const part = await getCustomFieldsForLeads(ids.slice(i, i + 5000));
+        for (const [k, v] of part) cfByLead.set(k, v);
+      }
+
+      res.json({
+        data: rows.map((r) => serializeLeadFull({ ...r.lead, funnelName: r.funnelName }, cfByLead.get(r.lead.id) ?? [])),
+        meta: { totalCount: Number(total), truncated: Number(total) > ALL_LEADS_CAP },
+      });
+      return;
+    }
+
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 50));
     const rows = await db
       .select({ lead: leads, funnelName: funnels.name })
       .from(leads)
@@ -123,6 +183,89 @@ router.get(
       data: rows.map((r) => serializeLead({ ...r.lead, funnelName: r.funnelName })),
       meta: { page, pageSize, totalCount: Number(total), totalPages: Math.ceil(Number(total) / pageSize) },
     });
+  }),
+);
+
+// ─── GET /leads/activity-counts — per-lead call/email totals, org-wide ──────
+// Same semantics as the per-funnel deferred endpoint (api.ts): calls = MAX of
+// the telephony log (matched by phone digits) and logged call events; emails
+// from events. Aggregated org-wide (the org table IS the full set, so there is
+// no key list to scope by) and cached for 60s per org.
+const orgActivityCache = createTtlCache<Record<string, { calls: number; emails: number }>>(60_000);
+
+router.get(
+  "/leads/activity-counts",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const cached = orgActivityCache.get(orgId);
+    if (cached) {
+      res.json({ data: { counts: cached } });
+      return;
+    }
+
+    const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
+    const toDigits = sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`;
+    const fromDigits = sql`regexp_replace(${callRecords.fromNumber}, '[^0-9]', '', 'g')`;
+
+    const [orgLeads, outRows, inRows, eventRows] = await Promise.all([
+      db
+        .select({ id: leads.id, phone: leads.phone, email: leads.email })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(eq(funnels.organizationId, orgId)),
+      db
+        .select({ phone: sql<string>`${toDigits}`, n: sql<number>`count(*)::int` })
+        .from(callRecords)
+        .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
+        .groupBy(toDigits),
+      db
+        .select({ phone: sql<string>`${fromDigits}`, n: sql<number>`count(*)::int` })
+        .from(callRecords)
+        .where(and(eq(callRecords.organizationId, orgId), sql`${callRecords.direction} <> 'outbound'`))
+        .groupBy(fromDigits),
+      db
+        .select({
+          leadId: leadEvents.leadId,
+          calls: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
+          emails: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+        })
+        .from(leadEvents)
+        .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(eq(funnels.organizationId, orgId))
+        .groupBy(leadEvents.leadId),
+    ]);
+
+    const callsByPhone = new Map<string, number>();
+    for (const r of [...outRows, ...inRows]) {
+      if (r.phone) callsByPhone.set(r.phone, (callsByPhone.get(r.phone) ?? 0) + Number(r.n));
+    }
+
+    // Event totals per person key: the same person appears in several
+    // campaigns, so counts roll up by phone/email across all their rows.
+    const evByLead = new Map(eventRows.map((r) => [r.leadId, r]));
+    const evCallsByPhone = new Map<string, number>();
+    const evEmailsByAddr = new Map<string, number>();
+    for (const l of orgLeads) {
+      const ev = evByLead.get(l.id);
+      if (!ev) continue;
+      const p = normPhone(l.phone);
+      const e = (l.email || "").toLowerCase();
+      if (p.length > 5) evCallsByPhone.set(p, (evCallsByPhone.get(p) ?? 0) + ev.calls);
+      if (e) evEmailsByAddr.set(e, (evEmailsByAddr.get(e) ?? 0) + ev.emails);
+    }
+
+    const counts: Record<string, { calls: number; emails: number }> = {};
+    for (const l of orgLeads) {
+      const p = normPhone(l.phone);
+      const e = (l.email || "").toLowerCase();
+      const calls = Math.max(p.length > 5 ? callsByPhone.get(p) ?? 0 : 0, evCallsByPhone.get(p) ?? 0);
+      const emails = evEmailsByAddr.get(e) ?? 0;
+      if (calls || emails) counts[l.id] = { calls, emails };
+    }
+
+    orgActivityCache.set(orgId, counts);
+    res.json({ data: { counts } });
   }),
 );
 

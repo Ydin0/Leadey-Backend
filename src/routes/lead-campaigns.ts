@@ -1,10 +1,10 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/index";
-import { leads } from "../db/schema/leads";
+import { leads, leadEvents } from "../db/schema/leads";
 import { funnels, funnelSteps } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
-import { ApiError, createId, phoneKey } from "../lib/helpers";
+import { ApiError, createId, dedupeKey, phoneKey } from "../lib/helpers";
 import { fireTrigger } from "../services/workflow-engine";
 
 const router = Router();
@@ -200,6 +200,157 @@ router.post(
 
     const refreshed = await findMemberships(orgId, base);
     res.status(201).json({ data: refreshed.map((m) => serialize(m, base.id)) });
+  }),
+);
+
+// ─── POST /funnels/:funnelId/leads/bulk-add — add MANY org leads at once ────
+// The org-wide Leads page's "add selection to campaign": clones each selected
+// lead into the target campaign, skipping people who are already in it
+// (person identity: master contact id, else email / phone last-9 / LinkedIn).
+// Body: { leadIds: string[] }. Returns { added, skipped }.
+router.post(
+  "/funnels/:funnelId/leads/bulk-add",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = String(req.params.funnelId);
+    const leadIds = Array.isArray(req.body?.leadIds)
+      ? (req.body.leadIds as unknown[]).map(String).filter(Boolean)
+      : [];
+    if (leadIds.length === 0) throw new ApiError(400, "leadIds is required");
+
+    const [target] = await db
+      .select({ id: funnels.id })
+      .from(funnels)
+      .where(and(eq(funnels.id, funnelId), eq(funnels.organizationId, orgId)))
+      .limit(1);
+    if (!target) throw new ApiError(404, "Target campaign not found");
+
+    const steps = await db
+      .select({ id: funnelSteps.id })
+      .from(funnelSteps)
+      .where(eq(funnelSteps.funnelId, funnelId));
+
+    // Source rows (org-scoped), fetched in bounded chunks.
+    const sourceRows: (typeof leads.$inferSelect)[] = [];
+    for (let i = 0; i < leadIds.length; i += 5000) {
+      const rows = await db
+        .select({ lead: leads })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(eq(funnels.organizationId, orgId), inArray(leads.id, leadIds.slice(i, i + 5000))));
+      sourceRows.push(...rows.map((r) => r.lead));
+    }
+    if (sourceRows.length === 0) throw new ApiError(400, "No matching leads found");
+
+    // Person-identity keys already present in the TARGET campaign — one query,
+    // not a per-lead findMemberships round-trip.
+    const targetRows = await db
+      .select({
+        masterContactId: leads.masterContactId,
+        email: leads.email,
+        phone: leads.phone,
+        linkedinUrl: leads.linkedinUrl,
+      })
+      .from(leads)
+      .where(eq(leads.funnelId, funnelId));
+    const taken = new Set<string>();
+    const keysOf = (l: { masterContactId?: string | null; email: string; phone: string; linkedinUrl: string }) => {
+      const keys: string[] = [];
+      if (l.masterContactId) keys.push(`mc:${l.masterContactId}`);
+      const email = (l.email || "").trim().toLowerCase();
+      if (email) keys.push(`em:${email}`);
+      const phone = phoneKey(l.phone);
+      if (phone) keys.push(`ph:${phone}`);
+      const li = linkedinKey(l.linkedinUrl);
+      if (li) keys.push(`li:${li}`);
+      return keys;
+    };
+    for (const t of targetRows) for (const k of keysOf(t)) taken.add(k);
+
+    // Resolve canonical person/company for rows that predate the backfill so
+    // dedupe and the copies are identity-linked.
+    const { resolvePersonsBulk } = await import("../lib/person-resolve");
+    const unlinked = sourceRows.filter((l) => !l.masterContactId);
+    const resolvedIds = await resolvePersonsBulk(orgId, unlinked).catch(() => unlinked.map(() => null));
+    const resolvedByRow = new Map(unlinked.map((l, i) => [l.id, resolvedIds[i]]));
+
+    const { resolveCompaniesForLeadsBulk } = await import("../lib/master-db");
+    const companyUnlinked = sourceRows.filter((l) => !l.masterCompanyId);
+    const companyIds = await resolveCompaniesForLeadsBulk(orgId, companyUnlinked).catch(() => companyUnlinked.map(() => null));
+    const companyByRow = new Map(companyUnlinked.map((l, i) => [l.id, companyIds[i]]));
+
+    // Skip anyone already in the target, and dedupe the selection itself (the
+    // same person may be selected from several campaigns). Key-less rows fall
+    // back to name+company+email.
+    const toInsert: (typeof leads.$inferSelect)[] = [];
+    let skipped = 0;
+    for (const l of sourceRows) {
+      const withPerson = { ...l, masterContactId: l.masterContactId ?? resolvedByRow.get(l.id) ?? null };
+      const keys = keysOf(withPerson);
+      if (keys.length === 0) keys.push(`dk:${dedupeKey(l.name, l.company, l.email)}`);
+      if (keys.some((k) => taken.has(k))) {
+        skipped++;
+        continue;
+      }
+      for (const k of keys) taken.add(k);
+      toInsert.push(withPerson);
+    }
+
+    const now = new Date();
+    const newLeads = toInsert.map((l) => ({
+      id: createId("lead"),
+      funnelId,
+      masterContactId: l.masterContactId,
+      masterCompanyId: l.masterCompanyId ?? companyByRow.get(l.id) ?? null,
+      name: l.name,
+      firstName: l.firstName,
+      lastName: l.lastName,
+      title: l.title,
+      company: l.company,
+      email: l.email,
+      phone: l.phone,
+      linkedinUrl: l.linkedinUrl,
+      source: "Added from Leads",
+      sourceType: "manual",
+      status: "pending",
+      currentStep: 1,
+      totalSteps: steps.length || 1,
+      score: l.score,
+      companyDomain: l.companyDomain,
+      companyIndustry: l.companyIndustry,
+      companyEmployeeCount: l.companyEmployeeCount,
+      companyLocation: l.companyLocation,
+      companyDescription: l.companyDescription,
+      companyLinkedin: l.companyLinkedin,
+      companyAnnualRevenue: l.companyAnnualRevenue,
+      companyHiringRoles: l.companyHiringRoles,
+      doNotCall: l.doNotCall,
+      createdAt: now,
+      updatedAt: now,
+    }));
+    const CHUNK = 500;
+    for (let i = 0; i < newLeads.length; i += CHUNK) {
+      await db.insert(leads).values(newLeads.slice(i, i + CHUNK));
+    }
+    const events = newLeads.map((l) => ({
+      id: createId("le"),
+      leadId: l.id,
+      type: "imported",
+      outcome: null,
+      stepIndex: 0,
+      meta: { source: "leads-bulk-add" },
+      timestamp: now,
+    }));
+    for (let i = 0; i < events.length; i += CHUNK) {
+      await db.insert(leadEvents).values(events.slice(i, i + CHUNK));
+    }
+
+    // One batched enrollment into any "lead enters campaign" workflows.
+    if (newLeads.length > 0) {
+      void fireTrigger(orgId, funnelId, newLeads.map((l) => l.id), "lead_enters_campaign");
+    }
+
+    res.status(201).json({ data: { added: newLeads.length, skipped } });
   }),
 );
 
