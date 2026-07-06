@@ -35,6 +35,23 @@ export const pipelines = pgTable(
   (t) => [unique().on(t.organizationId, t.name)],
 );
 
+/** Who can work a pipeline. Mirrors funnel_members: admins/managers see all
+ *  pipelines; a member scoped to "assigned" opportunities sees pipelines they
+ *  belong to (plus opps they own). */
+export const pipelineMembers = pgTable(
+  "pipeline_members",
+  {
+    id: text("id").primaryKey(),
+    pipelineId: text("pipeline_id")
+      .notNull()
+      .references(() => pipelines.id, { onDelete: "cascade" }),
+    userId: text("user_id").notNull(),
+    role: text("role").notNull().default("contributor"), // "owner" | "contributor" | "viewer"
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [unique().on(t.pipelineId, t.userId), index("pipeline_members_user_idx").on(t.userId)],
+);
+
 /** Stages within a pipeline. `type` drives terminal semantics — `won`
  *  and `lost` stages set `opportunities.closedAt` on transition.
  *  `defaultProbability` is 0-100; an opportunity may override per-row.

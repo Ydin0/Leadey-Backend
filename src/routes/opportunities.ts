@@ -5,6 +5,7 @@ import { db } from "../db";
 import {
   pipelines,
   pipelineStages,
+  pipelineMembers,
   opportunities,
   opportunityContacts,
   opportunityEvents,
@@ -62,6 +63,22 @@ function serializePipeline(p: typeof pipelines.$inferSelect) {
     isDefault: p.isDefault,
     sortOrder: p.sortOrder,
     createdAt: p.createdAt.toISOString(),
+  };
+}
+
+function serializePipelineMember(
+  m: typeof pipelineMembers.$inferSelect,
+  u?: typeof users.$inferSelect,
+) {
+  return {
+    id: m.id,
+    userId: m.userId,
+    role: m.role,
+    email: u?.email ?? null,
+    firstName: u?.firstName ?? null,
+    lastName: u?.lastName ?? null,
+    imageUrl: u?.imageUrl ?? null,
+    createdAt: m.createdAt.toISOString(),
   };
 }
 
@@ -185,13 +202,113 @@ router.get(
           .groupBy(opportunities.pipelineId)
       : [];
     const countByPipeline = new Map(counts.map((c) => [c.pipelineId, Number(c.count)]));
+
+    // Members per pipeline, enriched with the user's name/avatar in one lookup.
+    const memberRows = pipelineIds.length
+      ? await db.select().from(pipelineMembers).where(inArray(pipelineMembers.pipelineId, pipelineIds))
+      : [];
+    const memberUserIds = [...new Set(memberRows.map((m) => m.userId))];
+    const userById = new Map(
+      memberUserIds.length
+        ? (await db.select().from(users).where(inArray(users.id, memberUserIds))).map((u) => [u.id, u])
+        : [],
+    );
+    const membersByPipeline = new Map<string, ReturnType<typeof serializePipelineMember>[]>();
+    for (const m of memberRows) {
+      const arr = membersByPipeline.get(m.pipelineId) || [];
+      arr.push(serializePipelineMember(m, userById.get(m.userId)));
+      membersByPipeline.set(m.pipelineId, arr);
+    }
+
     res.json({
       data: rows.map((p) => ({
         ...serializePipeline(p),
         opportunityCount: countByPipeline.get(p.id) || 0,
         stages: (byPipeline.get(p.id) || []).map(serializeStage),
+        members: membersByPipeline.get(p.id) || [],
       })),
     });
+  }),
+);
+
+// ─── Pipeline members ─────────────────────────────────────────────────
+async function assertPipelineInOrg(orgId: string, pipelineId: string) {
+  const [p] = await db
+    .select({ id: pipelines.id })
+    .from(pipelines)
+    .where(and(eq(pipelines.id, pipelineId), eq(pipelines.organizationId, orgId)));
+  if (!p) throw new ApiError(404, "Pipeline not found");
+}
+
+router.get(
+  "/pipelines/:id/members",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const pipelineId = req.params.id as string;
+    await assertPipelineInOrg(orgId, pipelineId);
+    const rows = await db.select().from(pipelineMembers).where(eq(pipelineMembers.pipelineId, pipelineId));
+    const ids = [...new Set(rows.map((m) => m.userId))];
+    const byId = new Map(
+      ids.length ? (await db.select().from(users).where(inArray(users.id, ids))).map((u) => [u.id, u]) : [],
+    );
+    res.json({ data: rows.map((m) => serializePipelineMember(m, byId.get(m.userId))) });
+  }),
+);
+
+router.post(
+  "/pipelines/:id/members",
+  requirePerm("opportunities.managePipelines"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const pipelineId = req.params.id as string;
+    await assertPipelineInOrg(orgId, pipelineId);
+    const userId = String(req.body?.userId || "");
+    const role = String(req.body?.role || "contributor");
+    if (!userId) throw new ApiError(400, "userId is required");
+    // Must be an org member.
+    const [u] = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+    if (!u) throw new ApiError(400, "User is not a member of this organization");
+    const [existing] = await db
+      .select({ id: pipelineMembers.id })
+      .from(pipelineMembers)
+      .where(and(eq(pipelineMembers.pipelineId, pipelineId), eq(pipelineMembers.userId, userId)));
+    if (existing) throw new ApiError(409, "Already a member of this pipeline");
+    const row = { id: createId("pm"), pipelineId, userId, role, createdAt: new Date() };
+    await db.insert(pipelineMembers).values(row);
+    res.status(201).json({ data: serializePipelineMember(row, u) });
+  }),
+);
+
+router.patch(
+  "/pipelines/:id/members/:userId",
+  requirePerm("opportunities.managePipelines"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const pipelineId = req.params.id as string;
+    await assertPipelineInOrg(orgId, pipelineId);
+    const role = String(req.body?.role || "contributor");
+    await db
+      .update(pipelineMembers)
+      .set({ role })
+      .where(and(eq(pipelineMembers.pipelineId, pipelineId), eq(pipelineMembers.userId, req.params.userId as string)));
+    res.json({ data: { userId: req.params.userId, role } });
+  }),
+);
+
+router.delete(
+  "/pipelines/:id/members/:userId",
+  requirePerm("opportunities.managePipelines"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const pipelineId = req.params.id as string;
+    await assertPipelineInOrg(orgId, pipelineId);
+    await db
+      .delete(pipelineMembers)
+      .where(and(eq(pipelineMembers.pipelineId, pipelineId), eq(pipelineMembers.userId, req.params.userId as string)));
+    res.json({ data: { userId: req.params.userId, removed: true } });
   }),
 );
 
@@ -585,7 +702,18 @@ router.get(
     if (pipelineId) conditions.push(eq(opportunities.pipelineId, pipelineId));
     if (stageId) conditions.push(eq(opportunities.stageId, stageId));
     if (oppScope === "assigned") {
-      conditions.push(eq(opportunities.ownerId, getUserId(req)));
+      // Own deals OR deals in a pipeline this user is a member of.
+      const me = getUserId(req);
+      const myPipelines = await db
+        .select({ pipelineId: pipelineMembers.pipelineId })
+        .from(pipelineMembers)
+        .where(eq(pipelineMembers.userId, me));
+      const ids = myPipelines.map((p) => p.pipelineId);
+      conditions.push(
+        ids.length
+          ? or(eq(opportunities.ownerId, me), inArray(opportunities.pipelineId, ids))!
+          : eq(opportunities.ownerId, me),
+      );
     } else if (ownerId) {
       // ownerId may be a single id or a comma-separated list (multi-select).
       const ownerIds = ownerId.split(",").map((s) => s.trim()).filter(Boolean);
@@ -778,11 +906,17 @@ router.get(
       .where(and(eq(opportunities.id, id), eq(opportunities.organizationId, orgId)));
     if (!opp) throw new ApiError(404, "Opportunity not found");
 
-    // Visibility: "none" can't open any; "assigned" can only open their own.
+    // Visibility: "none" can't open any; "assigned" can open their own deals
+    // or any deal in a pipeline they're a member of.
     const perms = await getPerms(req);
     const oppScope = scopeOf(perms.permissions, "opportunities.view");
-    if (oppScope === "none" || (oppScope === "assigned" && opp.ownerId !== getUserId(req))) {
-      throw new ApiError(404, "Opportunity not found");
+    if (oppScope === "none") throw new ApiError(404, "Opportunity not found");
+    if (oppScope === "assigned" && opp.ownerId !== getUserId(req)) {
+      const [member] = await db
+        .select({ id: pipelineMembers.id })
+        .from(pipelineMembers)
+        .where(and(eq(pipelineMembers.pipelineId, opp.pipelineId), eq(pipelineMembers.userId, getUserId(req))));
+      if (!member) throw new ApiError(404, "Opportunity not found");
     }
 
     // Join company + primary contact + additional contacts

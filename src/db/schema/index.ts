@@ -37,6 +37,7 @@ export {
 export {
   pipelines,
   pipelineStages,
+  pipelineMembers,
   opportunities,
   opportunityContacts,
   opportunityEvents,
