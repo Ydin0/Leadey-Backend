@@ -2346,6 +2346,30 @@ router.post(
     const linkedinUrl = normalizeString(body.linkedinUrl as string);
 
     const masterContactId = await resolvePerson(orgId, { name, title, company, email, phone, linkedinUrl });
+
+    // Dedupe against this campaign: the same PERSON must not enrol twice.
+    // Match on the resolved master contact, else the import's email-first key
+    // (so "Add contact"/individual-add can't recreate a row a CSV already made).
+    // Returns the existing lead's profile with alreadyExists:true rather than
+    // inserting a duplicate.
+    const dupe = funnel.leads.find((l) =>
+      (masterContactId && l.masterContactId === masterContactId) ||
+      dedupeKey(l.name, l.company, l.email) === dedupeKey(name, company, email),
+    );
+    if (dupe) {
+      const refreshed = getFunnelOrThrow(
+        await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: dupe.id }),
+        funnel.id,
+      );
+      res.status(200).json({
+        data: {
+          leadId: dupe.id,
+          alreadyExists: true,
+          funnel: buildFunnelPayload(refreshed, { includeLeads: true, fullLeadId: dupe.id }),
+        },
+      });
+      return;
+    }
     const masterCompanyId = await resolveCompanyForLead(orgId, {
       company,
       companyDomain: domainFromEmail(email) || null,
