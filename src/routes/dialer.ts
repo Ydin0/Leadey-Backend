@@ -613,58 +613,37 @@ router.post(
       respectTimezone: filters?.respectTimezone ?? false,
     };
 
-    // Resolve the target. Two modes:
-    //   1. Step mode — a call-channel step; queue leads sitting on that step.
-    //   2. Campaign mode — no call step; queue every lead in the funnel that
-    //      has a phone number, regardless of which step they're on.
-    let sessionStepId: string | null = null;
-    let sessionFunnelId: string;
-    let candidateLeads: (typeof leads.$inferSelect)[];
-
-    if (funnelStepId) {
+    // The dialer is CAMPAIGN-scoped only — it is intentionally NOT linked to
+    // sequence steps. Starting it queues every lead in the campaign that has a
+    // phone number, regardless of which step they're on. (A legacy client may
+    // still send funnelStepId; we resolve its campaign and otherwise ignore it,
+    // storing no step link so nothing ties calls to the sequence.)
+    const sessionStepId: string | null = null;
+    let targetFunnelId = funnelId || "";
+    if (!targetFunnelId && funnelStepId) {
       const [step] = await db
-        .select({ id: funnelSteps.id, channel: funnelSteps.channel, funnelId: funnelSteps.funnelId, sortOrder: funnelSteps.sortOrder })
+        .select({ funnelId: funnelSteps.funnelId })
         .from(funnelSteps)
         .innerJoin(funnels, eq(funnels.id, funnelSteps.funnelId))
         .where(and(eq(funnelSteps.id, funnelStepId), eq(funnels.organizationId, orgId)));
-      if (!step) throw new ApiError(404, "Funnel step not found");
-      if (step.channel !== "call") {
-        throw new ApiError(400, `Dialer requires a call-channel step (got ${step.channel})`);
-      }
-      if (!canDialFunnel(step.funnelId)) throw new ApiError(403, "You don't have access to this campaign");
-      sessionStepId = step.id;
-      sessionFunnelId = step.funnelId;
-
-      // Leads on this step (currentStep is 1-indexed) with a phone.
-      const stepNumber = step.sortOrder + 1;
-      candidateLeads = await db
-        .select()
-        .from(leads)
-        .where(
-          and(
-            eq(leads.funnelId, step.funnelId),
-            eq(leads.currentStep, stepNumber),
-            sql`${leads.phone} <> ''`,
-          ),
-        )
-        .orderBy(asc(leads.createdAt));
-    } else {
-      // Campaign mode — verify the funnel belongs to the org.
-      const [funnel] = await db
-        .select({ id: funnels.id })
-        .from(funnels)
-        .where(and(eq(funnels.id, funnelId!), eq(funnels.organizationId, orgId)));
-      if (!funnel) throw new ApiError(404, "Campaign not found");
-      if (!canDialFunnel(funnel.id)) throw new ApiError(403, "You don't have access to this campaign");
-      sessionFunnelId = funnel.id;
-
-      // Every lead in the funnel with a phone number, any step.
-      candidateLeads = await db
-        .select()
-        .from(leads)
-        .where(and(eq(leads.funnelId, funnel.id), sql`${leads.phone} <> ''`))
-        .orderBy(asc(leads.createdAt));
+      if (!step) throw new ApiError(404, "Campaign not found");
+      targetFunnelId = step.funnelId;
     }
+
+    const [funnel] = await db
+      .select({ id: funnels.id })
+      .from(funnels)
+      .where(and(eq(funnels.id, targetFunnelId), eq(funnels.organizationId, orgId)));
+    if (!funnel) throw new ApiError(404, "Campaign not found");
+    if (!canDialFunnel(funnel.id)) throw new ApiError(403, "You don't have access to this campaign");
+    const sessionFunnelId = funnel.id;
+
+    // Every lead in the funnel with a phone number, any step.
+    const candidateLeads = await db
+      .select()
+      .from(leads)
+      .where(and(eq(leads.funnelId, funnel.id), sql`${leads.phone} <> ''`))
+      .orderBy(asc(leads.createdAt));
 
     // Canonical person link first (leads.master_contact_id, one indexed
     // fetch); the linkedin/email maps below remain as the fallback for rows
