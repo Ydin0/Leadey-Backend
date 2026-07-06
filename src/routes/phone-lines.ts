@@ -118,6 +118,23 @@ router.get(
       ]),
     );
 
+    // Self-heal: resolve display names for lines assigned to a user but missing
+    // the denormalized assignedToName (rows assigned before the name was stored
+    // server-side). One batched lookup.
+    const missingNameIds = [
+      ...new Set(lines.filter((l) => l.assignedTo && !l.assignedToName).map((l) => l.assignedTo as string)),
+    ];
+    const nameById = new Map<string, string>();
+    if (missingNameIds.length) {
+      const urows = await db
+        .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email })
+        .from(users)
+        .where(inArray(users.id, missingNameIds));
+      for (const u of urows) {
+        nameById.set(u.id, [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || "");
+      }
+    }
+
     const data = lines.map((line) => ({
       id: line.id,
       number: line.number,
@@ -127,7 +144,7 @@ router.get(
       type: line.type,
       status: line.status,
       assignedTo: line.assignedTo,
-      assignedToName: line.assignedToName,
+      assignedToName: line.assignedToName || (line.assignedTo ? nameById.get(line.assignedTo) || null : null),
       monthlyCost: line.monthlyCost,
       config: {
         voicemailGreeting: line.voicemailGreeting,
@@ -239,6 +256,26 @@ router.patch(
     for (const [bodyKey, colKey] of Object.entries(allowedFields)) {
       if (req.body[bodyKey] !== undefined) {
         updates[colKey] = req.body[bodyKey];
+      }
+    }
+
+    // Assignment: the client only sends the user id, so always derive the
+    // display name server-side (don't trust a client-sent name). Clearing the
+    // assignment clears the name too. This is why rows showed "Unassigned" in
+    // the table despite being assigned — assignedToName was never stored.
+    if (req.body.assignedTo !== undefined) {
+      const targetId = req.body.assignedTo ? String(req.body.assignedTo) : null;
+      if (targetId) {
+        const [u] = await db
+          .select({ firstName: users.firstName, lastName: users.lastName, email: users.email })
+          .from(users)
+          .where(eq(users.id, targetId))
+          .limit(1);
+        updates.assignedToName = u
+          ? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || null)
+          : null;
+      } else {
+        updates.assignedToName = null;
       }
     }
 
