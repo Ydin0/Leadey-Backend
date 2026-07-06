@@ -1260,6 +1260,33 @@ router.post(
       }
       return "";
     };
+
+    // Phone/email may map from SEVERAL columns (Work Direct / Mobile /
+    // Corporate / …). Collect every non-empty value across the mapped columns:
+    // the first becomes the primary phone/email, the rest are labeled extras
+    // (label derived from the column header). Strips Excel's text-guard
+    // apostrophe and pandas "nan"; de-dupes; caps extras at 10.
+    const cleanExtraLabel = (header: string, kind: "Phone" | "Email"): string =>
+      (header.replace(new RegExp(`\\s*${kind}\\s*$`, "i"), "").trim() || header).slice(0, 40);
+    const collectContacts = (
+      row: Record<string, unknown>,
+      labels: string[],
+      kind: "Phone" | "Email",
+    ): { primary: string; extras: { label: string; value: string }[] } => {
+      const hits: { label: string; value: string }[] = [];
+      const seen = new Set<string>();
+      for (const m of fieldMappings) {
+        if (!labels.includes(m.mappedField)) continue;
+        let v = normalizeString(row[m.csvColumn]).replace(/^'+/, "").trim();
+        if (kind === "Email") v = v.toLowerCase();
+        if (!v || v.toLowerCase() === "nan") continue;
+        const key = v.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        hits.push({ label: cleanExtraLabel(m.csvColumn, kind), value: v });
+      }
+      return { primary: hits[0]?.value || "", extras: hits.slice(1, 11) };
+    };
     const LBL = {
       name: ["Lead Name", "Name", "Full Name"],
       firstName: ["Lead First Name", "First Name", "Given Name"],
@@ -1318,7 +1345,7 @@ router.post(
     const now = Date.now();
     const importId = createId("import");
     const errors: Array<{ row: number; reason: string }> = [];
-    let importedRows = 0, skippedRows = 0, duplicateLeads = 0, invalidRows = 0;
+    let importedRows = 0, skippedRows = 0, duplicateLeads = 0, invalidRows = 0, extraContactRows = 0;
     const addedLeadIds: string[] = [];
     const newLeads: Array<typeof leads.$inferInsert> = [];
     // Each new lead's company aggregate, aligned by index — used to backfill
@@ -1340,7 +1367,8 @@ router.post(
       // the separate first/last columns so either mapping style works.
       let name = getField(row, LBL.name) || [firstName, lastName].filter(Boolean).join(" ");
       let cName = getField(row, LBL.cName);
-      const email = getField(row, LBL.email).toLowerCase();
+      const emailGroup = collectContacts(row, LBL.email, "Email");
+      const email = emailGroup.primary;
       const cDomainRaw = normalizeDomain(getField(row, LBL.cDomain)) || domainFromEmail(email);
 
       if (enrichMode) {
@@ -1448,7 +1476,8 @@ router.post(
       }
 
       const title = getField(row, LBL.title);
-      const phone = getField(row, LBL.phone);
+      const phoneGroup = collectContacts(row, LBL.phone, "Phone");
+      const phone = phoneGroup.primary;
       const linkedinUrl = getField(row, LBL.linkedin);
       const leadId = createId("lead");
       // Prefer the explicitly-mapped first/last; otherwise split the full name so
@@ -1456,8 +1485,10 @@ router.post(
       const nameParts = name.split(" ").filter(Boolean);
       const fnFinal = firstName || nameParts[0] || null;
       const lnFinal = lastName || nameParts.slice(1).join(" ") || null;
+      if (emailGroup.extras.length || phoneGroup.extras.length) extraContactRows += 1;
       newLeads.push({
         id: leadId, funnelId: funnel.id, importId, name, firstName: fnFinal, lastName: lnFinal, title, company: canonicalCompany, email, phone, linkedinUrl,
+        extraEmails: emailGroup.extras, extraPhones: phoneGroup.extras,
         currentStep: 1, totalSteps: funnel.steps.length, status: "pending",
         // Sequence-less campaigns have no first step — leads land workable
         // with no scheduled action instead of being rejected (or completed).
@@ -1503,7 +1534,7 @@ router.post(
     const existingCompanies = namedCompanies.filter((c) => c.existing).length;
     const newCompanies = namedCompanies.length - existingCompanies;
     const summary = {
-      totalRows: rows.length, importedRows, skippedRows, duplicateLeads, invalidRows,
+      totalRows: rows.length, importedRows, skippedRows, duplicateLeads, invalidRows, extraContactRows,
       companiesTotal: namedCompanies.length, existingCompanies, newCompanies, groupBy,
     };
 
