@@ -847,9 +847,17 @@ router.post(
     }
 
     if (queue.length === 0) {
+      // A campaign Smart View / filter with no matching leads is the most
+      // common cause of a mysteriously-empty queue — call it out explicitly.
+      if (filterWhere && candidateLeads.length === 0) {
+        throw new ApiError(
+          400,
+          "No leads match this campaign's active Smart View filter. Clear or change the filter on the campaign's leads list, then start the dialer again.",
+        );
+      }
       throw new ApiError(
         400,
-        `No dialable leads found. Excluded — DNC:${excludedDnc} closed:${excludedClosed} retry:${excludedRetry} recent:${excludedRecent} timezone:${excludedTimezone}`,
+        `No dialable leads found${filterWhere ? " (a Smart View filter is active on this campaign)" : ""}. Excluded — DNC:${excludedDnc} closed:${excludedClosed} retry:${excludedRetry} recent:${excludedRecent} timezone:${excludedTimezone}`,
       );
     }
 

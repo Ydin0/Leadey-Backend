@@ -24,7 +24,12 @@ const COL: Record<string, SQL> = {
   email: sql`${leads.email}`,
   phone: sql`${leads.phone}`,
   linkedinUrl: sql`${leads.linkedinUrl}`,
-  status: sql`${leads.status}`,
+  // The UI shows the DB default "pending" (and blank) as "new" (see the
+  // frontend's asLeadStatus). Filters are authored against that displayed
+  // value, so normalize the same way here — otherwise a "status is New"
+  // Smart View matches ZERO rows server-side (they're stored "pending"),
+  // which silently emptied the power-dialer queue.
+  status: sql`(case when coalesce(${leads.status}, '') in ('', 'pending') then 'new' else ${leads.status} end)`,
   source: sql`${leads.source}`,
   score: sql`${leads.score}`,
   companyDomain: sql`${leads.companyDomain}`,
