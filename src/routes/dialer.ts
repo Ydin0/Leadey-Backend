@@ -19,6 +19,7 @@ import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { getPerms, getVisibleFunnelIds } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
+import { buildLeadFilterWhere } from "../lib/lead-filter";
 import { seedSystemDispositions } from "../lib/dialer-seed";
 import { flagDoNotCall } from "../lib/dnc";
 import {
@@ -631,18 +632,26 @@ router.post(
     }
 
     const [funnel] = await db
-      .select({ id: funnels.id })
+      .select({ id: funnels.id, config: funnels.config })
       .from(funnels)
       .where(and(eq(funnels.id, targetFunnelId), eq(funnels.organizationId, orgId)));
     if (!funnel) throw new ApiError(404, "Campaign not found");
     if (!canDialFunnel(funnel.id)) throw new ApiError(403, "You don't have access to this campaign");
     const sessionFunnelId = funnel.id;
 
-    // Every lead in the funnel with a phone number, any step.
+    // Respect the campaign's active Smart View / filter: the leads table
+    // persists its selected FilterGroup to config.leadFilters, so the dialer
+    // queues exactly the same set the rep is looking at (or every phone-having
+    // lead when no filter is active). Derived fields (callCount, custom:*, …)
+    // are handled by the shared server-side evaluator.
+    const filterWhere = buildLeadFilterWhere(
+      (funnel.config as Record<string, unknown> | null)?.leadFilters,
+      { orgId },
+    );
     const candidateLeads = await db
       .select()
       .from(leads)
-      .where(and(eq(leads.funnelId, funnel.id), sql`${leads.phone} <> ''`))
+      .where(and(eq(leads.funnelId, funnel.id), sql`${leads.phone} <> ''`, ...(filterWhere ? [filterWhere] : [])))
       .orderBy(asc(leads.createdAt));
 
     // Canonical person link first (leads.master_contact_id, one indexed
