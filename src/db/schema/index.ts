@@ -17,6 +17,7 @@ export { calendarAccounts, calendarEvents } from "./calendar";
 export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";
 export { organizations, users } from "./organizations";
+export { orgRoles } from "./org-roles";
 export { phoneLines } from "./phone-lines";
 export { regulatoryBundles, bundleDocuments } from "./regulatory-bundles";
 export { callRecords } from "./call-records";

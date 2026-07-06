@@ -4,6 +4,7 @@ import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { apiKeys } from "../db/schema/api-keys";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
 import { generateApiKey, maskKey } from "../lib/api-keys";
 
@@ -46,6 +47,7 @@ router.get(
 // ─── POST /api/api-keys — create a key; returns the secret exactly once ───────
 router.post(
   "/api-keys",
+  requirePerm("settings.manageApiKeys"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const name = normalizeString((req.body || {}).name);
@@ -78,6 +80,7 @@ router.post(
 // ─── DELETE /api/api-keys/:id — soft-revoke an org key ────────────────────────
 router.delete(
   "/api-keys/:id",
+  requirePerm("settings.manageApiKeys"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;

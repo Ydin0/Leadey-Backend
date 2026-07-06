@@ -75,7 +75,8 @@ import {
   type MappingEntry,
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
-import { getUserRole, canViewFunnel } from "../lib/permissions";
+import { getPerms, requirePerm } from "../lib/permission-service";
+import { scopeOf } from "../lib/permission-catalog";
 import { getBalance, deductCredits, InsufficientCreditsError, CREDIT_COSTS } from "../lib/credits";
 import {
   buildFunnelPayload,
@@ -410,15 +411,20 @@ router.get(
       };
     });
 
-    // Visibility gate: reps/viewers only see PUBLIC campaigns + PRIVATE ones
-    // they're assigned to. Admins/managers see all. This is what the campaign
-    // Private/Public selector controls.
+    // Visibility gate driven by campaigns.access: "all" → everything;
+    // "assigned" → public campaigns + private ones they're a member of;
+    // "none" → nothing.
     const auth = getAuth(req);
-    const role = auth?.userId ? await getUserRole(auth.userId) : "rep";
+    const perms = await getPerms(req);
+    const access = scopeOf(perms.permissions, "campaigns.access");
     const myFunnelIds = new Set(
       memberRows.filter((m) => m.userId === auth?.userId).map((m) => m.funnelId),
     );
-    const visible = data.filter((f) => canViewFunnel(role, f.visibility, myFunnelIds.has(f.id)));
+    const visible = access === "all"
+      ? data
+      : access === "none"
+        ? []
+        : data.filter((f) => f.visibility === "public" || myFunnelIds.has(f.id));
 
     res.json({ data: visible });
   }),
@@ -580,28 +586,30 @@ router.get(
     // The funnel load, members list and caller role are independent — one
     // parallel round instead of three serial round trips.
     const auth = getAuth(req as unknown as Request);
-    const [loadedFunnel, members, role] = await Promise.all([
+    const [loadedFunnel, members, perms] = await Promise.all([
       loadFunnel(orgId, req.params.funnelId, { withEvents: !lite, fullLeadId }),
       db.select().from(funnelMembers).where(eq(funnelMembers.funnelId, req.params.funnelId)),
-      auth?.userId ? getUserRole(auth.userId) : Promise.resolve("rep" as const),
+      getPerms(req as unknown as Request),
     ]);
     const funnel = getFunnelOrThrow(loadedFunnel, req.params.funnelId);
 
-    // Visibility gate: a non-member rep can't open a PRIVATE campaign directly.
-    let isMember = !!auth?.userId && members.some((m) => m.userId === auth.userId);
-    // Working a campaign in the power dialer grants access to it: if the caller
-    // has (or had) a dialer session for this funnel, let them open its leads
-    // even when it's Private. Only checked when plain membership didn't already
-    // pass, so the common path stays a single query.
-    if (!isMember && auth?.userId && !canViewFunnel(role, funnel.visibility, false)) {
-      const [sess] = await db
-        .select({ id: dialerSessions.id })
-        .from(dialerSessions)
-        .where(and(eq(dialerSessions.userId, auth.userId), eq(dialerSessions.funnelId, req.params.funnelId)))
-        .limit(1);
-      if (sess) isMember = true;
+    // Visibility gate driven by campaigns.access.
+    const access = scopeOf(perms.permissions, "campaigns.access");
+    let canView = access === "all" || funnel.visibility === "public";
+    if (!canView && access === "assigned") {
+      canView = !!auth?.userId && members.some((m) => m.userId === auth.userId);
+      // Working a campaign in the power dialer grants access even when Private
+      // (sessions can now only be created for permitted funnels — see dialer.ts).
+      if (!canView && auth?.userId) {
+        const [sess] = await db
+          .select({ id: dialerSessions.id })
+          .from(dialerSessions)
+          .where(and(eq(dialerSessions.userId, auth.userId), eq(dialerSessions.funnelId, req.params.funnelId)))
+          .limit(1);
+        if (sess) canView = true;
+      }
     }
-    if (!canViewFunnel(role, funnel.visibility, isMember)) {
+    if (!canView) {
       throw new ApiError(403, "You do not have access to this campaign");
     }
     // One batched lookup instead of a query per member.
@@ -679,6 +687,7 @@ router.get(
 
 router.post(
   "/funnels",
+  requirePerm("campaigns.create"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const { name, description, status, steps, sourceTypes, visibility, audience, exit, emailAutomation, members } = req.body || {};
@@ -901,6 +910,7 @@ router.post(
 
 router.patch(
   "/funnels/:funnelId",
+  requirePerm("campaigns.edit"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const body = req.body || {};
@@ -1127,6 +1137,7 @@ router.patch(
 
 router.patch(
   "/funnels/:funnelId/webhook",
+  requirePerm("campaigns.edit"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnel = getFunnelOrThrow(
@@ -1176,6 +1187,7 @@ router.patch(
 
 router.delete(
   "/funnels/:funnelId",
+  requirePerm("campaigns.delete"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnel = getFunnelOrThrow(
@@ -1193,6 +1205,7 @@ router.delete(
 
 router.post(
   "/funnels/:funnelId/imports/csv",
+  requirePerm("campaigns.addLeads"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const { fileName, mappings, rows, groupBy: groupByRaw, dryRun, enrichCompanies } = req.body || {};
@@ -2153,6 +2166,7 @@ router.post(
 // the change follows the person across campaigns.
 router.patch(
   "/funnels/:funnelId/leads/:leadId/contact",
+  requirePerm("leads.edit"),
   asyncHandler<LeadAdvanceParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnel = getFunnelOrThrow(
@@ -2293,6 +2307,7 @@ router.patch(
 // enrollments) cascade; an opportunity sourced from this lead survives.
 router.delete(
   "/funnels/:funnelId/leads/:leadId",
+  requirePerm("leads.delete"),
   asyncHandler<LeadAdvanceParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnel = getFunnelOrThrow(
@@ -2313,6 +2328,7 @@ router.delete(
 // rest is filled in from the now-fully-editable lead profile.
 router.post(
   "/funnels/:funnelId/leads",
+  requirePerm("campaigns.addLeads"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnel = getFunnelOrThrow(await loadFunnel(orgId, req.params.funnelId), req.params.funnelId);
@@ -2733,6 +2749,7 @@ function jobToRole(job: TheirStackJob) {
 
 router.post(
   "/funnels/:funnelId/enrich-job-posts",
+  requirePerm("leads.enrich"),
   asyncHandler<{ funnelId: string }>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnelId = req.params.funnelId;
@@ -2908,6 +2925,7 @@ function formatRevenueUsd(n: number | null | undefined): string | null {
 
 router.post(
   "/funnels/:funnelId/enrich-companies",
+  requirePerm("leads.enrich"),
   asyncHandler<{ funnelId: string }>(async (req, res) => {
     const orgId = getOrgId(req);
     const funnelId = req.params.funnelId;

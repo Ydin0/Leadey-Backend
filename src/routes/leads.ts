@@ -8,6 +8,7 @@ import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, dedupeKey } from "../lib/helpers";
 import { buildLeadFilterWhere, decodeFilterParam } from "../lib/lead-filter";
+import { getPerms, getVisibleFunnelIds, leadVisibilityCondition, requirePerm } from "../lib/permission-service";
 import { createTtlCache } from "../lib/ttl-cache";
 import { getCustomFieldsForLeads, type LeadCustomField } from "../lib/custom-fields-service";
 
@@ -21,6 +22,17 @@ function asyncHandler(handler: (req: Request, res: Response, next: NextFunction)
 
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 const truthy = (v: unknown): boolean => v === "1" || v === "true";
+
+/** The leads.view visibility predicate for this request (or null = no extra
+ *  filter). Returns sql`false` when the user may see nothing. Callers must have
+ *  `funnels` joined (for the campaign-scoped case). */
+async function leadVisibilityForReq(req: Request): Promise<SQL | null> {
+  const orgId = getOrgId(req);
+  const userId = getAuth(req)?.userId || "";
+  const perms = await getPerms(req);
+  const visible = await getVisibleFunnelIds(orgId, userId, perms.permissions);
+  return leadVisibilityCondition(perms.permissions, visible);
+}
 
 /** Build the WHERE conditions for the org-wide leads query from query params.
  *  Always org-scoped (the caller joins funnels). */
@@ -137,6 +149,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
+    const vis = await leadVisibilityForReq(req);
+    if (vis) conds.push(vis);
 
     const [{ total }] = await db
       .select({ total: count() })
@@ -272,9 +286,12 @@ router.get(
 // ─── GET /leads/export — CSV of every lead matching the (Smart View) filter ──
 router.get(
   "/leads/export",
+  requirePerm("leads.export"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
+    const vis = await leadVisibilityForReq(req);
+    if (vis) conds.push(vis);
     const rows = await db
       .select({ lead: leads, funnelName: funnels.name })
       .from(leads)
@@ -310,6 +327,8 @@ router.get(
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));
     const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
+    const vis = await leadVisibilityForReq(req);
+    if (vis) conds.push(vis);
 
     const grouped = db
       .select({
@@ -452,6 +471,8 @@ router.get(
   "/leads/facets",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+    const vis = await leadVisibilityForReq(req);
+    const scope = (base: SQL) => (vis ? and(base, vis)! : base);
 
     const [agg] = await db
       .select({
@@ -463,7 +484,7 @@ router.get(
       })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(eq(funnels.organizationId, orgId));
+      .where(scope(eq(funnels.organizationId, orgId)));
 
     const campaigns = await db
       .select({ id: funnels.id, name: funnels.name })
@@ -475,14 +496,14 @@ router.get(
       .select({ sourceType: leads.sourceType })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(eq(funnels.organizationId, orgId))
+      .where(scope(eq(funnels.organizationId, orgId)))
       .groupBy(leads.sourceType);
 
     const statusRows = await db
       .select({ status: leads.status })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(eq(funnels.organizationId, orgId))
+      .where(scope(eq(funnels.organizationId, orgId)))
       .groupBy(leads.status);
 
     res.json({
@@ -503,6 +524,7 @@ router.get(
 // ─── POST /leads/campaign-from-filter — new campaign from the filtered set ───
 router.post(
   "/leads/campaign-from-filter",
+  requirePerm("campaigns.create"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const body = (req.body || {}) as {
@@ -515,18 +537,24 @@ router.post(
     const name = str(body.name);
     if (!name) throw new ApiError(400, "Campaign name is required");
 
+    // Only build from leads the caller may actually see.
+    const vis = await leadVisibilityForReq(req);
+
     // Resolve the source leads — explicit selection, or everything matching the
     // current filters.
     let sourceRows: (typeof leads.$inferSelect)[];
     if (Array.isArray(body.leadIds) && body.leadIds.length > 0) {
+      const conds = [eq(funnels.organizationId, orgId), inArray(leads.id, body.leadIds)];
+      if (vis) conds.push(vis);
       sourceRows = await db
         .select({ lead: leads })
         .from(leads)
         .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-        .where(and(eq(funnels.organizationId, orgId), inArray(leads.id, body.leadIds)))
+        .where(and(...conds))
         .then((r) => r.map((x) => x.lead));
     } else {
       const conds = buildLeadConditions(orgId, body.filters || {});
+      if (vis) conds.push(vis);
       sourceRows = await db
         .select({ lead: leads })
         .from(leads)

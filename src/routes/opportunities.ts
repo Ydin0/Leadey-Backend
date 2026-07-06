@@ -15,6 +15,8 @@ import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { seedDefaultPipeline } from "../lib/opportunities-seed";
+import { getPerms, requirePerm } from "../lib/permission-service";
+import { hasPerm, scopeOf } from "../lib/permission-catalog";
 
 const router = Router();
 
@@ -195,6 +197,7 @@ router.get(
 
 router.post(
   "/pipelines",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const { name, description } = req.body as { name?: string; description?: string };
@@ -237,6 +240,7 @@ router.post(
 
 router.post(
   "/pipelines/:id/duplicate",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const sourceId = req.params.id as string;
@@ -316,6 +320,7 @@ router.post(
 
 router.patch(
   "/pipelines/:id",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;
@@ -340,6 +345,7 @@ router.patch(
 
 router.delete(
   "/pipelines/:id",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;
@@ -420,6 +426,7 @@ router.delete(
 // Stages
 router.post(
   "/pipelines/:id/stages",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const pipelineId = req.params.id as string;
@@ -462,6 +469,7 @@ router.post(
 
 router.patch(
   "/pipelines/:id/stages/reorder",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const pipelineId = req.params.id as string;
@@ -493,6 +501,7 @@ router.patch(
 
 router.patch(
   "/pipelines/:id/stages/:stageId",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const pipelineId = req.params.id as string;
@@ -523,6 +532,7 @@ router.patch(
 
 router.delete(
   "/pipelines/:id/stages/:stageId",
+  requirePerm("opportunities.managePipelines"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const pipelineId = req.params.id as string;
@@ -562,11 +572,22 @@ router.get(
       summary,
     } = req.query as Record<string, string | undefined>;
 
+    // Visibility: "assigned" forces own-only (ignoring any client ownerId),
+    // "none" returns nothing, "all" honors the client owner filter.
+    const perms = await getPerms(req);
+    const oppScope = scopeOf(perms.permissions, "opportunities.view");
+    if (oppScope === "none") {
+      res.json({ data: [], summary: null });
+      return;
+    }
+
     const conditions = [eq(opportunities.organizationId, orgId)];
     if (pipelineId) conditions.push(eq(opportunities.pipelineId, pipelineId));
     if (stageId) conditions.push(eq(opportunities.stageId, stageId));
-    // ownerId may be a single id or a comma-separated list (multi-select).
-    if (ownerId) {
+    if (oppScope === "assigned") {
+      conditions.push(eq(opportunities.ownerId, getUserId(req)));
+    } else if (ownerId) {
+      // ownerId may be a single id or a comma-separated list (multi-select).
       const ownerIds = ownerId.split(",").map((s) => s.trim()).filter(Boolean);
       if (ownerIds.length === 1) conditions.push(eq(opportunities.ownerId, ownerIds[0]));
       else if (ownerIds.length > 1) conditions.push(inArray(opportunities.ownerId, ownerIds));
@@ -672,9 +693,11 @@ router.get(
 
 router.post(
   "/opportunities",
+  requirePerm("opportunities.create"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getUserId(req);
+    const perms = await getPerms(req);
     const {
       pipelineId,
       stageId,
@@ -689,6 +712,9 @@ router.post(
       expectedCloseDate,
       notes,
     } = req.body as Record<string, any>;
+
+    // Without editAll, an opp can only be created owned by yourself.
+    const resolvedOwner = hasPerm(perms.permissions, "opportunities.editAll") ? (ownerId || userId) : userId;
 
     if (!pipelineId) throw new ApiError(400, "pipelineId required");
     if (!stageId) throw new ApiError(400, "stageId required");
@@ -717,7 +743,7 @@ router.post(
         name: name.trim(),
         masterCompanyId: masterCompanyId || null,
         masterContactId: masterContactId || null,
-        ownerId: ownerId || userId,
+        ownerId: resolvedOwner,
         sourceLeadId: sourceLeadId || null,
         value: value != null ? String(value) : "0",
         currency: currency || "USD",
@@ -751,6 +777,13 @@ router.get(
       .from(opportunities)
       .where(and(eq(opportunities.id, id), eq(opportunities.organizationId, orgId)));
     if (!opp) throw new ApiError(404, "Opportunity not found");
+
+    // Visibility: "none" can't open any; "assigned" can only open their own.
+    const perms = await getPerms(req);
+    const oppScope = scopeOf(perms.permissions, "opportunities.view");
+    if (oppScope === "none" || (oppScope === "assigned" && opp.ownerId !== getUserId(req))) {
+      throw new ApiError(404, "Opportunity not found");
+    }
 
     // Join company + primary contact + additional contacts
     const company = opp.masterCompanyId
@@ -867,6 +900,17 @@ router.patch(
       .where(and(eq(opportunities.id, id), eq(opportunities.organizationId, orgId)));
     if (!existing) throw new ApiError(404, "Opportunity not found");
 
+    // Editing is allowed on your own opp; touching others' requires editAll.
+    const perms = await getPerms(req);
+    const canEditAll = hasPerm(perms.permissions, "opportunities.editAll");
+    if (!canEditAll && existing.ownerId !== userId) {
+      throw new ApiError(403, "You can only edit opportunities assigned to you");
+    }
+    // Reassigning ownership to someone else also requires editAll.
+    if (!canEditAll && "ownerId" in req.body && req.body.ownerId && req.body.ownerId !== userId) {
+      throw new ApiError(403, "You can't reassign this opportunity");
+    }
+
     const allowed = [
       "name", "pipelineId", "stageId", "masterCompanyId", "masterContactId", "ownerId",
       "value", "currency", "probabilityOverride", "expectedCloseDate",
@@ -982,6 +1026,7 @@ router.patch(
 
 router.delete(
   "/opportunities/:id",
+  requirePerm("opportunities.delete"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;

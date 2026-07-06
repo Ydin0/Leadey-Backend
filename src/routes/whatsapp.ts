@@ -12,6 +12,7 @@ import { users, organizations } from "../db/schema/organizations";
 import { settings } from "../db/schema/settings";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, phoneKey } from "../lib/helpers";
+import { requirePerm } from "../lib/permission-service";
 import { getSetting, upsertSetting, deleteSetting } from "../lib/settings-service";
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
 import { createNotification } from "./notifications";
@@ -162,6 +163,7 @@ router.delete(
 // ── PUT /api/whatsapp/settings ──────────────────────────────────────
 router.put(
   "/whatsapp/settings",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const wabaId = String(req.body?.wabaId ?? "").trim();
@@ -189,6 +191,7 @@ router.get(
 // goes through OTP verification (POST …/verify) before it comes ONLINE.
 router.post(
   "/whatsapp/senders",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const lineId = String(req.body?.lineId || "");
@@ -255,6 +258,7 @@ router.post(
 // ── POST /api/whatsapp/senders/:id/verify — submit the OTP code ────
 router.post(
   "/whatsapp/senders/:id/verify",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const code = String(req.body?.code || "").trim();
@@ -318,6 +322,7 @@ router.post(
 // ── DELETE /api/whatsapp/senders/:id — deregister ───────────────────
 router.delete(
   "/whatsapp/senders/:id",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const [sender] = await db
@@ -350,6 +355,7 @@ router.get(
 // ── POST /api/whatsapp/content-templates ────────────────────────────
 router.post(
   "/whatsapp/content-templates",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const { sid, approvalStatus } = await createTextTemplate(orgId, {
@@ -365,6 +371,7 @@ router.post(
 // ── POST /api/funnels/:funnelId/leads/:leadId/whatsapp — manual send ──
 router.post(
   "/funnels/:funnelId/leads/:leadId/whatsapp",
+  requirePerm("messaging.sendWhatsapp"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;

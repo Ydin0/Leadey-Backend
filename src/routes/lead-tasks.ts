@@ -7,7 +7,8 @@ import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
-import { getUserRole } from "../lib/permissions";
+import { getPerms, requirePerm } from "../lib/permission-service";
+import { hasPerm, scopeOf } from "../lib/permission-catalog";
 import { getTaskCategories, saveTaskCategories } from "../lib/task-categories";
 import { ApiError, createId } from "../lib/helpers";
 
@@ -86,10 +87,9 @@ async function resolveAssignee(
   const requested = requestedRaw ? String(requestedRaw).trim() : "";
   // Default / self.
   if (!requested || requested === userId) return userId;
-  const role = userId ? await getUserRole(userId) : "rep";
-  const canAssignOthers = role === "admin" || role === "manager";
-  if (!canAssignOthers) {
-    throw new ApiError(403, "Only admins can assign tasks to other members");
+  const perms = await getPerms(req);
+  if (!hasPerm(perms.permissions, "tasks.assignOthers")) {
+    throw new ApiError(403, "You don't have permission to assign tasks to other members");
   }
   const [m] = await db
     .select({ id: users.id })
@@ -124,6 +124,12 @@ router.get(
     const orgId = getOrgId(req);
     const { funnelId, leadId } = req.params as { funnelId: string; leadId: string };
     await assertLeadInOrg(orgId, funnelId, leadId);
+    // tasks.view "own" → only tasks assigned to or created by me.
+    const perms = await getPerms(req);
+    const meId = getAuth(req)?.userId || "";
+    const ownOnly = scopeOf(perms.permissions, "tasks.view") === "own";
+    const conds = [eq(leadTasks.organizationId, orgId), eq(leadTasks.leadId, leadId)];
+    if (ownOnly) conds.push(or(eq(leadTasks.assigneeId, meId), eq(leadTasks.createdBy, meId))!);
     const rows = await db
       .select({
         task: leadTasks,
@@ -133,7 +139,7 @@ router.get(
       })
       .from(leadTasks)
       .leftJoin(users, eq(users.id, leadTasks.assigneeId))
-      .where(and(eq(leadTasks.organizationId, orgId), eq(leadTasks.leadId, leadId)))
+      .where(and(...conds))
       .orderBy(asc(leadTasks.done), asc(leadTasks.dueAt), asc(leadTasks.createdAt));
     res.json({
       data: rows.map((r) =>
@@ -191,6 +197,14 @@ router.patch(
       .where(and(eq(leadTasks.id, taskId), eq(leadTasks.organizationId, orgId)));
     if (!existing) throw new ApiError(404, "Task not found");
 
+    // Editing someone else's task requires tasks.editOthers.
+    const perms = await getPerms(req);
+    const meId = getAuth(req)?.userId || "";
+    const ownsTask = existing.assigneeId === meId || existing.createdBy === meId;
+    if (!ownsTask && !hasPerm(perms.permissions, "tasks.editOthers")) {
+      throw new ApiError(403, "You can only edit your own tasks");
+    }
+
     const updates: Record<string, unknown> = { updatedAt: new Date() };
     if ("label" in req.body) {
       const label = String(req.body.label || "").trim();
@@ -226,6 +240,7 @@ router.get(
 // ─── PUT /task-categories ───────────────────────────────────────────
 router.put(
   "/task-categories",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const input = Array.isArray(req.body?.categories) ? req.body.categories : req.body;
@@ -245,8 +260,8 @@ router.get(
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
     if (!userId) { res.json({ data: [] }); return; }
-    const role = await getUserRole(userId);
-    const canViewOthers = role === "admin" || role === "manager";
+    const perms = await getPerms(req);
+    const canViewOthers = scopeOf(perms.permissions, "tasks.view") === "all";
 
     // Resolve whose tasks to show.
     const requested = (req.query.assigneeId as string | undefined)?.trim();
@@ -345,10 +360,16 @@ router.delete(
     const orgId = getOrgId(req);
     const taskId = req.params.taskId as string;
     const [existing] = await db
-      .select({ id: leadTasks.id })
+      .select({ id: leadTasks.id, assigneeId: leadTasks.assigneeId, createdBy: leadTasks.createdBy })
       .from(leadTasks)
       .where(and(eq(leadTasks.id, taskId), eq(leadTasks.organizationId, orgId)));
     if (!existing) throw new ApiError(404, "Task not found");
+    const perms = await getPerms(req);
+    const meId = getAuth(req)?.userId || "";
+    const ownsTask = existing.assigneeId === meId || existing.createdBy === meId;
+    if (!ownsTask && !hasPerm(perms.permissions, "tasks.editOthers")) {
+      throw new ApiError(403, "You can only delete your own tasks");
+    }
     await db.delete(leadTasks).where(eq(leadTasks.id, taskId));
     res.status(204).end();
   }),

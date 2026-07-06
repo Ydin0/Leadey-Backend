@@ -6,12 +6,27 @@ import { organizations, users } from "../db/schema/organizations";
 import { callRecords } from "../db/schema/call-records";
 import { opportunities } from "../db/schema/opportunities";
 import { getOrgId } from "../lib/auth";
-import { ApiError } from "../lib/helpers";
+import { ApiError, createId } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
 import { syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
+import { orgRoles } from "../db/schema/org-roles";
+import {
+  resolvePermissions,
+  requirePerm,
+  invalidateUserPermissions,
+  invalidateOrgPermissions,
+} from "../lib/permission-service";
+import {
+  ALL_PERM_KEYS,
+  isValidPermValue,
+  BUILTIN_ROLE_KEYS,
+  BUILTIN_ROLE_LABELS,
+  BUILTIN_ROLES,
+  type PermissionMap,
+} from "../lib/permission-catalog";
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
@@ -94,11 +109,26 @@ router.get(
     });
 
     let role = user?.role || "org:member";
-    // Normalize
+    // Normalize (kept for older clients that still read `role`).
     if (role === "org:admin") role = "admin";
     else if (role === "org:member") role = "rep";
 
-    res.json({ data: { role } });
+    // Resolved granular permissions for the new client. Fail-closed: on error
+    // the frontend hook synthesizes a locked-down map, never admin.
+    let permissions = null;
+    let appRole = "member";
+    let isOrgAdmin = false;
+    try {
+      const orgId = getOrgId(req);
+      const resolved = await resolvePermissions(orgId, auth.userId);
+      permissions = resolved.permissions;
+      appRole = resolved.appRole;
+      isOrgAdmin = resolved.isOrgAdmin;
+    } catch (err) {
+      console.warn("[team/me] permission resolve failed:", err instanceof Error ? err.message : err);
+    }
+
+    res.json({ data: { role, appRole, isOrgAdmin, permissions } });
   }),
 );
 
@@ -124,7 +154,14 @@ router.get(
     type Member = {
       id: string; email: string; firstName: string | null; lastName: string | null;
       imageUrl: string | null; role: string; createdAt: string;
+      appRole: string; hasOverrides: boolean;
     };
+    // The member's effective app-role: org:admin is always "admin"; otherwise
+    // the stored app_role (default member).
+    const effectiveAppRole = (clerkRole: string, row?: typeof users.$inferSelect) =>
+      clerkRole === "org:admin" ? "admin" : row?.appRole || "member";
+    const hasOverrides = (row?: typeof users.$inferSelect) =>
+      !!row?.permissionOverrides && Object.keys(row.permissionOverrides).length > 0;
     let members: Member[];
     try {
       const list = await clerkClient.organizations.getOrganizationMembershipList({
@@ -137,13 +174,16 @@ router.get(
       members = list.data.map((m) => {
         const pud = m.publicUserData;
         const row = pud?.userId ? byId.get(pud.userId) : undefined;
+        const clerkRole = m.role || "org:member";
         return {
           id: pud?.userId || m.id,
           email: pud?.identifier || row?.email || "",
           firstName: pud?.firstName ?? row?.firstName ?? null,
           lastName: pud?.lastName ?? row?.lastName ?? null,
           imageUrl: pud?.imageUrl ?? row?.imageUrl ?? null,
-          role: m.role || "org:member",
+          role: clerkRole,
+          appRole: effectiveAppRole(clerkRole, row),
+          hasOverrides: hasOverrides(row),
           createdAt: new Date(m.createdAt).toISOString(),
         };
       });
@@ -156,6 +196,8 @@ router.get(
         lastName: m.lastName,
         imageUrl: m.imageUrl,
         role: m.role || "org:member",
+        appRole: effectiveAppRole(m.role || "org:member", m),
+        hasOverrides: hasOverrides(m),
         createdAt: m.createdAt.toISOString(),
       }));
     }
@@ -386,27 +428,42 @@ router.delete(
 );
 
 // ─── PATCH /team/:userId/role ───────────────────────────────────────
-// Update a member's role
+// Change a member's Clerk org role (admin vs member). Gated on manageTeam;
+// validates the role value; refuses to demote the last org:admin; only an
+// org:admin may change another org:admin. Keeps app_role in sync.
 router.patch(
   "/team/:userId/role",
+  requirePerm("settings.manageTeam"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = req.params.userId;
     const { role } = req.body;
 
-    if (!role) throw new ApiError(400, "role is required");
+    if (role !== "org:admin" && role !== "org:member") {
+      throw new ApiError(400, "role must be 'org:admin' or 'org:member'");
+    }
 
     try {
-      // Find the membership
       const memberships = await clerkClient.organizations.getOrganizationMembershipList({
         organizationId: orgId,
       });
-
       const membership = (memberships.data || []).find(
-        (m: any) => m.publicUserData?.userId === userId
+        (m: any) => m.publicUserData?.userId === userId,
       );
-
       if (!membership) throw new ApiError(404, "Member not found");
+
+      const targetIsAdmin = membership.role === "org:admin";
+      const admins = (memberships.data || []).filter((m: any) => m.role === "org:admin");
+
+      // Only an org:admin may change another org:admin's role.
+      const caller = await resolvePermissions(orgId, getAuth(req)?.userId || "");
+      if (targetIsAdmin && !caller.isOrgAdmin) {
+        throw new ApiError(403, "Only an admin can change another admin's role");
+      }
+      // Never demote the last admin.
+      if (targetIsAdmin && role === "org:member" && admins.length <= 1) {
+        throw new ApiError(400, "Can't remove the last admin — promote someone else first");
+      }
 
       await clerkClient.organizations.updateOrganizationMembership({
         organizationId: orgId,
@@ -414,17 +471,205 @@ router.patch(
         role,
       });
 
-      // Update local DB
+      // Mirror to DB. Promoting to admin sets app_role "admin"; demoting resets
+      // to "member" so the granular role actually applies from now on.
       await db
         .update(users)
-        .set({ role, updatedAt: new Date() })
+        .set({ role, appRole: role === "org:admin" ? "admin" : "member", updatedAt: new Date() })
         .where(eq(users.id, userId));
+      invalidateUserPermissions(orgId, userId);
 
       res.json({ data: { id: userId, role } });
     } catch (err: any) {
       if (err instanceof ApiError) throw err;
       throw new ApiError(400, err?.errors?.[0]?.message || "Failed to update role");
     }
+  }),
+);
+
+// ─── PATCH /team/:userId/permissions ────────────────────────────────
+// Set a member's granular app-role and/or sparse permission overrides.
+// Body: { appRole?: string, overrides?: Record<string, boolean|string>|null }.
+router.patch(
+  "/team/:userId/permissions",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = req.params.userId;
+    const { appRole, overrides } = req.body || {};
+    const caller = await resolvePermissions(orgId, getAuth(req)?.userId || "");
+
+    // Member must belong to this org.
+    const [target] = await db
+      .select({ id: users.id, role: users.role })
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
+    if (!target) throw new ApiError(404, "Member not found");
+
+    // Escalation guard: only an org:admin may touch an org:admin's grant or
+    // hand out the "admin" app-role.
+    if (target.role === "org:admin" && !caller.isOrgAdmin) {
+      throw new ApiError(403, "Only an admin can edit another admin's permissions");
+    }
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+
+    if (appRole !== undefined) {
+      const validBuiltin = (BUILTIN_ROLE_KEYS as string[]).includes(appRole);
+      let validCustom = false;
+      if (typeof appRole === "string" && appRole.startsWith("role_")) {
+        const [role] = await db
+          .select({ id: orgRoles.id })
+          .from(orgRoles)
+          .where(and(eq(orgRoles.id, appRole), eq(orgRoles.organizationId, orgId)));
+        validCustom = !!role;
+      }
+      if (!validBuiltin && !validCustom) throw new ApiError(400, "Unknown role");
+      if (appRole === "admin" && !caller.isOrgAdmin) {
+        throw new ApiError(403, "Only an admin can grant the Admin role");
+      }
+      updates.appRole = appRole;
+    }
+
+    if (overrides !== undefined) {
+      if (overrides === null) {
+        updates.permissionOverrides = null;
+      } else if (typeof overrides === "object") {
+        const clean: PermissionMap = {};
+        for (const [key, value] of Object.entries(overrides)) {
+          if (!isValidPermValue(key, value)) throw new ApiError(400, `Invalid permission: ${key}`);
+          clean[key] = value as boolean | string;
+        }
+        updates.permissionOverrides = Object.keys(clean).length > 0 ? clean : null;
+      } else {
+        throw new ApiError(400, "overrides must be an object or null");
+      }
+    }
+
+    await db.update(users).set(updates).where(eq(users.id, userId));
+    invalidateUserPermissions(orgId, userId);
+    res.json({ data: { id: userId, ok: true } });
+  }),
+);
+
+// ─── Roles (built-in presets + custom org roles) ────────────────────
+router.get(
+  "/team/roles",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const custom = await db.select().from(orgRoles).where(eq(orgRoles.organizationId, orgId));
+    // Member count per role (org:admin members always resolve to admin).
+    const rows = await db
+      .select({ appRole: users.appRole, count: count() })
+      .from(users)
+      .where(eq(users.organizationId, orgId))
+      .groupBy(users.appRole);
+    const counts = new Map(rows.map((r) => [r.appRole || "member", Number(r.count)]));
+    res.json({
+      data: {
+        builtins: BUILTIN_ROLE_KEYS.map((key) => ({
+          key,
+          name: BUILTIN_ROLE_LABELS[key],
+          permissions: BUILTIN_ROLES[key],
+          memberCount: counts.get(key) ?? 0,
+        })),
+        custom: custom.map((r) => ({
+          id: r.id,
+          name: r.name,
+          description: r.description,
+          permissions: r.permissions,
+          memberCount: counts.get(r.id) ?? 0,
+        })),
+      },
+    });
+  }),
+);
+
+function sanitizePermMap(raw: unknown): PermissionMap {
+  const clean: PermissionMap = {};
+  if (raw && typeof raw === "object") {
+    for (const [key, value] of Object.entries(raw)) {
+      if (isValidPermValue(key, value)) clean[key] = value as boolean | string;
+    }
+  }
+  return clean;
+}
+
+router.post(
+  "/team/roles",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const name = String(req.body?.name || "").trim();
+    if (!name) throw new ApiError(400, "name is required");
+    const [dupe] = await db
+      .select({ id: orgRoles.id })
+      .from(orgRoles)
+      .where(and(eq(orgRoles.organizationId, orgId), sql`lower(${orgRoles.name}) = ${name.toLowerCase()}`));
+    if (dupe) throw new ApiError(409, "A role with that name already exists");
+
+    const id = createId("role");
+    await db.insert(orgRoles).values({
+      id,
+      organizationId: orgId,
+      name,
+      description: req.body?.description ? String(req.body.description) : null,
+      permissions: sanitizePermMap(req.body?.permissions),
+    });
+    res.status(201).json({ data: { id, name } });
+  }),
+);
+
+router.patch(
+  "/team/roles/:roleId",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const roleId = req.params.roleId;
+    const [existing] = await db
+      .select({ id: orgRoles.id })
+      .from(orgRoles)
+      .where(and(eq(orgRoles.id, roleId), eq(orgRoles.organizationId, orgId)));
+    if (!existing) throw new ApiError(404, "Role not found");
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name).trim();
+      if (!name) throw new ApiError(400, "name cannot be empty");
+      updates.name = name;
+    }
+    if (req.body?.description !== undefined) updates.description = req.body.description ? String(req.body.description) : null;
+    if (req.body?.permissions !== undefined) updates.permissions = sanitizePermMap(req.body.permissions);
+
+    await db.update(orgRoles).set(updates).where(eq(orgRoles.id, roleId));
+    invalidateOrgPermissions(orgId); // affects every assignee
+    res.json({ data: { id: roleId, ok: true } });
+  }),
+);
+
+router.delete(
+  "/team/roles/:roleId",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const roleId = req.params.roleId;
+    const result = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ id: orgRoles.id })
+        .from(orgRoles)
+        .where(and(eq(orgRoles.id, roleId), eq(orgRoles.organizationId, orgId)));
+      if (!existing) throw new ApiError(404, "Role not found");
+      const reassigned = await tx
+        .update(users)
+        .set({ appRole: "member", updatedAt: new Date() })
+        .where(and(eq(users.organizationId, orgId), eq(users.appRole, roleId)))
+        .returning({ id: users.id });
+      await tx.delete(orgRoles).where(eq(orgRoles.id, roleId));
+      return reassigned.length;
+    });
+    invalidateOrgPermissions(orgId);
+    res.json({ data: { id: roleId, deleted: true, reassignedCount: result } });
   }),
 );
 

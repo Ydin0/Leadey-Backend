@@ -3,6 +3,7 @@ import { eq, and, desc } from "drizzle-orm";
 import { db } from "../db/index";
 import { templates } from "../db/schema/templates";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { ApiError, createId } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 
@@ -87,6 +88,7 @@ router.get(
 // ─── POST /templates ────────────────────────────────────────────────
 router.post(
   "/templates",
+  requirePerm("templates.manage"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const auth = getAuth(req);
@@ -132,6 +134,7 @@ router.post(
 // ─── PATCH /templates/:id ───────────────────────────────────────────
 router.patch(
   "/templates/:id",
+  requirePerm("templates.manage"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;
@@ -175,6 +178,7 @@ router.patch(
 // ─── DELETE /templates/:id ──────────────────────────────────────────
 router.delete(
   "/templates/:id",
+  requirePerm("templates.manage"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = req.params.id as string;

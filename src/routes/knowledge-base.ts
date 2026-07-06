@@ -11,7 +11,8 @@ import {
   type KbLessonContent,
 } from "../db/schema/knowledge-base";
 import { getOrgId } from "../lib/auth";
-import { getUserRole } from "../lib/permissions";
+import { getPerms } from "../lib/permission-service";
+import { hasPerm } from "../lib/permission-catalog";
 import { ApiError, createId } from "../lib/helpers";
 
 const router = Router();
@@ -36,18 +37,19 @@ function getUserId(req: Request): string {
   return auth.userId;
 }
 
-/** Only org admins may create/edit content + manage assignments. */
+/** Only users with knowledgeBase.manage may create/edit content + assignments. */
 async function assertAdmin(req: Request): Promise<string> {
   const userId = getUserId(req);
-  const role = await getUserRole(userId);
-  if (role !== "admin") {
-    throw new ApiError(403, "Only organisation admins can manage the knowledge base");
+  const perms = await getPerms(req);
+  if (!hasPerm(perms.permissions, "knowledgeBase.manage")) {
+    throw new ApiError(403, "You don't have permission to manage the knowledge base");
   }
   return userId;
 }
 
-async function isAdmin(userId: string): Promise<boolean> {
-  return (await getUserRole(userId)) === "admin";
+async function isManager(req: Request): Promise<boolean> {
+  const perms = await getPerms(req);
+  return hasPerm(perms.permissions, "knowledgeBase.manage");
 }
 
 // ── Serialization ──────────────────────────────────────────────────
@@ -131,7 +133,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getUserId(req);
-    const admin = await isAdmin(userId);
+    const admin = await isManager(req);
 
     const offers = await loadVisibleOffers(orgId, userId, admin);
 
@@ -484,8 +486,8 @@ router.post(
     });
     if (!lesson) throw new ApiError(404, "Lesson not found");
 
-    // Access: admins, or members the lesson's offer is assigned to.
-    if (!(await isAdmin(userId))) {
+    // Access: managers, or members the lesson's offer is assigned to.
+    if (!(await isManager(req))) {
       const assigned = await db.query.kbAssignments.findFirst({
         where: and(
           eq(kbAssignments.offerId, lesson.offerId),

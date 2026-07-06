@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import {
   getMergedLeadStatuses,
   saveCustomLeadStatuses,
@@ -29,6 +30,7 @@ router.get(
 // PUT /api/lead-statuses — replace the org's custom statuses + hidden built-ins.
 router.put(
   "/lead-statuses",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const body = req.body ?? {};

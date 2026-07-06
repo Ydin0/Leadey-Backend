@@ -25,7 +25,8 @@ function phoneKey(raw: string | null | undefined): string | null {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
-import { getUserRole } from "../lib/permissions";
+import { getPerms } from "../lib/permission-service";
+import { hasPerm, scopeOf } from "../lib/permission-catalog";
 import { createId, ApiError } from "../lib/helpers";
 import {
   uploadSupportingDocumentWithFile,
@@ -71,8 +72,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
-    const role = userId ? await getUserRole(userId) : "rep";
-    const canSeeAll = role === "admin" || role === "manager";
+    const perms = await getPerms(req);
+    const canSeeAll = hasPerm(perms.permissions, "settings.managePhoneLines");
 
     const monthStart = new Date();
     monthStart.setDate(1);
@@ -568,10 +569,18 @@ router.get(
     const limit = Math.min(parseInt(req.query.limit as string) || 25, 200);
     const offset = req.query.page ? (page - 1) * limit : parseInt(req.query.offset as string) || 0;
 
+    // Recordings visibility: "none" → nothing; "own" → only calls I placed;
+    // "all" honors the optional userId filter.
+    const perms = await getPerms(req);
+    const recScope = scopeOf(perms.permissions, "calling.recordings");
+    if (recScope === "none") { res.json({ data: [], meta: { page, pageSize: limit, totalCount: 0, totalPages: 0 } }); return; }
+    const meId = getAuth(req)?.userId || "";
+
     const conditions = [eq(callRecords.organizationId, orgId)];
     if (lineId) conditions.push(eq(callRecords.lineId, lineId));
     if (direction) conditions.push(eq(callRecords.direction, direction));
-    if (userId) conditions.push(eq(callRecords.userId, userId));
+    if (recScope === "own") conditions.push(eq(callRecords.userId, meId));
+    else if (userId) conditions.push(eq(callRecords.userId, userId));
     if (disposition) conditions.push(eq(callRecords.disposition, disposition));
     if (hasRecording === "true") conditions.push(isNotNull(callRecords.recordingUrl));
     if (minDuration !== undefined && !Number.isNaN(minDuration)) conditions.push(gte(callRecords.duration, minDuration));

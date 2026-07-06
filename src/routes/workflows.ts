@@ -7,6 +7,7 @@ import type { WorkflowGraph, WorkflowSettings } from "../db/schema/workflows";
 import { leads } from "../db/schema/leads";
 import { desc } from "drizzle-orm";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { ApiError, createId } from "../lib/helpers";
 import { enrollLeadsDirect, triggerStart } from "../services/workflow-engine";
 
@@ -131,6 +132,7 @@ router.get(
 // ─── POST /funnels/:funnelId/workflows ──────────────────────────────────
 router.post(
   "/funnels/:funnelId/workflows",
+  requirePerm("campaigns.manageWorkflows"),
   asyncHandler<FunnelParams>(async (req, res) => {
     const orgId = getOrgId(req);
     await assertFunnel(orgId, req.params.funnelId);
@@ -165,6 +167,7 @@ router.get(
 // The "Save" — accepts name / status / graph / settings (any subset).
 router.patch(
   "/funnels/:funnelId/workflows/:workflowId",
+  requirePerm("campaigns.manageWorkflows"),
   asyncHandler<WorkflowParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const existing = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
@@ -195,6 +198,7 @@ router.patch(
 // Manually enroll leads into a workflow (must be active to run).
 router.post(
   "/funnels/:funnelId/workflows/:workflowId/enroll",
+  requirePerm("campaigns.manageWorkflows"),
   asyncHandler<WorkflowParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
@@ -258,6 +262,7 @@ router.get(
 // it up on the next tick.
 router.post(
   "/funnels/:funnelId/workflows/:workflowId/enrollments/:enrollmentId/retry",
+  requirePerm("campaigns.manageWorkflows"),
   asyncHandler<WorkflowParams & { enrollmentId: string }>(async (req, res) => {
     const orgId = getOrgId(req);
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
@@ -311,6 +316,7 @@ router.get(
 // ─── DELETE /funnels/:funnelId/workflows/:workflowId ────────────────────
 router.delete(
   "/funnels/:funnelId/workflows/:workflowId",
+  requirePerm("campaigns.manageWorkflows"),
   asyncHandler<WorkflowParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);

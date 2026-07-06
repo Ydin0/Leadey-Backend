@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, AnyPgColumn } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, jsonb, AnyPgColumn } from "drizzle-orm/pg-core";
 
 export const organizations = pgTable("organizations", {
   id: text("id").primaryKey(),
@@ -53,6 +53,13 @@ export const users = pgTable("users", {
   imageUrl: text("image_url"),
   role: text("role"),
   platformRole: text("platform_role"),
+  /** Granular-permission role: a built-in key ("admin"|"manager"|"member"|
+   *  "viewer") OR an org_roles.id ("role_…"). Clerk org:admin always resolves
+   *  to full permissions regardless of this (see permission-service.ts). */
+  appRole: text("app_role"),
+  /** Sparse per-user permission overrides (flat "module.key" → value map),
+   *  layered on top of the role defaults. */
+  permissionOverrides: jsonb("permission_overrides").$type<Record<string, boolean | string>>(),
   suspendedAt: timestamp("suspended_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

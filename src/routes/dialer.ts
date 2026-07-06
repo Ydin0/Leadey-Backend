@@ -17,6 +17,8 @@ import { masterContacts } from "../db/schema/master";
 import { callRecords } from "../db/schema/call-records";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
+import { getPerms, getVisibleFunnelIds } from "../lib/permission-service";
+import { hasPerm } from "../lib/permission-catalog";
 import { seedSystemDispositions } from "../lib/dialer-seed";
 import { flagDoNotCall } from "../lib/dnc";
 import {
@@ -592,6 +594,16 @@ router.post(
       throw new ApiError(400, "funnelStepId or funnelId required");
     }
 
+    // Must be allowed to use the dialer at all.
+    const perms = await getPerms(req);
+    if (!hasPerm(perms.permissions, "calling.useDialer")) {
+      throw new ApiError(403, "You don't have permission to use the dialer");
+    }
+    // And must be able to see the campaign being dialed (closes the loophole
+    // where creating a session granted funnel access — see api.ts GET funnel).
+    const visible = await getVisibleFunnelIds(orgId, userId, perms.permissions);
+    const canDialFunnel = (fid: string) => visible.mode === "all" || (visible.mode === "ids" && visible.ids.includes(fid));
+
     const recentlyCalledHours = Math.round(recencyMsFromFilters(filters ?? null) / HOUR_MS);
     const resolvedFilters = {
       excludeDoNotCall: filters?.excludeDoNotCall ?? true,
@@ -619,6 +631,7 @@ router.post(
       if (step.channel !== "call") {
         throw new ApiError(400, `Dialer requires a call-channel step (got ${step.channel})`);
       }
+      if (!canDialFunnel(step.funnelId)) throw new ApiError(403, "You don't have access to this campaign");
       sessionStepId = step.id;
       sessionFunnelId = step.funnelId;
 
@@ -642,6 +655,7 @@ router.post(
         .from(funnels)
         .where(and(eq(funnels.id, funnelId!), eq(funnels.organizationId, orgId)));
       if (!funnel) throw new ApiError(404, "Campaign not found");
+      if (!canDialFunnel(funnel.id)) throw new ApiError(403, "You don't have access to this campaign");
       sessionFunnelId = funnel.id;
 
       // Every lead in the funnel with a phone number, any step.

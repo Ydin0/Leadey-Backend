@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { ApiError } from "../lib/helpers";
 import {
   stripe,
@@ -111,6 +112,7 @@ router.get(
 // Create a Stripe Checkout session
 router.post(
   "/billing/checkout",
+  requirePerm("settings.manageBilling"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const auth = getAuth(req);

@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
 import { getCallOutcomes, saveCallOutcomes } from "../lib/call-outcomes";
@@ -32,6 +33,7 @@ router.get(
 // PUT /api/call-outcomes — replace the list (org admin only).
 router.put(
   "/call-outcomes",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     if (!(await isOrgAdmin(userId))) throw new ApiError(403, "Only an admin can change call outcomes.");

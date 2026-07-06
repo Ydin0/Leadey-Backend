@@ -4,6 +4,7 @@ import { db } from "../db/index";
 import { funnelTags, funnelTagAssignments } from "../db/schema/funnel-tags";
 import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
+import { requirePerm } from "../lib/permission-service";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
 
 const router = Router();
@@ -75,6 +76,7 @@ router.get(
 // ─── POST /funnel-tags ───────────────────────────────────────────────
 router.post(
   "/funnel-tags",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const body = req.body as { name?: string; color?: string };
@@ -105,6 +107,7 @@ router.post(
 // ─── PATCH /funnel-tags/:id ──────────────────────────────────────────
 router.patch(
   "/funnel-tags/:id",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
@@ -149,6 +152,7 @@ router.patch(
 // Assignments cascade away with the tag.
 router.delete(
   "/funnel-tags/:id",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
@@ -164,6 +168,7 @@ router.delete(
 // client can patch its caches without a refetch.
 router.put(
   "/funnels/:funnelId/tags",
+  requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const funnelId = String(req.params.funnelId);

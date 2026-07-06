@@ -11,6 +11,7 @@ import { users } from "../db/schema/organizations";
 import { masterContacts } from "../db/schema/master";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
+import { requirePerm } from "../lib/permission-service";
 
 /** Rough dial-country of a number, so we text a UK lead from a UK number and a
  *  US lead from a US number (Twilio rejects mismatched From/To combinations). */
@@ -56,6 +57,7 @@ async function ensureSmsConfigured(number: string): Promise<void> {
 // POST /api/funnels/:funnelId/leads/:leadId/sms — send a text to a lead.
 router.post(
   "/funnels/:funnelId/leads/:leadId/sms",
+  requirePerm("messaging.sendSms"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
