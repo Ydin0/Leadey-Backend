@@ -92,6 +92,7 @@ router.get(
             phone: leads.phone,
             companyDomain: leads.companyDomain,
             funnelId: leads.funnelId,
+            masterContactId: leads.masterContactId,
           })
           .from(leads)
           .innerJoin(funnels, eq(leads.funnelId, funnels.id))
@@ -106,7 +107,9 @@ router.get(
               ),
             ),
           )
-          .limit(PER_GROUP),
+          // Over-fetch: the same person enrolled in N campaigns is N rows;
+          // we collapse to one per person below, then slice to PER_GROUP.
+          .limit(PER_GROUP * 6),
 
         db
           .select({ id: opportunities.id, name: opportunities.name, sourceLeadId: opportunities.sourceLeadId })
@@ -185,6 +188,29 @@ router.get(
           .limit(PER_GROUP),
       ]);
 
+    // Collapse leads to one row PER PERSON — a person enrolled in several
+    // campaigns is several lead rows, and we don't want the same human listed
+    // repeatedly. Key by master contact, falling back to email/phone/id since
+    // masterContactId is nullable on legacy rows. First match wins.
+    const phoneDigits = (p: string | null) => (p || "").replace(/\D/g, "");
+    const personKey = (l: (typeof leadRows)[number]) =>
+      l.masterContactId || (l.email ? `e:${l.email.toLowerCase()}` : "") || (phoneDigits(l.phone) ? `p:${phoneDigits(l.phone)}` : "") || l.id;
+    const seenPerson = new Set<string>();
+    const dedupedLeads: typeof leadRows = [];
+    for (const l of leadRows) {
+      const key = personKey(l);
+      if (seenPerson.has(key)) continue;
+      seenPerson.add(key);
+      dedupedLeads.push(l);
+      if (dedupedLeads.length >= PER_GROUP) break;
+    }
+    // Suppress contact results for people already shown as a lead (an enrolled
+    // contact would otherwise appear under both Leads and Contacts).
+    const leadEmails = new Set(
+      dedupedLeads.map((l) => l.email?.toLowerCase()).filter(Boolean) as string[],
+    );
+    const dedupedContacts = contactRows.filter((c) => !(c.email && leadEmails.has(c.email.toLowerCase())));
+
     // Resolve contact results to a campaign lead (matched by email) so they
     // open the lead view directly. Company results route to
     // /dashboard/companies/:id, which resolves to the company's most recently
@@ -238,7 +264,7 @@ router.get(
         subtitle: `Campaign · ${c.status}`,
         href: `/dashboard/funnels/${c.id}`,
       })),
-      ...leadRows.map((l) => ({
+      ...dedupedLeads.map((l) => ({
         type: "lead" as const,
         id: l.id,
         title: l.name,
@@ -271,7 +297,7 @@ router.get(
         href: `/dashboard/companies/${c.id}`,
         domain: c.domain || null,
       })),
-      ...contactRows.map((c) => {
+      ...dedupedContacts.map((c) => {
         const match = c.email ? byEmail.get(c.email.toLowerCase()) : undefined;
         return {
           type: "contact" as const,
