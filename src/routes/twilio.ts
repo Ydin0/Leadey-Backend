@@ -390,58 +390,23 @@ webhookRouter.post(
 webhookRouter.post(
   "/twilio/sms",
   asyncHandler(async (req, res) => {
-    const rawFrom = (req.body?.From as string) || "";
-    const rawTo = (req.body?.To as string) || "";
-    const isWhatsapp = rawFrom.startsWith("whatsapp:") || rawTo.startsWith("whatsapp:");
-    const from = rawFrom.replace(/^whatsapp:/, "");
-    const to = rawTo.replace(/^whatsapp:/, "");
-    const channel = isWhatsapp ? "whatsapp" : "sms";
+    const from = (req.body?.From as string) || "";
+    const to = (req.body?.To as string) || "";
     const body = (req.body?.Body as string) || "";
     const messageSid = (req.body?.MessageSid as string) || null;
 
     try {
       const { db } = await import("../db");
       const { phoneLines } = await import("../db/schema/phone-lines");
-      const { whatsappSenders } = await import("../db/schema/whatsapp");
       const { leads, leadEvents } = await import("../db/schema/leads");
       const { funnels } = await import("../db/schema/funnels");
       const { smsMessages } = await import("../db/schema/sms");
-      const { eq: e, and: a, desc: d, inArray: inArray2 } = await import("drizzle-orm");
+      const { eq: e, and: a, desc: d } = await import("drizzle-orm");
       const { createId, phoneKey } = await import("../lib/helpers");
       const { createNotification } = await import("./notifications");
 
       // Which org owns the number that was messaged?
       const toDigits = to.replace(/\D/g, "");
-
-      // Hands-free WhatsApp sender verification: Meta texts an OTP (plain SMS)
-      // to the number being registered — a Twilio number, so it lands here.
-      // If that number has a pending registration, extract the code and submit
-      // it to the Senders API automatically. Guarded by the pending-sender
-      // match, so ordinary texts containing digits never trigger this.
-      if (!isWhatsapp) {
-        try {
-          const pendings = await db
-            .select()
-            .from(whatsappSenders)
-            .where(inArray2(whatsappSenders.status, ["pending_verification", "verifying", "creating"]));
-          const pending = pendings.find((s) => s.number.replace(/\D/g, "") === toDigits);
-          const code = pending ? body.match(/(\d{3})[-\s]?(\d{3})/) : null;
-          if (pending && code) {
-            await client.messaging.v2.channelsSenders(pending.senderSid).update({
-              configuration: { verificationCode: `${code[1]}${code[2]}` },
-            });
-            const fresh = await client.messaging.v2.channelsSenders(pending.senderSid).fetch();
-            const status = (fresh.status || "").toLowerCase().replace("online:updating", "online") || pending.status;
-            await db
-              .update(whatsappSenders)
-              .set({ status, lastError: null, updatedAt: new Date() })
-              .where(e(whatsappSenders.id, pending.id));
-            console.log(`[whatsapp] auto-verified sender ${pending.number} → ${status}`);
-          }
-        } catch (err) {
-          console.warn("[whatsapp] auto-verification failed (code can be entered manually):", err instanceof Error ? err.message : err);
-        }
-      }
 
       const allLines = await db
         .select({ id: phoneLines.id, number: phoneLines.number, organizationId: phoneLines.organizationId, assignedTo: phoneLines.assignedTo })
@@ -451,28 +416,8 @@ webhookRouter.post(
         allLines.find((l) => l.number.replace(/\D/g, "") === toDigits) ||
         null;
 
-      // Resolve the owning org: the line, else (WhatsApp only) a registered
-      // sender whose line was released, else the dev sandbox org.
-      let orgId: string | null = line?.organizationId ?? null;
-      let lineId: string | null = line?.id ?? null;
-      if (!orgId && isWhatsapp) {
-        const senders = await db
-          .select({ organizationId: whatsappSenders.organizationId, lineId: whatsappSenders.lineId, number: whatsappSenders.number })
-          .from(whatsappSenders);
-        const sender = senders.find((s) => s.number.replace(/\D/g, "") === toDigits) || null;
-        if (sender) {
-          orgId = sender.organizationId;
-          lineId = sender.lineId;
-        } else if (
-          process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER &&
-          toDigits === process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER.replace(/\D/g, "") &&
-          process.env.TWILIO_WHATSAPP_SANDBOX_ORG_ID
-        ) {
-          orgId = process.env.TWILIO_WHATSAPP_SANDBOX_ORG_ID;
-        } else {
-          console.warn(`[Twilio] inbound whatsapp to unknown number ${to} — skipped`);
-        }
-      }
+      const orgId: string | null = line?.organizationId ?? null;
+      const lineId: string | null = line?.id ?? null;
 
       if (orgId) {
         // Find the lead by the sender's number within that org.
@@ -495,7 +440,7 @@ webhookRouter.post(
           lineId,
           userId: null,
           direction: "inbound",
-          channel,
+          channel: "sms",
           fromNumber: from,
           toNumber: to,
           body,
@@ -510,7 +455,7 @@ webhookRouter.post(
             type: "step_outcome",
             outcome: "replied",
             stepIndex: 0,
-            meta: { channel, direction: "inbound", body },
+            meta: { channel: "sms", direction: "inbound", body },
             timestamp: new Date(),
           });
 
@@ -531,7 +476,7 @@ webhookRouter.post(
               orgId,
               userId: targetUserId,
               type: "sms_reply",
-              title: `${lead.name} replied${isWhatsapp ? " on WhatsApp" : ""}`,
+              title: `${lead.name} replied`,
               body: body.slice(0, 140),
               leadId: lead.id,
               funnelId: lead.funnelId,

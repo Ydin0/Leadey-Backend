@@ -231,7 +231,7 @@ router.get(
       key: string; phone: string; leadId: string | null; funnelId: string | null;
       contactName: string | null; company: string | null;
       companyDomain: string | null; masterCompanyId: string | null;
-      lastBody: string; lastDirection: string; lastAt: string;
+      channel: string; lastBody: string; lastDirection: string; lastAt: string;
       inboundCount: number; total: number; needsReply: boolean;
     };
     const threads = new Map<string, Thread>();
@@ -246,6 +246,7 @@ router.get(
           key, phone: counterparty, leadId: m.leadId, funnelId: m.funnelId,
           contactName: r.leadName ?? null, company: r.leadCompany ?? null,
           companyDomain: null, masterCompanyId: null,
+          channel: m.channel || "sms",
           lastBody: m.body, lastDirection: m.direction, lastAt: m.createdAt.toISOString(),
           inboundCount: 0, total: 0, needsReply: m.direction === "inbound",
         };

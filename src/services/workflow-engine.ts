@@ -220,31 +220,19 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
       const tokens = await leadTokens(lead, orgId);
       const body = renderTokens(String(d.message || ""), tokens);
-      const contentSid = typeof d.contentSid === "string" && d.contentSid ? d.contentSid : undefined;
-      // Merge variables work inside template values too: {"1": "{{first_name}}"}.
-      const rawVars = (d.contentVariables && typeof d.contentVariables === "object" && !Array.isArray(d.contentVariables))
-        ? (d.contentVariables as Record<string, unknown>)
-        : {};
-      const contentVariables = Object.fromEntries(
-        Object.entries(rawVars).map(([k, v]) => [k, renderTokens(String(v ?? ""), tokens)]),
-      );
       try {
-        // Shared sender: 24h-session rule + sender resolution + message row.
-        // Failures (e.g. session window closed on a freeform step) land in the
-        // step-run log with the human-readable reason.
+        // QR-linked WhatsApp via the org's own connected number (Unipile).
+        // Failures (e.g. no account connected) land in the step-run log with
+        // the human-readable reason.
         await sendWhatsapp({
           orgId,
           lead: { id: lead.id, phone: lead.phone, funnelId: lead.funnelId },
           body,
-          contentSid,
-          contentBody: typeof d.contentBody === "string" ? d.contentBody : undefined,
-          contentVariables: contentSid ? contentVariables : undefined,
-          preferredLineId: typeof d.lineId === "string" && d.lineId ? d.lineId : undefined,
           userId: null,
         });
         await db.insert(leadEvents).values({
           id: createId("event"), leadId: lead.id, type: "step_outcome", outcome: "sent",
-          stepIndex: 0, meta: { channel: "whatsapp", direction: "outbound", body, contentSid: contentSid || null, source: "workflow" }, timestamp: new Date(),
+          stepIndex: 0, meta: { channel: "whatsapp", direction: "outbound", body, source: "workflow" }, timestamp: new Date(),
         });
         await logRun(enr, node, "done", {});
       } catch (e) {
