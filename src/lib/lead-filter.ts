@@ -109,6 +109,28 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return applyNum(expr, op, c.value);
   }
 
+  // Has an opportunity — mirrors the client (leads.opportunityId, set on
+  // conversion). Boolean "is" yes/no, plus presence operators.
+  if (field === "hasOpportunity") {
+    const present = sql`${leads.opportunityId} is not null`;
+    const absent = sql`${leads.opportunityId} is null`;
+    if (op === "is") return String(c.value) === "true" ? present : absent;
+    if (op === "is_set") return present;
+    if (op === "is_empty") return absent;
+    return null;
+  }
+
+  // Campaign membership (org all-leads page). A lead belongs to exactly one
+  // funnel; "is any of" matches per enrollment. Ids are org-scoped upstream.
+  if (field === "funnelId") {
+    const ids = asArray(c.value);
+    if (ids.length === 0) return null;
+    const inList = sql.join(ids.map((v) => sql`${v}`), sql`, `);
+    if (op === "is") return sql`${leads.funnelId} in (${inList})`;
+    if (op === "is_not") return sql`${leads.funnelId} not in (${inList})`;
+    return null;
+  }
+
   if (field === "companyHiringRoles") {
     const len = sql`jsonb_array_length(coalesce(${leads.companyHiringRoles}, '[]'::jsonb))`;
     if (op === "is_set") return sql`${len} > 0`;
