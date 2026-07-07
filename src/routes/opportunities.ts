@@ -18,6 +18,7 @@ import { ApiError, createId } from "../lib/helpers";
 import { seedDefaultPipeline } from "../lib/opportunities-seed";
 import { getPerms, requirePerm } from "../lib/permission-service";
 import { hasPerm, scopeOf } from "../lib/permission-catalog";
+import { isOrgMember } from "../lib/org-membership";
 
 const router = Router();
 
@@ -266,12 +267,14 @@ router.post(
     const userId = String(req.body?.userId || "");
     const role = String(req.body?.role || "contributor");
     if (!userId) throw new ApiError(400, "userId is required");
-    // Must be an org member.
-    const [u] = await db
-      .select()
-      .from(users)
-      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
-    if (!u) throw new ApiError(400, "User is not a member of this organization");
+    // Must be an org member — verify via Clerk (source of truth), NOT the local
+    // single-org users.organizationId (which is wrong/null for anyone who also
+    // belongs to another org, silently blocking them from being added).
+    if (!(await isOrgMember(userId, orgId))) {
+      throw new ApiError(400, "User is not a member of this organization");
+    }
+    // Profile (org-agnostic) for the response — may be null if not yet synced.
+    const [u] = await db.select().from(users).where(eq(users.id, userId));
     const [existing] = await db
       .select({ id: pipelineMembers.id })
       .from(pipelineMembers)

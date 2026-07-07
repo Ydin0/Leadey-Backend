@@ -10,6 +10,7 @@ import { getOrgId } from "../lib/auth";
 import { getPerms, requirePerm } from "../lib/permission-service";
 import { hasPerm, scopeOf } from "../lib/permission-catalog";
 import { getTaskCategories, saveTaskCategories } from "../lib/task-categories";
+import { isOrgMember } from "../lib/org-membership";
 import { ApiError, createId } from "../lib/helpers";
 
 // Categories are org-configurable now, so accept any non-empty key (slugified).
@@ -91,12 +92,11 @@ async function resolveAssignee(
   if (!hasPerm(perms.permissions, "tasks.assignOthers")) {
     throw new ApiError(403, "You don't have permission to assign tasks to other members");
   }
-  const [m] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.id, requested), eq(users.organizationId, orgId)))
-    .limit(1);
-  if (!m) throw new ApiError(400, "Assignee is not a member of this organization");
+  // Verify via Clerk (source of truth), not the local single-org column, so an
+  // assignee who also belongs to another org isn't falsely rejected.
+  if (!(await isOrgMember(requested, orgId))) {
+    throw new ApiError(400, "Assignee is not a member of this organization");
+  }
   return requested;
 }
 

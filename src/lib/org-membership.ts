@@ -98,6 +98,22 @@ async function fetchMemberOrgIds(userId: string): Promise<Set<string>> {
   return orgs;
 }
 
+/** Whether a user is a member of an org per Clerk (the source of truth),
+ *  cached. Use this instead of the local `users.organizationId` column when
+ *  checking membership: that column is single-org, so a user who belongs to
+ *  several Clerk orgs (or whose row hasn't synced) can falsely look like a
+ *  non-member of an org they're genuinely in. Fails closed on a hard error. */
+export async function isOrgMember(userId: string, orgId: string): Promise<boolean> {
+  if (!userId || !orgId) return false;
+  const hit = cache.get(userId);
+  if (hit && hit.exp > Date.now()) return hit.orgs.has(orgId);
+  try {
+    return (await fetchMemberOrgIds(userId)).has(orgId);
+  } catch {
+    return false;
+  }
+}
+
 export async function requireOrgMembership(req: Request, _res: Response, next: NextFunction) {
   const auth = getAuth(req);
   const userId = auth?.userId;
