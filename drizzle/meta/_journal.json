@@ -491,6 +491,13 @@
       "when": 1783441608623,
       "tag": "0069_fluffy_iron_fist",
       "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1783446016068,
+      "tag": "0070_watery_blue_blade",
+      "breakpoints": true
     }
   ]
 }

@@ -112,6 +112,7 @@ function serializeOpp(
     // was converted from a campaign lead. Lets the client deep-link clicks to
     // the Lead View instead of the dedicated opportunity page.
     funnelId,
+    sortOrder: o.sortOrder,
     value: Number(o.value),
     currency: o.currency,
     probabilityOverride: o.probabilityOverride,
@@ -676,6 +677,55 @@ router.delete(
 // Opportunities
 // ─────────────────────────────────────────────────────────────────────
 
+// POST /opportunities/reorder — persist the kanban order of a stage column.
+// Body: { stageId, orderedIds }. Each id gets sortOrder = its index and its
+// stageId set to the target (so a cross-column drag lands + orders in one call).
+router.post(
+  "/opportunities/reorder",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const perms = await getPerms(req);
+    if (scopeOf(perms.permissions, "opportunities.view") === "none") {
+      throw new ApiError(403, "Not allowed");
+    }
+    const stageId = String(req.body?.stageId || "");
+    const orderedIds: string[] = Array.isArray(req.body?.orderedIds)
+      ? (req.body.orderedIds as unknown[]).map(String)
+      : [];
+    if (!stageId || orderedIds.length === 0) {
+      throw new ApiError(400, "stageId and orderedIds are required");
+    }
+
+    // The target stage must belong to this org (via its pipeline); its type
+    // drives terminal semantics (won/lost set closedAt, open clears it).
+    const [stage] = await db
+      .select({ id: pipelineStages.id, type: pipelineStages.type })
+      .from(pipelineStages)
+      .innerJoin(pipelines, eq(pipelines.id, pipelineStages.pipelineId))
+      .where(and(eq(pipelineStages.id, stageId), eq(pipelines.organizationId, orgId)));
+    if (!stage) throw new ApiError(404, "Stage not found");
+    const isTerminal = stage.type !== "open";
+
+    await db.transaction(async (tx) => {
+      for (let i = 0; i < orderedIds.length; i++) {
+        await tx
+          .update(opportunities)
+          .set({
+            stageId,
+            sortOrder: i,
+            updatedAt: new Date(),
+            // Keep won/lost closed (idempotent); reopen when dropped into open.
+            closedAt: isTerminal ? sql`coalesce(${opportunities.closedAt}, now())` : null,
+            ...(isTerminal ? {} : { lostReason: null }),
+          })
+          .where(and(eq(opportunities.id, orderedIds[i]), eq(opportunities.organizationId, orgId)));
+      }
+    });
+
+    res.json({ data: { ok: true } });
+  }),
+);
+
 router.get(
   "/opportunities",
   asyncHandler(async (req, res) => {
@@ -737,7 +787,8 @@ router.get(
       .select()
       .from(opportunities)
       .where(and(...conditions))
-      .orderBy(desc(opportunities.updatedAt));
+      // Board order: manual position within a stage first, newest as tiebreak.
+      .orderBy(asc(opportunities.sortOrder), desc(opportunities.updatedAt));
 
     let summaryPayload: any = null;
     if (summary === "1" || summary === "true") {

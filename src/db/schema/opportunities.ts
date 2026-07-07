@@ -107,6 +107,8 @@ export const opportunities = pgTable(
     sourceLeadId: text("source_lead_id").references(() => leads.id, {
       onDelete: "set null",
     }),
+    /** Manual position within a stage column on the kanban board (0 = top). */
+    sortOrder: integer("sort_order").notNull().default(0),
     value: numeric("value", { precision: 14, scale: 2 }).notNull().default("0"),
     currency: text("currency").notNull().default("USD"),
     /** When set, overrides the stage's defaultProbability for this opp. */
