@@ -4,9 +4,10 @@ import { eq, and, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { users } from "../db/schema/organizations";
 import { funnels, funnelMembers } from "../db/schema/funnels";
+import { organizationMemberships } from "../db/schema/organization-memberships";
 import { leads } from "../db/schema/leads";
 import { leadTasks } from "../db/schema/lead-tasks";
-import { ApiError } from "./helpers";
+import { ApiError, createId } from "./helpers";
 
 /**
  * Detach a removed member from everything they were assigned to WITHIN one org,
@@ -89,6 +90,69 @@ export async function syncUserPrimaryOrg(userId: string): Promise<void> {
  *  (called when we add/remove a member, or on a Clerk membership webhook). */
 export function invalidateOrgMembership(userId: string): void {
   cache.delete(userId);
+}
+
+// ── organization_memberships (per-org role/appRole/overrides) ──────────────
+// The join table that replaces the single-org users.role/appRole/overrides.
+// Clerk is still the source of truth for WHICH orgs a user is in (isOrgMember /
+// requireOrgMembership above); these rows hold the per-org RBAC data.
+
+export interface OrgMembership {
+  role: string;
+  appRole: string | null;
+  permissionOverrides: Record<string, boolean | string> | null;
+}
+
+/** The user's role data for one org, or null if no membership row yet. */
+export async function getMembership(userId: string, orgId: string): Promise<OrgMembership | null> {
+  const [m] = await db
+    .select({
+      role: organizationMemberships.role,
+      appRole: organizationMemberships.appRole,
+      permissionOverrides: organizationMemberships.permissionOverrides,
+    })
+    .from(organizationMemberships)
+    .where(and(eq(organizationMemberships.userId, userId), eq(organizationMemberships.organizationId, orgId)))
+    .limit(1);
+  return m ?? null;
+}
+
+/** Upsert a user's membership row for an org (dual-write from webhooks / team /
+ *  admin). Only the provided fields are updated on conflict. */
+export async function upsertMembership(
+  orgId: string,
+  userId: string,
+  data: Partial<OrgMembership>,
+): Promise<void> {
+  const set: Record<string, unknown> = { updatedAt: new Date() };
+  if (data.role !== undefined) set.role = data.role;
+  if (data.appRole !== undefined) set.appRole = data.appRole;
+  if (data.permissionOverrides !== undefined) set.permissionOverrides = data.permissionOverrides;
+  await db
+    .insert(organizationMemberships)
+    .values({
+      id: createId("mem"),
+      organizationId: orgId,
+      userId,
+      role: data.role ?? "org:member",
+      appRole: data.appRole ?? "member",
+      permissionOverrides: data.permissionOverrides ?? null,
+    })
+    .onConflictDoUpdate({
+      target: [organizationMemberships.organizationId, organizationMemberships.userId],
+      set,
+    });
+}
+
+export async function deleteMembership(orgId: string, userId: string): Promise<void> {
+  await db
+    .delete(organizationMemberships)
+    .where(and(eq(organizationMemberships.organizationId, orgId), eq(organizationMemberships.userId, userId)));
+}
+
+/** Remove all of a user's memberships (on user.deleted — no userId FK cascades). */
+export async function deleteAllMembershipsForUser(userId: string): Promise<void> {
+  await db.delete(organizationMemberships).where(eq(organizationMemberships.userId, userId));
 }
 
 async function fetchMemberOrgIds(userId: string): Promise<Set<string>> {

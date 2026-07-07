@@ -4,6 +4,7 @@ import { db } from "../db/index";
 import { users } from "../db/schema/organizations";
 import { dialerSessions, dialerQueueItems } from "../db/schema/dialer";
 import { getOrgId } from "../lib/auth";
+import { getMembership } from "../lib/org-membership";
 import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
 import {
@@ -22,11 +23,14 @@ function asyncHandler(handler: (req: Request, res: Response, next: NextFunction)
   };
 }
 
-/** Org admin = Clerk org:admin role on the user row. */
-async function isOrgAdmin(userId: string): Promise<boolean> {
+/** Org admin = Clerk org:admin role for THIS org (per-org membership row,
+ *  falling back to the legacy single-org users.role for the primary org). */
+async function isOrgAdmin(userId: string, orgId: string): Promise<boolean> {
   if (!userId) return false;
-  const [u] = await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1);
-  return u?.role === "org:admin" || u?.role === "admin";
+  const m = await getMembership(userId, orgId);
+  if (m) return m.role === "org:admin" || m.role === "admin";
+  const [u] = await db.select({ role: users.role, orgId: users.organizationId }).from(users).where(eq(users.id, userId)).limit(1);
+  return !!u && u.orgId === orgId && (u.role === "org:admin" || u.role === "admin");
 }
 
 // ── GET /api/calls/local-presence-config ────────────────────────────────
@@ -36,7 +40,7 @@ router.get(
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
     const config = await getLocalPresenceConfig(orgId);
-    res.json({ data: { config, isAdmin: await isOrgAdmin(userId) } });
+    res.json({ data: { config, isAdmin: await isOrgAdmin(userId, orgId) } });
   }),
 );
 
@@ -46,7 +50,7 @@ router.put(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
-    if (!(await isOrgAdmin(userId))) throw new ApiError(403, "Only an admin can change local-presence settings.");
+    if (!(await isOrgAdmin(userId, orgId))) throw new ApiError(403, "Only an admin can change local-presence settings.");
     const body = req.body || {};
     const config = await saveLocalPresenceConfig(orgId, {
       enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
@@ -82,7 +86,7 @@ router.post(
     // *could* cover (so it can offer a one-off buy on a manual dial).
     const dest = areaInfoOf(to);
     const userId = getAuth(req)?.userId || "";
-    const canProvision = cfg.whoCanProvision === "anyone" || (await isOrgAdmin(userId));
+    const canProvision = cfg.whoCanProvision === "anyone" || (await isOrgAdmin(userId, orgId));
     res.json({
       data: {
         source: "default",
@@ -110,7 +114,7 @@ router.get(
       data: {
         lines: lines.map((l) => ({ id: l.id, number: l.number, areaCode: l.areaCode, state: l.state, stateName: l.stateName })),
         config: await getLocalPresenceConfig(orgId),
-        isAdmin: await isOrgAdmin(userId),
+        isAdmin: await isOrgAdmin(userId, orgId),
         monthlyCostPerNumber: MONTHLY_COST_PER_NUMBER,
       },
     });
@@ -179,7 +183,7 @@ router.post(
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
     const cfg = await getLocalPresenceConfig(orgId);
-    if (cfg.whoCanProvision !== "anyone" && !(await isOrgAdmin(userId))) {
+    if (cfg.whoCanProvision !== "anyone" && !(await isOrgAdmin(userId, orgId))) {
       throw new ApiError(403, "Only an admin can buy new numbers. Ask an admin to add local numbers for these states.");
     }
     const areaCode = req.body?.areaCode ? String(req.body.areaCode) : undefined;
@@ -197,7 +201,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
-    if (!(await isOrgAdmin(userId))) throw new ApiError(403, "Only an admin can release numbers.");
+    if (!(await isOrgAdmin(userId, orgId))) throw new ApiError(403, "Only an admin can release numbers.");
     const days = Math.max(1, Math.floor(Number(req.body?.days) || 30));
     const result = await reclaimUnusedLocalNumbers(orgId, days);
     res.json({ data: result });

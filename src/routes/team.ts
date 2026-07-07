@@ -11,8 +11,9 @@ import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
-import { syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
+import { syncUserPrimaryOrg, cleanupUserOrgAssignments, isOrgMember, upsertMembership } from "../lib/org-membership";
 import { orgRoles } from "../db/schema/org-roles";
+import { organizationMemberships } from "../db/schema/organization-memberships";
 import {
   resolvePermissions,
   requirePerm,
@@ -103,18 +104,9 @@ router.get(
       return;
     }
 
-    const user = await db.query.users.findFirst({
-      where: eq(users.id, auth.userId),
-      columns: { role: true },
-    });
-
-    let role = user?.role || "org:member";
-    // Normalize (kept for older clients that still read `role`).
-    if (role === "org:admin") role = "admin";
-    else if (role === "org:member") role = "rep";
-
-    // Resolved granular permissions for the new client. Fail-closed: on error
-    // the frontend hook synthesizes a locked-down map, never admin.
+    // Resolved granular permissions for the new client, keyed to the token's
+    // active org (per-org via the membership row). Fail-closed: on error the
+    // frontend hook synthesizes a locked-down map, never admin.
     let permissions = null;
     let appRole = "member";
     let isOrgAdmin = false;
@@ -128,6 +120,8 @@ router.get(
       console.warn("[team/me] permission resolve failed:", err instanceof Error ? err.message : err);
     }
 
+    // Coarse role kept for older clients that still read `role`.
+    const role = isOrgAdmin ? "admin" : "rep";
     res.json({ data: { role, appRole, isOrgAdmin, permissions } });
   }),
 );
@@ -156,12 +150,20 @@ router.get(
       imageUrl: string | null; role: string; createdAt: string;
       appRole: string; hasOverrides: boolean;
     };
-    // The member's effective app-role: org:admin is always "admin"; otherwise
-    // the stored app_role (default member).
-    const effectiveAppRole = (clerkRole: string, row?: typeof users.$inferSelect) =>
-      clerkRole === "org:admin" ? "admin" : row?.appRole || "member";
-    const hasOverrides = (row?: typeof users.$inferSelect) =>
-      !!row?.permissionOverrides && Object.keys(row.permissionOverrides).length > 0;
+    // Per-org appRole/overrides come from the membership row (source of truth),
+    // falling back to the legacy single-org users columns during transition.
+    type Mem = { appRole: string | null; permissionOverrides: Record<string, boolean | string> | null };
+    const appRoleFor = (clerkRole: string, mem?: Mem, row?: typeof users.$inferSelect) =>
+      clerkRole === "org:admin" ? "admin" : mem?.appRole || row?.appRole || "member";
+    const overridesFor = (mem?: Mem, row?: typeof users.$inferSelect) => {
+      const o = mem?.permissionOverrides ?? row?.permissionOverrides;
+      return !!o && Object.keys(o).length > 0;
+    };
+    const memRows = await db
+      .select({ userId: organizationMemberships.userId, appRole: organizationMemberships.appRole, permissionOverrides: organizationMemberships.permissionOverrides })
+      .from(organizationMemberships)
+      .where(eq(organizationMemberships.organizationId, orgId));
+    const memById = new Map<string, Mem>(memRows.map((m) => [m.userId, m]));
     let members: Member[];
     try {
       const list = await clerkClient.organizations.getOrganizationMembershipList({
@@ -173,17 +175,19 @@ router.get(
       const byId = new Map(rows.map((r) => [r.id, r]));
       members = list.data.map((m) => {
         const pud = m.publicUserData;
-        const row = pud?.userId ? byId.get(pud.userId) : undefined;
+        const uid = pud?.userId;
+        const row = uid ? byId.get(uid) : undefined;
+        const mem = uid ? memById.get(uid) : undefined;
         const clerkRole = m.role || "org:member";
         return {
-          id: pud?.userId || m.id,
+          id: uid || m.id,
           email: pud?.identifier || row?.email || "",
           firstName: pud?.firstName ?? row?.firstName ?? null,
           lastName: pud?.lastName ?? row?.lastName ?? null,
           imageUrl: pud?.imageUrl ?? row?.imageUrl ?? null,
           role: clerkRole,
-          appRole: effectiveAppRole(clerkRole, row),
-          hasOverrides: hasOverrides(row),
+          appRole: appRoleFor(clerkRole, mem, row),
+          hasOverrides: overridesFor(mem, row),
           createdAt: new Date(m.createdAt).toISOString(),
         };
       });
@@ -196,8 +200,8 @@ router.get(
         lastName: m.lastName,
         imageUrl: m.imageUrl,
         role: m.role || "org:member",
-        appRole: effectiveAppRole(m.role || "org:member", m),
-        hasOverrides: hasOverrides(m),
+        appRole: appRoleFor(m.role || "org:member", memById.get(m.id), m),
+        hasOverrides: overridesFor(memById.get(m.id), m),
         createdAt: m.createdAt.toISOString(),
       }));
     }
@@ -310,8 +314,8 @@ router.post(
 
     const [{ memberCount }] = await db
       .select({ memberCount: count() })
-      .from(users)
-      .where(eq(users.organizationId, orgId));
+      .from(organizationMemberships)
+      .where(eq(organizationMemberships.organizationId, orgId));
 
     const config = getPlanConfig(org.plan);
     const seatLimit = org.seatsIncluded || config.seats;
@@ -473,10 +477,13 @@ router.patch(
 
       // Mirror to DB. Promoting to admin sets app_role "admin"; demoting resets
       // to "member" so the granular role actually applies from now on.
+      const nextAppRole = role === "org:admin" ? "admin" : "member";
       await db
         .update(users)
-        .set({ role, appRole: role === "org:admin" ? "admin" : "member", updatedAt: new Date() })
+        .set({ role, appRole: nextAppRole, updatedAt: new Date() })
         .where(eq(users.id, userId));
+      // Per-org membership row is the source of truth going forward.
+      await upsertMembership(orgId, userId, { role, appRole: nextAppRole });
       invalidateUserPermissions(orgId, userId);
 
       res.json({ data: { id: userId, role } });
@@ -499,16 +506,13 @@ router.patch(
     const { appRole, overrides } = req.body || {};
     const caller = await resolvePermissions(orgId, getAuth(req)?.userId || "");
 
-    // Member must belong to this org.
-    const [target] = await db
-      .select({ id: users.id, role: users.role })
-      .from(users)
-      .where(and(eq(users.id, userId), eq(users.organizationId, orgId)));
-    if (!target) throw new ApiError(404, "Member not found");
+    // Member must belong to this org — Clerk source of truth (multi-org safe).
+    if (!(await isOrgMember(userId, orgId))) throw new ApiError(404, "Member not found");
+    const targetPerms = await resolvePermissions(orgId, userId);
 
     // Escalation guard: only an org:admin may touch an org:admin's grant or
     // hand out the "admin" app-role.
-    if (target.role === "org:admin" && !caller.isOrgAdmin) {
+    if (targetPerms.isOrgAdmin && !caller.isOrgAdmin) {
       throw new ApiError(403, "Only an admin can edit another admin's permissions");
     }
 
@@ -547,6 +551,11 @@ router.patch(
     }
 
     await db.update(users).set(updates).where(eq(users.id, userId));
+    // Mirror to the per-org membership row (source of truth going forward).
+    const memPatch: Partial<{ appRole: string; permissionOverrides: Record<string, boolean | string> | null }> = {};
+    if (appRole !== undefined) memPatch.appRole = appRole;
+    if (overrides !== undefined) memPatch.permissionOverrides = (updates.permissionOverrides as Record<string, boolean | string> | null) ?? null;
+    if (Object.keys(memPatch).length > 0) await upsertMembership(orgId, userId, memPatch);
     invalidateUserPermissions(orgId, userId);
     res.json({ data: { id: userId, ok: true } });
   }),
@@ -561,10 +570,10 @@ router.get(
     const custom = await db.select().from(orgRoles).where(eq(orgRoles.organizationId, orgId));
     // Member count per role (org:admin members always resolve to admin).
     const rows = await db
-      .select({ appRole: users.appRole, count: count() })
-      .from(users)
-      .where(eq(users.organizationId, orgId))
-      .groupBy(users.appRole);
+      .select({ appRole: organizationMemberships.appRole, count: count() })
+      .from(organizationMemberships)
+      .where(eq(organizationMemberships.organizationId, orgId))
+      .groupBy(organizationMemberships.appRole);
     const counts = new Map(rows.map((r) => [r.appRole || "member", Number(r.count)]));
     res.json({
       data: {
@@ -660,11 +669,17 @@ router.delete(
         .from(orgRoles)
         .where(and(eq(orgRoles.id, roleId), eq(orgRoles.organizationId, orgId)));
       if (!existing) throw new ApiError(404, "Role not found");
+      // Reassign anyone on this custom role back to member — in the per-org
+      // membership rows (source of truth) AND the legacy users column.
       const reassigned = await tx
+        .update(organizationMemberships)
+        .set({ appRole: "member", updatedAt: new Date() })
+        .where(and(eq(organizationMemberships.organizationId, orgId), eq(organizationMemberships.appRole, roleId)))
+        .returning({ id: organizationMemberships.userId });
+      await tx
         .update(users)
         .set({ appRole: "member", updatedAt: new Date() })
-        .where(and(eq(users.organizationId, orgId), eq(users.appRole, roleId)))
-        .returning({ id: users.id });
+        .where(and(eq(users.organizationId, orgId), eq(users.appRole, roleId)));
       await tx.delete(orgRoles).where(eq(orgRoles.id, roleId));
       return reassigned.length;
     });

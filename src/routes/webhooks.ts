@@ -19,7 +19,8 @@ import { setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
-import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments } from "../lib/org-membership";
+import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments, upsertMembership, deleteMembership, deleteAllMembershipsForUser } from "../lib/org-membership";
+import { invalidateUserPermissions } from "../lib/permission-service";
 import { fireTrigger, fireTriggerForLead, notifyWorkflowEvent } from "../services/workflow-engine";
 
 const router = Router();
@@ -515,6 +516,11 @@ router.post("/clerk", async (req: Request, res: Response) => {
               updatedAt: new Date(data.updated_at),
             },
           });
+        // Per-org membership row.
+        if (targetOrgId) {
+          await upsertMembership(targetOrgId, data.id, { role: targetRole });
+          invalidateUserPermissions(targetOrgId, data.id);
+        }
 
         // Best-effort: ensure the Clerk membership exists too (idempotent —
         // the invite flow usually creates it already; "already a member" is fine).
@@ -560,6 +566,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
         break;
       }
       case "user.deleted": {
+        await deleteAllMembershipsForUser(data.id);
         await db.delete(users).where(eq(users.id, data.id));
         break;
       }
@@ -590,28 +597,30 @@ router.post("/clerk", async (req: Request, res: Response) => {
               updatedAt: new Date(),
             },
           });
+        // Per-org membership row (source of truth for role/RBAC).
+        await upsertMembership(data.organization.id, userId, { role: data.role });
+        invalidateUserPermissions(data.organization.id, userId);
         break;
       }
       case "organizationMembership.updated": {
-        invalidateOrgMembership(data.public_user_data.user_id);
-        await db
-          .update(users)
-          .set({
-            role: data.role,
-            updatedAt: new Date(),
-          })
-          .where(eq(users.id, data.public_user_data.user_id));
+        const uid = data.public_user_data.user_id;
+        invalidateOrgMembership(uid);
+        await db.update(users).set({ role: data.role, updatedAt: new Date() }).where(eq(users.id, uid));
+        await upsertMembership(data.organization.id, uid, { role: data.role });
+        invalidateUserPermissions(data.organization.id, uid);
         break;
       }
       case "organizationMembership.deleted": {
-        // Re-point to a still-valid org instead of blanket-nulling the row,
-        // which would wipe a multi-org user platform-wide. (Also invalidates
-        // the membership cache.)
-        await syncUserPrimaryOrg(data.public_user_data.user_id);
-        // Detach from that org's campaigns / leads / tasks so they don't show
-        // as "Unknown" assignees after removal (e.g. via the Clerk dashboard).
+        const uid = data.public_user_data.user_id;
+        // Re-point the legacy single-org row to a still-valid org instead of
+        // blanket-nulling it (would wipe a multi-org user platform-wide).
+        await syncUserPrimaryOrg(uid);
         if (data.organization?.id) {
-          await cleanupUserOrgAssignments(data.organization.id, data.public_user_data.user_id);
+          // Drop the per-org membership row + detach from that org's
+          // campaigns / leads / tasks so they don't show as "Unknown".
+          await deleteMembership(data.organization.id, uid);
+          invalidateUserPermissions(data.organization.id, uid);
+          await cleanupUserOrgAssignments(data.organization.id, uid);
         }
         break;
       }

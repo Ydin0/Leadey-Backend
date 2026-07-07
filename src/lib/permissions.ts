@@ -4,6 +4,7 @@ import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { users } from "../db/schema/organizations";
 import { funnelMembers } from "../db/schema/funnels";
+import { getMembership } from "./org-membership";
 
 // Role hierarchy: admin > manager > rep > viewer
 const ROLE_HIERARCHY: Record<string, number> = {
@@ -23,16 +24,26 @@ function roleLevel(role: string): number {
  * Get the user's platform role from the DB.
  * Falls back to "rep" if no role is set.
  */
-export async function getUserRole(userId: string): Promise<string> {
-  const user = await db.query.users.findFirst({
-    where: eq(users.id, userId),
-    columns: { role: true },
-  });
-  const role = user?.role || "org:member";
+export async function getUserRole(userId: string, orgId?: string): Promise<string> {
+  // Per-org role from the membership row; fall back to the legacy single-org
+  // users.role only for the user's primary org.
+  let role: string | null = null;
+  if (orgId) {
+    const m = await getMembership(userId, orgId);
+    role = m?.role ?? null;
+  }
+  if (role == null) {
+    const user = await db.query.users.findFirst({
+      where: eq(users.id, userId),
+      columns: { role: true, organizationId: true },
+    });
+    role = user && (!orgId || user.organizationId === orgId) ? (user.role ?? null) : null;
+  }
+  const r = role || "org:member";
   // Normalize Clerk roles to platform roles
-  if (role === "org:admin") return "admin";
-  if (role === "org:member") return "rep";
-  return role;
+  if (r === "org:admin") return "admin";
+  if (r === "org:member") return "rep";
+  return r;
 }
 
 /**
@@ -67,7 +78,7 @@ export function requireRole(...allowedRoles: string[]) {
       return;
     }
 
-    const role = await getUserRole(auth.userId);
+    const role = await getUserRole(auth.userId, auth.orgId || undefined);
     if (allowedRoles.includes(role)) {
       (req as any)._userRole = role;
       return next();
@@ -92,7 +103,7 @@ export function requireFunnelAccess(...requiredFunnelRoles: string[]) {
       return;
     }
 
-    const platformRole = await getUserRole(auth.userId);
+    const platformRole = await getUserRole(auth.userId, auth.orgId || undefined);
     (req as any)._userRole = platformRole;
 
     // Admin always has full access

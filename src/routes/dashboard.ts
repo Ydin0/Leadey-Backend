@@ -135,7 +135,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
-    const role = userId ? await getUserRole(userId) : "rep";
+    const role = userId ? await getUserRole(userId, orgId) : "rep";
     const allFunnels = await loadAllFunnels(orgId, { userId, role });
     const funnelIds = allFunnels.map((f) => f.id);
 

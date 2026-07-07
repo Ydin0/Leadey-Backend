@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
+import { getMembership } from "../lib/org-membership";
 import { requirePerm } from "../lib/permission-service";
 import { getAuth } from "@clerk/express";
 import { ApiError } from "../lib/helpers";
@@ -16,10 +17,12 @@ function asyncHandler(handler: (req: Request, res: Response, next: NextFunction)
   };
 }
 
-async function isOrgAdmin(userId: string): Promise<boolean> {
+async function isOrgAdmin(userId: string, orgId: string): Promise<boolean> {
   if (!userId) return false;
-  const [u] = await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1);
-  return u?.role === "org:admin" || u?.role === "admin";
+  const m = await getMembership(userId, orgId);
+  if (m) return m.role === "org:admin" || m.role === "admin";
+  const [u] = await db.select({ role: users.role, orgId: users.organizationId }).from(users).where(eq(users.id, userId)).limit(1);
+  return !!u && u.orgId === orgId && (u.role === "org:admin" || u.role === "admin");
 }
 
 // GET /api/call-outcomes — the org's call-outcome label set.
@@ -36,7 +39,7 @@ router.put(
   requirePerm("settings.manageOrgConfig"),
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
-    if (!(await isOrgAdmin(userId))) throw new ApiError(403, "Only an admin can change call outcomes.");
+    if (!(await isOrgAdmin(userId, getOrgId(req)))) throw new ApiError(403, "Only an admin can change call outcomes.");
     const list = req.body?.outcomes ?? req.body;
     res.json({ data: await saveCallOutcomes(getOrgId(req), list) });
   }),

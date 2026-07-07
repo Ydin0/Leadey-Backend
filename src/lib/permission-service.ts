@@ -15,6 +15,7 @@ import { funnels, funnelMembers } from "../db/schema/funnels";
 import { leads } from "../db/schema/leads";
 import { ApiError } from "./helpers";
 import { getOrgId } from "./auth";
+import { getMembership } from "./org-membership";
 import { createTtlCache } from "./ttl-cache";
 import {
   builtinRoleDefaults,
@@ -55,20 +56,39 @@ export async function resolvePermissions(orgId: string, userId: string): Promise
   const cached = permCache.get(cacheKey);
   if (cached) return cached;
 
-  const [u] = await db
-    .select({ role: users.role, appRole: users.appRole, overrides: users.permissionOverrides })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
+  // Per-org role/RBAC from the membership row (source of truth). Fall back to
+  // the legacy single-org users columns ONLY for the user's primary org, to
+  // cover backfill lag / brand-new members before their row exists. A multi-org
+  // user whose primary org differs resolves to plain member here (safe) until
+  // backfill writes their membership row.
+  const membership = await getMembership(userId, orgId);
+  let role: string | null;
+  let appRoleRaw: string | null;
+  let overrides: Record<string, boolean | string> | null;
+  if (membership) {
+    role = membership.role;
+    appRoleRaw = membership.appRole;
+    overrides = membership.permissionOverrides;
+  } else {
+    const [u] = await db
+      .select({ role: users.role, appRole: users.appRole, overrides: users.permissionOverrides, orgId: users.organizationId })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+    const primary = !!u && u.orgId === orgId;
+    role = primary ? u!.role : null;
+    appRoleRaw = primary ? u!.appRole : null;
+    overrides = primary ? (u!.overrides ?? null) : null;
+  }
 
-  const isOrgAdmin = u?.role === "org:admin" || u?.role === "admin";
+  const isOrgAdmin = role === "org:admin" || role === "admin";
   let resolved: ResolvedUser;
 
   if (isOrgAdmin) {
     // Escape hatch: owners always have everything, regardless of appRole.
     resolved = { permissions: BUILTIN_ROLES.admin, appRole: "admin", isOrgAdmin: true };
   } else {
-    const appRole = u?.appRole || "member";
+    const appRole = appRoleRaw || "member";
     let base: ResolvedPermissions;
     if (appRole.startsWith("role_")) {
       const [custom] = await db
@@ -83,7 +103,7 @@ export async function resolvePermissions(orgId: string, userId: string): Promise
       base = builtinRoleDefaults(appRole);
     }
     resolved = {
-      permissions: mergePermissions(base, u?.overrides ?? null),
+      permissions: mergePermissions(base, overrides ?? null),
       appRole,
       isOrgAdmin: false,
     };
