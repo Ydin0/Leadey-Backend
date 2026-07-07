@@ -222,8 +222,38 @@ async function potentialContacts(orgId: string) {
     if (iso > pc.lastAt) pc.lastAt = iso;
   }
 
+  // Exclude anyone who is ALREADY A LEAD in this org (matched at query time,
+  // by last-10-digit phone or email — primary + extra). The stored leadId is a
+  // stale ingest-time snapshot that only ever matched the primary leads.phone,
+  // so leads reachable via a secondary number/email (or created after the call)
+  // wrongly linger here. This re-check is the real "not matched to a lead" gate.
+  let list = [...map.values()];
+  if (list.length) {
+    const leadRows = await db
+      .select({ phone: leads.phone, extraPhones: leads.extraPhones, email: leads.email, extraEmails: leads.extraEmails })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(eq(funnels.organizationId, orgId));
+    const leadPhoneKeys = new Set<string>();
+    const leadEmails = new Set<string>();
+    for (const l of leadRows) {
+      for (const p of [l.phone, ...(l.extraPhones ?? []).map((x) => x.value)]) {
+        const k = norm(p);
+        if (k) leadPhoneKeys.add(k);
+      }
+      for (const e of [l.email, ...(l.extraEmails ?? []).map((x) => x.value)]) {
+        const em = (e || "").trim().toLowerCase();
+        if (em) leadEmails.add(em);
+      }
+    }
+    list = list.filter((pc) =>
+      pc.source === "calendly"
+        ? !(pc.email && leadEmails.has(pc.email.toLowerCase()))
+        : !(norm(pc.phone) && leadPhoneKeys.has(norm(pc.phone))),
+    );
+  }
+
   // Enrich names from master_contacts by last-10-digit phone match.
-  const list = [...map.values()];
   if (list.length) {
     const mc = await db
       .select({ phone: masterContacts.phone, fullName: masterContacts.fullName, firstName: masterContacts.firstName, lastName: masterContacts.lastName })
