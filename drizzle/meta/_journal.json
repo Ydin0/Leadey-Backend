@@ -484,6 +484,13 @@
       "when": 1783437239206,
       "tag": "0068_ordinary_strong_guy",
       "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1783441608623,
+      "tag": "0069_fluffy_iron_fist",
+      "breakpoints": true
     }
   ]
 }

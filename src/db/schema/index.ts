@@ -9,6 +9,7 @@ export { leadTasks } from "./lead-tasks";
 export { leadHiringRoles } from "./hiring-roles";
 export { imports } from "./imports";
 export { smsMessages } from "./sms";
+export { whatsappAccounts } from "./whatsapp-accounts";
 export { notifications } from "./notifications";
 export { emailAccounts, emailMessages } from "./email-accounts";
 export { calendlyAccounts, calendlyMeetings } from "./calendly";

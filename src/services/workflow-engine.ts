@@ -220,19 +220,28 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
       const tokens = await leadTokens(lead, orgId);
       const body = renderTokens(String(d.message || ""), tokens);
+      // Optional approved-template send (required outside the 24h window for
+      // cold outreach). Variables are token-rendered against the lead.
+      const templateName = typeof d.templateName === "string" && d.templateName ? d.templateName : undefined;
+      const templateLanguage = typeof d.templateLanguage === "string" && d.templateLanguage ? d.templateLanguage : undefined;
+      const rawVars = Array.isArray(d.templateVariables) ? (d.templateVariables as unknown[]) : [];
+      const templateVariables = templateName ? rawVars.map((v) => renderTokens(String(v ?? ""), tokens)) : undefined;
       try {
-        // QR-linked WhatsApp via the org's own connected number (Unipile).
-        // Failures (e.g. no account connected) land in the step-run log with
-        // the human-readable reason.
+        // Meta WhatsApp Cloud API via the org's connected number. Failures
+        // (no account, outside 24h without a template) land in the step log.
         await sendWhatsapp({
           orgId,
           lead: { id: lead.id, phone: lead.phone, funnelId: lead.funnelId },
           body,
+          templateName,
+          templateLanguage,
+          templateVariables,
+          contentBody: typeof d.contentBody === "string" ? renderTokens(d.contentBody, tokens) : undefined,
           userId: null,
         });
         await db.insert(leadEvents).values({
           id: createId("event"), leadId: lead.id, type: "step_outcome", outcome: "sent",
-          stepIndex: 0, meta: { channel: "whatsapp", direction: "outbound", body, source: "workflow" }, timestamp: new Date(),
+          stepIndex: 0, meta: { channel: "whatsapp", direction: "outbound", body: body || templateName, template: templateName || null, source: "workflow" }, timestamp: new Date(),
         });
         await logRun(enr, node, "done", {});
       } catch (e) {

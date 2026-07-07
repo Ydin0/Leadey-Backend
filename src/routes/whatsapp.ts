@@ -6,31 +6,32 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { smsMessages } from "../db/schema/sms";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
-import { settings } from "../db/schema/settings";
+import { whatsappAccounts } from "../db/schema/whatsapp-accounts";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId, phoneKey } from "../lib/helpers";
 import { requirePerm } from "../lib/permission-service";
-import { getSetting, upsertSetting, deleteSetting } from "../lib/settings-service";
+import { encryptSecret } from "../lib/crypto";
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
 import { createNotification } from "./notifications";
+import { sendWhatsapp, getWhatsappAccount } from "../services/whatsapp-sender";
 import {
-  sendWhatsapp,
-  getConnectedUnipileWhatsapp,
-  unipilePlatformClient,
-  UNIPILE_WA_ACCOUNT_KEY,
-  UNIPILE_WA_PHONE_KEY,
-} from "../services/whatsapp-sender";
+  metaConfigured,
+  exchangeCode,
+  getPhoneInfo,
+  subscribeApp,
+  unsubscribeApp,
+  registerPhone,
+  listTemplates,
+  verifyMetaSignature,
+} from "../lib/meta-whatsapp";
 
-// WhatsApp is QR-linked via Unipile (Close.com-style): the org scans a QR with
-// their own phone, and sends go out from that number. No Twilio, no Meta WABA,
-// no templates, no 24-hour window. Messages reuse the sms_messages table with
+// WhatsApp runs on the official Meta WhatsApp Cloud API, onboarded per-org via
+// Embedded Signup (Tech Provider). Messages reuse the sms_messages table with
 // channel="whatsapp" so threads/inbox/reply-triggers are shared with SMS.
 
 const router = Router();
 
-function asyncHandler(
-  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
-) {
+function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(handler(req, res, next)).catch(next);
   };
@@ -41,74 +42,104 @@ router.get(
   "/whatsapp/settings",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const unipile = await getConnectedUnipileWhatsapp(orgId);
+    const [row] = await db
+      .select()
+      .from(whatsappAccounts)
+      .where(eq(whatsappAccounts.organizationId, orgId))
+      .limit(1);
     res.json({
       data: {
-        /** Whether the platform has Unipile configured at all. */
-        available: !!unipilePlatformClient(),
-        /** Whether this org has a QR-connected WhatsApp account. */
-        connected: !!unipile,
-        /** The connected phone number (display only). */
-        phone: unipile?.phone ?? null,
+        available: metaConfigured(),
+        connected: !!row,
+        phone: row?.displayPhone ?? null,
+        wabaId: row?.wabaId ?? null,
       },
     });
   }),
 );
 
-// ── POST /api/whatsapp/connect-link — start the QR connect flow ─────
-// Returns a Unipile hosted-auth URL: the customer opens it, scans the QR with
-// their own WhatsApp, and Unipile calls our notify webhook with the new
-// account id.
+// ── POST /api/whatsapp/connect — finish Embedded Signup ─────────────
+// Body: { code, phoneNumberId, wabaId, businessId } captured client-side from
+// the FB.login callback + the WA_EMBEDDED_SIGNUP message event.
 router.post(
-  "/whatsapp/connect-link",
+  "/whatsapp/connect",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const unipile = unipilePlatformClient();
-    if (!unipile) throw new ApiError(501, "WhatsApp connection is not configured on the platform");
-    const base = process.env.WEBHOOK_BASE_URL;
-    const appBase = process.env.APP_BASE_URL || "http://localhost:3000";
-
-    // Make sure incoming WhatsApp messages reach us (idempotent, best-effort).
-    if (base) {
-      const messagesUrl = `${base}/webhooks/unipile/messages`;
-      try {
-        const hooks = await unipile.listWebhooks();
-        if (!hooks.some((h) => h.request_url === messagesUrl)) {
-          await unipile.createMessagingWebhook(messagesUrl);
-        }
-      } catch (err) {
-        console.warn("[whatsapp] unipile webhook registration failed:", err instanceof Error ? err.message : err);
-      }
+    if (!metaConfigured()) throw new ApiError(501, "WhatsApp is not configured on the platform");
+    const code = String(req.body?.code || "").trim();
+    const phoneNumberId = String(req.body?.phoneNumberId || "").trim();
+    const wabaId = String(req.body?.wabaId || "").trim();
+    const businessId = req.body?.businessId ? String(req.body.businessId) : null;
+    if (!code || !phoneNumberId || !wabaId) {
+      throw new ApiError(400, "Missing Embedded Signup details (code, phoneNumberId, wabaId)");
     }
 
-    const link = await unipile.createHostedAuthLink({
-      providers: ["WHATSAPP"],
-      name: orgId,
-      ...(base ? { notifyUrl: `${base}/webhooks/unipile/hosted-auth` } : {}),
-      successRedirectUrl: `${appBase}/dashboard/settings?tab=whatsapp&whatsapp_connected=1`,
-      failureRedirectUrl: `${appBase}/dashboard/settings?tab=whatsapp&whatsapp_error=1`,
+    // Exchange the 30-second code for a long-lived business token.
+    const { accessToken, expiresIn } = await exchangeCode(code);
+    // Subscribe our app to the WABA so inbound messages reach our webhook.
+    await subscribeApp(wabaId, accessToken).catch((err) => {
+      console.warn("[whatsapp] subscribeApp failed:", err instanceof Error ? err.message : err);
     });
-    res.json({ data: { url: link.url } });
+    // Register the number for Cloud API (best-effort — often already registered).
+    const pin = String(Math.floor(100000 + Math.random() * 900000));
+    await registerPhone(phoneNumberId, accessToken, pin).catch((err) => {
+      console.warn("[whatsapp] registerPhone (non-fatal):", err instanceof Error ? err.message : err);
+    });
+    // Display number + verified name for the UI.
+    const info = await getPhoneInfo(phoneNumberId, accessToken).catch(() => ({ displayPhone: null, verifiedName: null }));
+
+    const now = new Date();
+    const tokenExpiresAt = expiresIn ? new Date(Date.now() + expiresIn * 1000) : new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+    const values = {
+      organizationId: orgId,
+      wabaId,
+      phoneNumberId,
+      displayPhone: info.displayPhone,
+      verifiedName: info.verifiedName,
+      businessId,
+      encryptedToken: encryptSecret(accessToken),
+      tokenExpiresAt,
+      status: "connected" as const,
+      lastError: null,
+      updatedAt: now,
+    };
+    await db
+      .insert(whatsappAccounts)
+      .values({ id: createId("wac"), ...values })
+      .onConflictDoUpdate({ target: whatsappAccounts.organizationId, set: values });
+
+    res.status(201).json({ data: { connected: true, phone: info.displayPhone, wabaId } });
   }),
 );
 
-// ── DELETE /api/whatsapp/account — disconnect the QR-linked WhatsApp ──
+// ── DELETE /api/whatsapp/account — disconnect ───────────────────────
 router.delete(
   "/whatsapp/account",
+  requirePerm("messaging.manageAccounts"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const connected = await getConnectedUnipileWhatsapp(orgId);
-    if (connected) {
-      // Remove the Unipile account too (it bills per connected account).
-      try {
-        await unipilePlatformClient()?.deleteAccount(connected.accountId);
-      } catch (err) {
-        console.warn("[whatsapp] unipile account delete failed (continuing):", err instanceof Error ? err.message : err);
-      }
+    const account = await getWhatsappAccount(orgId);
+    if (account) {
+      await unsubscribeApp(account.wabaId, account.token).catch(() => {});
     }
-    await deleteSetting(orgId, UNIPILE_WA_ACCOUNT_KEY);
-    await deleteSetting(orgId, UNIPILE_WA_PHONE_KEY);
+    await db.delete(whatsappAccounts).where(eq(whatsappAccounts.organizationId, orgId));
     res.json({ data: { connected: false } });
+  }),
+);
+
+// ── GET /api/whatsapp/templates — approved templates for the picker ──
+router.get(
+  "/whatsapp/templates",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const account = await getWhatsappAccount(orgId);
+    if (!account) {
+      res.json({ data: [] });
+      return;
+    }
+    const templates = await listTemplates(account.wabaId, account.token).catch(() => []);
+    res.json({ data: templates });
   }),
 );
 
@@ -122,7 +153,13 @@ router.post(
     const funnelId = String(req.params.funnelId);
     const leadId = String(req.params.leadId);
     const body = String(req.body?.body ?? "").trim();
-    if (!body) throw new ApiError(400, "A message body is required");
+    const templateName = req.body?.templateName ? String(req.body.templateName) : undefined;
+    const templateLanguage = req.body?.templateLanguage ? String(req.body.templateLanguage) : undefined;
+    const templateVariables = Array.isArray(req.body?.templateVariables)
+      ? (req.body.templateVariables as string[]).map(String)
+      : undefined;
+    const contentBody = req.body?.contentBody ? String(req.body.contentBody) : undefined;
+    if (!body && !templateName) throw new ApiError(400, "A message body or template is required");
 
     const [lead] = await db
       .select({ id: leads.id, phone: leads.phone, currentStep: leads.currentStep, funnelId: leads.funnelId })
@@ -135,6 +172,10 @@ router.post(
       orgId,
       lead: { id: lead.id, phone: lead.phone, funnelId: lead.funnelId },
       body,
+      templateName,
+      templateLanguage,
+      templateVariables,
+      contentBody,
       userId,
     });
 
@@ -154,7 +195,7 @@ router.post(
       type: "step_outcome",
       outcome: "sent",
       stepIndex: Math.max(0, (lead.currentStep || 1) - 1),
-      meta: { channel: "whatsapp", direction: "outbound", body, userId, userName },
+      meta: { channel: "whatsapp", direction: "outbound", body: body || templateName, template: templateName || null, userId, userName },
       timestamp: now,
     });
 
@@ -165,7 +206,7 @@ router.post(
         channel: "whatsapp",
         fromNumber: result.fromNumber,
         toNumber: result.toNumber,
-        body,
+        body: body || `[template: ${templateName}]`,
         status: result.status,
         userId,
         userName,
@@ -177,66 +218,75 @@ router.post(
 
 export default router;
 
-// ── PUBLIC: Unipile webhooks (mounted under /webhooks, no auth) ──────
+// ── PUBLIC: Meta webhook (mounted under /webhooks; raw body for signature) ──
 export const whatsappPublicRouter = Router();
 
-/** Hosted-auth completion: Unipile POSTs { status, account_id, name } where
- *  `name` is the orgId we passed when creating the link. */
-whatsappPublicRouter.post(
-  "/unipile/hosted-auth",
-  asyncHandler(async (req, res) => {
-    try {
-      const status = String(req.body?.status || "");
-      const accountId = String(req.body?.account_id || "");
-      const orgId = String(req.body?.name || "");
-      if (accountId && orgId && (status === "CREATION_SUCCESS" || status === "RECONNECTED" || !status)) {
-        await upsertSetting(orgId, UNIPILE_WA_ACCOUNT_KEY, accountId);
-        // The account's display name is the connected phone number.
-        try {
-          const account = await unipilePlatformClient()?.getAccount(accountId);
-          if (account?.name) await upsertSetting(orgId, UNIPILE_WA_PHONE_KEY, account.name);
-        } catch {
-          // phone label is cosmetic — connection still works without it
-        }
-        console.log(`[whatsapp] unipile account ${accountId} connected for org ${orgId}`);
-      }
-    } catch (err) {
-      console.error("[whatsapp] hosted-auth notify failed:", err);
+/** Webhook verification handshake (Meta App Dashboard → WhatsApp → Config). */
+whatsappPublicRouter.get("/meta/whatsapp", (req: Request, res: Response) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+    res.status(200).send(String(challenge ?? ""));
+    return;
+  }
+  res.sendStatus(403);
+});
+
+/** Map a Meta delivery status to our sms_messages.status. */
+function mapStatus(s: string): string {
+  if (s === "read") return "delivered";
+  if (s === "delivered") return "delivered";
+  if (s === "sent") return "sent";
+  if (s === "failed") return "failed";
+  return s;
+}
+
+/** Inbound messages + delivery statuses for connected WABAs. Body is RAW
+ *  (express.raw registered for /webhooks/meta) so we can verify the signature. */
+whatsappPublicRouter.post("/meta/whatsapp", asyncHandler(async (req, res) => {
+  try {
+    const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
+    if (!verifyMetaSignature(raw, req.header("x-hub-signature-256"))) {
+      // Reject spoofed calls but still 200 so Meta doesn't disable the hook.
+      console.warn("[whatsapp] meta webhook signature mismatch");
+      res.sendStatus(200);
+      return;
     }
-    res.json({ ok: true });
-  }),
-);
+    const payload = JSON.parse(raw.toString("utf8")) as MetaWebhook;
 
-/** Incoming WhatsApp messages for QR-connected accounts. Mirrors the Twilio
- *  inbound path: store the message, match the lead by phone, log the timeline
- *  event, fire reply triggers, notify the last rep. */
-whatsappPublicRouter.post(
-  "/unipile/messages",
-  asyncHandler(async (req, res) => {
-    try {
-      const p = (req.body || {}) as Record<string, unknown>;
-      const accountType = String(p.account_type || "");
-      const accountId = String(p.account_id || "");
-      if (accountId && (!accountType || accountType.toUpperCase() === "WHATSAPP")) {
-        // Which org owns this connected account?
-        const [row] = await db
-          .select({ organizationId: settings.organizationId })
-          .from(settings)
-          .where(and(eq(settings.key, UNIPILE_WA_ACCOUNT_KEY), eq(settings.value, accountId)));
-        const orgId = row?.organizationId;
+    for (const entry of payload.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.field !== "messages") continue;
+        const value = change.value || {};
+        const phoneNumberId = value.metadata?.phone_number_id;
+        if (!phoneNumberId) continue;
+        const [account] = await db
+          .select({ organizationId: whatsappAccounts.organizationId, displayPhone: whatsappAccounts.displayPhone })
+          .from(whatsappAccounts)
+          .where(eq(whatsappAccounts.phoneNumberId, phoneNumberId))
+          .limit(1);
+        if (!account) continue;
+        const orgId = account.organizationId;
 
-        const sender = (p.sender || {}) as Record<string, unknown>;
-        const senderProviderId = String(sender.attendee_provider_id || "");
-        const fromDigits = senderProviderId.replace(/@.*/, "").replace(/\D/g, "");
-        const text =
-          typeof p.message === "string"
-            ? p.message
-            : String((p.message as Record<string, unknown> | undefined)?.text || "");
-        const ourPhone = orgId ? ((await getSetting(orgId, UNIPILE_WA_PHONE_KEY)) || "") : "";
-        const isOwnMessage = !!fromDigits && ourPhone.replace(/\D/g, "").endsWith(fromDigits.slice(-9));
+        // Delivery/read statuses → update the stored outbound row.
+        for (const st of value.statuses || []) {
+          if (!st.id) continue;
+          await db
+            .update(smsMessages)
+            .set({ status: mapStatus(st.status) })
+            .where(and(eq(smsMessages.organizationId, orgId), eq(smsMessages.twilioSid, st.id)));
+        }
 
-        if (orgId && fromDigits && text && !isOwnMessage) {
-          // Match the lead by the sender's number.
+        // Inbound messages → store, match a lead, fire reply triggers, notify.
+        for (const msg of value.messages || []) {
+          const fromDigits = (msg.from || "").replace(/\D/g, "");
+          const text =
+            msg.type === "text"
+              ? msg.text?.body || ""
+              : msg.button?.text || msg.interactive?.list_reply?.title || msg.interactive?.button_reply?.title || `[${msg.type}]`;
+          if (!fromDigits || !text) continue;
+
           const key = phoneKey(fromDigits);
           let lead: { id: string; funnelId: string; name: string } | null = null;
           if (key) {
@@ -258,10 +308,10 @@ whatsappPublicRouter.post(
             direction: "inbound",
             channel: "whatsapp",
             fromNumber: `+${fromDigits}`,
-            toNumber: ourPhone || "whatsapp",
+            toNumber: account.displayPhone || "whatsapp",
             body: text,
             status: "received",
-            twilioSid: null,
+            twilioSid: msg.id ?? null,
           });
 
           if (lead) {
@@ -297,10 +347,32 @@ whatsappPublicRouter.post(
           }
         }
       }
-    } catch (err) {
-      console.error("[whatsapp] unipile message webhook failed:", err);
     }
-    // Always 200 so Unipile doesn't disable the webhook on transient errors.
-    res.json({ ok: true });
-  }),
-);
+  } catch (err) {
+    console.error("[whatsapp] meta webhook failed:", err);
+  }
+  // Always 200 so Meta doesn't disable the webhook on transient errors.
+  res.sendStatus(200);
+}));
+
+// ── Meta webhook payload shapes (partial) ──
+interface MetaWebhook {
+  entry?: {
+    id?: string;
+    changes?: {
+      field?: string;
+      value?: {
+        metadata?: { display_phone_number?: string; phone_number_id?: string };
+        messages?: {
+          from?: string;
+          id?: string;
+          type?: string;
+          text?: { body?: string };
+          button?: { text?: string };
+          interactive?: { list_reply?: { title?: string }; button_reply?: { title?: string } };
+        }[];
+        statuses?: { id?: string; status: string; recipient_id?: string }[];
+      };
+    }[];
+  }[];
+}
