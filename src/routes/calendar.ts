@@ -1,9 +1,9 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, gte, sql } from "drizzle-orm";
+import { eq, and, gte, lte, sql } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
-import { calendlyMeetings } from "../db/schema/calendly";
+import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
@@ -231,6 +231,137 @@ router.get(
 
     meetings.sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
     res.json({ data: { meetings, calendarConnected: calCount > 0 } });
+  }),
+);
+
+// ── GET /api/calendar/meetings?from&to&scope — org/date-range feed ──
+// Powers the Cockpit "meetings today" block and the full calendar page.
+// Unions connected-calendar events (lead-matched by attendee email) with
+// Calendly bookings (persisted leadId), deduped, enriched with lead/funnel
+// refs for deep links. scope=mine (default) = the caller's own accounts;
+// scope=org = everyone's meetings.
+router.get(
+  "/calendar/meetings",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || "";
+    const scope = String(req.query.scope || "mine") === "org" ? "org" : "mine";
+
+    const from = req.query.from ? new Date(String(req.query.from)) : new Date(new Date().setHours(0, 0, 0, 0));
+    let to = req.query.to ? new Date(String(req.query.to)) : new Date(from.getTime() + 30 * 86400000);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) throw new ApiError(400, "Invalid from/to");
+    // Clamp the window (sync only looks 60 days ahead anyway).
+    const MAX_MS = 62 * 86400000;
+    if (to.getTime() - from.getTime() > MAX_MS) to = new Date(from.getTime() + MAX_MS);
+
+    // Connected flags for empty states (always the caller's own accounts).
+    const [[calAcct], [cdlyAcct]] = await Promise.all([
+      db.select({ id: calendarAccounts.id }).from(calendarAccounts)
+        .where(and(eq(calendarAccounts.organizationId, orgId), eq(calendarAccounts.userId, userId))).limit(1),
+      db.select({ id: calendlyAccounts.id }).from(calendlyAccounts)
+        .where(and(eq(calendlyAccounts.organizationId, orgId), eq(calendlyAccounts.userId, userId))).limit(1),
+    ]);
+
+    // Org leads for email→lead resolution + calendly enrichment (one pass).
+    const orgLeads = await db
+      .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company, email: leads.email })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(eq(funnels.organizationId, orgId));
+    const leadByEmail = new Map<string, (typeof orgLeads)[number]>();
+    for (const l of orgLeads) {
+      const e = (l.email || "").trim().toLowerCase();
+      if (e && !leadByEmail.has(e)) leadByEmail.set(e, l);
+    }
+    const leadById = new Map(orgLeads.map((l) => [l.id, l]));
+
+    type OrgMeeting = {
+      id: string; source: "google" | "outlook" | "calendly";
+      title: string; startTime: string | null; endTime: string | null;
+      joinUrl: string | null; location: string | null; organizerEmail: string | null;
+      responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
+      leadId: string | null; funnelId: string | null; leadName: string | null; company: string | null;
+    };
+    const meetings: OrgMeeting[] = [];
+    const seen = new Set<string>(); // title|startTime + joinUrl dedupe across sources/reps
+
+    // 1) Calendly bookings first (they win dedupe over synced calendar copies).
+    const cdlyRows = await db
+      .select()
+      .from(calendlyMeetings)
+      .where(and(
+        eq(calendlyMeetings.organizationId, orgId),
+        eq(calendlyMeetings.status, "scheduled"),
+        gte(calendlyMeetings.startTime, from),
+        lte(calendlyMeetings.startTime, to),
+        ...(scope === "mine" ? [eq(calendlyMeetings.userId, userId)] : []),
+      ));
+    for (const m of cdlyRows) {
+      const lead = m.leadId ? leadById.get(m.leadId) : undefined;
+      const startIso = m.startTime ? m.startTime.toISOString() : null;
+      seen.add(`${m.title || "Calendly meeting"}|${startIso || ""}`);
+      if (m.joinUrl) seen.add(`url:${m.joinUrl}`);
+      meetings.push({
+        id: m.id,
+        source: "calendly",
+        title: m.title || "Calendly meeting",
+        startTime: startIso,
+        endTime: m.endTime ? m.endTime.toISOString() : null,
+        joinUrl: m.joinUrl,
+        location: null,
+        organizerEmail: null,
+        responseStatus: "accepted", // invitee booked the slot themselves
+        leadId: lead?.id ?? m.leadId ?? null,
+        funnelId: lead?.funnelId ?? null,
+        leadName: lead?.name ?? m.inviteeName ?? null,
+        company: lead?.company ?? null,
+      });
+    }
+
+    // 2) Connected-calendar events (Google/Outlook), lead-matched by attendees.
+    const evRows = await db
+      .select({ ev: calendarEvents, provider: calendarAccounts.provider, acctUserId: calendarAccounts.userId, acctEmail: calendarAccounts.email })
+      .from(calendarEvents)
+      .innerJoin(calendarAccounts, eq(calendarEvents.accountId, calendarAccounts.id))
+      .where(and(
+        eq(calendarEvents.organizationId, orgId),
+        eq(calendarEvents.status, "confirmed"),
+        gte(calendarEvents.startTime, from),
+        lte(calendarEvents.startTime, to),
+        ...(scope === "mine" ? [eq(calendarAccounts.userId, userId)] : []),
+      ));
+    for (const { ev, provider, acctEmail } of evRows) {
+      const startIso = ev.startTime ? ev.startTime.toISOString() : null;
+      const dedupeKey = `${ev.title}|${startIso || ""}`;
+      if (seen.has(dedupeKey) || (ev.joinUrl && seen.has(`url:${ev.joinUrl}`))) continue;
+      seen.add(dedupeKey);
+      if (ev.joinUrl) seen.add(`url:${ev.joinUrl}`);
+
+      const attendees = ev.attendeeEmails || [];
+      const matchedEmail = attendees.find((e) => leadByEmail.has(e));
+      const lead = matchedEmail ? leadByEmail.get(matchedEmail) : undefined;
+      const responses = ev.attendeeResponses || {};
+      // Show the LEAD's RSVP when linked, else the account owner's own status.
+      const rsvp = (matchedEmail && responses[matchedEmail]) || responses[(acctEmail || "").toLowerCase()] || null;
+      meetings.push({
+        id: ev.id,
+        source: provider === "google" ? "google" : "outlook",
+        title: ev.title,
+        startTime: startIso,
+        endTime: ev.endTime ? ev.endTime.toISOString() : null,
+        joinUrl: ev.joinUrl,
+        location: ev.location,
+        organizerEmail: ev.organizerEmail,
+        responseStatus: rsvp,
+        leadId: lead?.id ?? null,
+        funnelId: lead?.funnelId ?? null,
+        leadName: lead?.name ?? null,
+        company: lead?.company ?? null,
+      });
+    }
+
+    meetings.sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
+    res.json({ data: { meetings, calendarConnected: !!calAcct, calendlyConnected: !!cdlyAcct } });
   }),
 );
 
