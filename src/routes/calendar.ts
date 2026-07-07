@@ -281,9 +281,15 @@ router.get(
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
       leadId: string | null; funnelId: string | null; leadName: string | null; company: string | null;
+      /** Owner rep (whose calendar/Calendly this meeting belongs to). */
+      userId: string | null;
     };
     const meetings: OrgMeeting[] = [];
     const seen = new Set<string>(); // title|startTime + joinUrl dedupe across sources/reps
+
+    // ONLY lead-linked meetings are returned — a rep's personal calendar noise
+    // (lunches, internal standups) never shows in Leadey; every meeting here
+    // can open a lead profile.
 
     // 1) Calendly bookings first (they win dedupe over synced calendar copies).
     const cdlyRows = await db
@@ -298,6 +304,7 @@ router.get(
       ));
     for (const m of cdlyRows) {
       const lead = m.leadId ? leadById.get(m.leadId) : undefined;
+      if (!lead) continue; // not matched to a lead → excluded
       const startIso = m.startTime ? m.startTime.toISOString() : null;
       seen.add(`${m.title || "Calendly meeting"}|${startIso || ""}`);
       if (m.joinUrl) seen.add(`url:${m.joinUrl}`);
@@ -311,10 +318,11 @@ router.get(
         location: null,
         organizerEmail: null,
         responseStatus: "accepted", // invitee booked the slot themselves
-        leadId: lead?.id ?? m.leadId ?? null,
-        funnelId: lead?.funnelId ?? null,
-        leadName: lead?.name ?? m.inviteeName ?? null,
-        company: lead?.company ?? null,
+        leadId: lead.id,
+        funnelId: lead.funnelId,
+        leadName: lead.name ?? m.inviteeName ?? null,
+        company: lead.company ?? null,
+        userId: m.userId ?? null,
       });
     }
 
@@ -330,19 +338,19 @@ router.get(
         lte(calendarEvents.startTime, to),
         ...(scope === "mine" ? [eq(calendarAccounts.userId, userId)] : []),
       ));
-    for (const { ev, provider, acctEmail } of evRows) {
+    for (const { ev, provider, acctUserId } of evRows) {
+      const attendees = ev.attendeeEmails || [];
+      const matchedEmail = attendees.find((e) => leadByEmail.has(e));
+      const lead = matchedEmail ? leadByEmail.get(matchedEmail) : undefined;
+      if (!lead || !matchedEmail) continue; // no attendee is a lead → excluded
+
       const startIso = ev.startTime ? ev.startTime.toISOString() : null;
       const dedupeKey = `${ev.title}|${startIso || ""}`;
       if (seen.has(dedupeKey) || (ev.joinUrl && seen.has(`url:${ev.joinUrl}`))) continue;
       seen.add(dedupeKey);
       if (ev.joinUrl) seen.add(`url:${ev.joinUrl}`);
 
-      const attendees = ev.attendeeEmails || [];
-      const matchedEmail = attendees.find((e) => leadByEmail.has(e));
-      const lead = matchedEmail ? leadByEmail.get(matchedEmail) : undefined;
       const responses = ev.attendeeResponses || {};
-      // Show the LEAD's RSVP when linked, else the account owner's own status.
-      const rsvp = (matchedEmail && responses[matchedEmail]) || responses[(acctEmail || "").toLowerCase()] || null;
       meetings.push({
         id: ev.id,
         source: provider === "google" ? "google" : "outlook",
@@ -352,11 +360,13 @@ router.get(
         joinUrl: ev.joinUrl,
         location: ev.location,
         organizerEmail: ev.organizerEmail,
-        responseStatus: rsvp,
-        leadId: lead?.id ?? null,
-        funnelId: lead?.funnelId ?? null,
-        leadName: lead?.name ?? null,
-        company: lead?.company ?? null,
+        // The LEAD's RSVP — that's the signal reps care about.
+        responseStatus: responses[matchedEmail] || null,
+        leadId: lead.id,
+        funnelId: lead.funnelId,
+        leadName: lead.name,
+        company: lead.company,
+        userId: acctUserId ?? null,
       });
     }
 
