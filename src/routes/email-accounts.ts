@@ -1,15 +1,41 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, asc, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { emailAccounts, emailMessages } from "../db/schema/email-accounts";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
+import { templateAttachments } from "../db/schema/template-attachments";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { signState, verifyState, encryptSecret } from "../lib/crypto";
-import { sendEmailVia, verifySmtp, packTokens } from "../lib/email-providers";
+import { sendEmailVia, verifySmtp, packTokens, type EmailAttachment } from "../lib/email-providers";
+import { readAttachmentFile } from "../lib/template-attachment-storage";
+
+const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024; // providers cap ~25MB total incl. encoding
+
+/** Resolve org-scoped attachment ids into loadable email attachments. Unknown
+ *  ids and missing files are skipped; throws only if the total exceeds the cap. */
+async function loadAttachments(orgId: string, ids: unknown): Promise<EmailAttachment[]> {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+  const rows = await db
+    .select()
+    .from(templateAttachments)
+    .where(and(eq(templateAttachments.organizationId, orgId), inArray(templateAttachments.id, ids.map(String))));
+  const out: EmailAttachment[] = [];
+  let total = 0;
+  for (const r of rows) {
+    const content = await readAttachmentFile(r.storedName);
+    if (!content) continue;
+    total += content.length;
+    if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
+      throw new ApiError(400, "Attachments exceed the 20MB total limit.");
+    }
+    out.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+  }
+  return out;
+}
 
 const router = Router(); // authed, mounted at /api
 const publicRouter = Router(); // unauthenticated (OAuth callback + tracking pixel)
@@ -230,10 +256,11 @@ router.post(
     // Open-tracking pixel (best-effort; blocked images simply won't register).
     const pixel = `<img src="${backendBase()}/track/email/${messageId}/open.gif" width="1" height="1" alt="" style="display:none" />`;
     const html = `${bodyHtml}${pixel}`;
+    const attachments = await loadAttachments(orgId, req.body?.attachmentIds);
 
     let result;
     try {
-      result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, subject, html });
+      result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, subject, html, attachments });
     } catch (err: any) {
       console.error(`[email send] ${account.provider} ${account.email} failed:`, err?.message || err);
       await db.update(emailAccounts).set({ status: "error", lastError: String(err?.message || err) }).where(eq(emailAccounts.id, account.id));

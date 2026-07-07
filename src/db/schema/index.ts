@@ -26,6 +26,7 @@ export { discoveryRuns, scraperContacts } from "./contacts";
 export { creditTransactions } from "./credits";
 export { smartViews } from "./smart-views";
 export { templates } from "./templates";
+export { templateAttachments } from "./template-attachments";
 export { masterCompanies, masterContacts } from "./master";
 export {
   callDispositions,

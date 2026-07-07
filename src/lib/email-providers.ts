@@ -10,6 +10,11 @@ import { createId } from "./helpers";
 
 type Account = typeof emailAccounts.$inferSelect;
 
+export interface EmailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+}
 export interface SendInput {
   to: string;
   toName?: string | null;
@@ -17,6 +22,7 @@ export interface SendInput {
   cc?: string;
   subject: string;
   html: string;
+  attachments?: EmailAttachment[];
 }
 export interface SendResult {
   providerMessageId: string | null;
@@ -120,6 +126,7 @@ async function buildMime(account: Account, input: SendInput): Promise<{ raw: Buf
     ...(input.cc ? { cc: input.cc } : {}),
     subject: input.subject,
     html: input.html,
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
     messageId,
   });
   const raw = await new Promise<Buffer>((resolve, reject) => {
@@ -143,6 +150,7 @@ async function sendSmtp(account: Account, input: SendInput): Promise<SendResult>
     ...(input.cc ? { cc: input.cc } : {}),
     subject: input.subject,
     html: input.html,
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
   });
   return { providerMessageId: info.messageId || null, providerThreadId: null, messageIdHeader: info.messageId || null };
 }
@@ -178,6 +186,16 @@ async function sendOutlook(account: Account, input: SendInput): Promise<SendResu
           .map((a) => a.trim())
           .filter(Boolean)
           .map((address) => ({ emailAddress: { address } })),
+        ...(input.attachments?.length
+          ? {
+              attachments: input.attachments.map((a) => ({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                name: a.filename,
+                contentType: a.contentType,
+                contentBytes: a.content.toString("base64"),
+              })),
+            }
+          : {}),
       },
       saveToSentItems: true,
     }),

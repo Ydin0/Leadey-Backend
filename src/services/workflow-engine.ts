@@ -10,7 +10,9 @@ import { smsMessages } from "../db/schema/sms";
 import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { sendEmail } from "../lib/email";
-import { sendEmailVia } from "../lib/email-providers";
+import { sendEmailVia, type EmailAttachment } from "../lib/email-providers";
+import { templateAttachments } from "../db/schema/template-attachments";
+import { readAttachmentFile } from "../lib/template-attachment-storage";
 import { sendWhatsapp } from "./whatsapp-sender";
 import { setLeadCustomFields, getCustomFieldsForLeads, listFieldDefinitions } from "../lib/custom-fields-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
@@ -119,6 +121,22 @@ async function logRun(enr: Enrollment, node: WorkflowNode, status: string, detai
   });
 }
 
+/** Load org-scoped template attachments referenced by a workflow email node.
+ *  No-op for nodes without an attachmentIds array; missing files are skipped. */
+async function loadWorkflowAttachments(orgId: string, ids: unknown): Promise<EmailAttachment[]> {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+  const rows = await db
+    .select()
+    .from(templateAttachments)
+    .where(and(eq(templateAttachments.organizationId, orgId), inArray(templateAttachments.id, ids.map(String))));
+  const out: EmailAttachment[] = [];
+  for (const r of rows) {
+    const content = await readAttachmentFile(r.storedName);
+    if (content) out.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+  }
+  return out;
+}
+
 // ─── Action executors (reuse existing senders / patterns) ────────────────
 async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promise<void> {
   const d = (node.data || {}) as Record<string, unknown>;
@@ -129,8 +147,13 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       if (!lead.email) { await logRun(enr, node, "skipped", { reason: "no email" }); return; }
       const tokens = await leadTokens(lead, orgId);
       const subject = renderTokens(String(d.subject || ""), tokens);
-      const bodyText = renderTokens(String(d.body || ""), tokens);
-      const html = bodyText.replace(/\n/g, "<br>");
+      // Prefer a rich HTML body when the node carries one (template with links/
+      // formatting); otherwise convert the plain-text body's newlines.
+      const html = d.bodyHtml
+        ? renderTokens(String(d.bodyHtml), tokens)
+        : renderTokens(String(d.body || ""), tokens).replace(/\n/g, "<br>");
+      // Attachments the node references (e.g. a template's welcome-pack PDFs).
+      const attachments = await loadWorkflowAttachments(orgId, d.attachmentIds);
       const accounts = await db.select().from(emailAccounts).where(eq(emailAccounts.organizationId, orgId));
       const accountId = typeof d.accountId === "string" ? d.accountId : "";
       const fromAddr = typeof d.from === "string" ? d.from : "";
@@ -140,7 +163,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         accounts.find((a) => a.isDefault) || accounts[0];
       try {
         if (account) {
-          const res = await sendEmailVia(account, { to: lead.email, subject, html });
+          const res = await sendEmailVia(account, { to: lead.email, subject, html, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,
             funnelId: lead.funnelId, userId: null, direction: "outbound", fromEmail: account.email,
