@@ -5,7 +5,7 @@ import { organizations } from "../db/schema/organizations";
 import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
 import { getOrgId } from "../lib/auth";
 import { requirePerm } from "../lib/permission-service";
-import { ApiError } from "../lib/helpers";
+import { ApiError, appOrigin } from "../lib/helpers";
 import {
   stripe,
   createCheckoutSession,
@@ -44,8 +44,11 @@ router.get(
 
     if (!org) throw new ApiError(404, "Organization not found");
 
-    // Auto-sync: if org has Stripe customer but plan is still trial, check for active subscription
-    if (org.stripeCustomerId && org.plan === "trial" && !org.stripeSubscriptionId) {
+    // Auto-sync: org has a Stripe customer but no linked subscription — check
+    // for one and adopt it. Heals missed checkout webhooks for ANY plan (an
+    // org with an admin-assigned plan still needs its paid subscription
+    // linked), not just trials.
+    if (org.stripeCustomerId && !org.stripeSubscriptionId) {
       try {
         const subs = await stripe.subscriptions.list({ customer: org.stripeCustomerId, status: "active", limit: 1 });
         if (subs.data.length > 0) {
@@ -146,8 +149,8 @@ router.post(
       userEmail,
       priceId,
       seatCount,
-      successUrl || `${process.env.CORS_ORIGIN?.split(",")[0]}/dashboard/settings/billing-success`,
-      cancelUrl || `${process.env.CORS_ORIGIN?.split(",")[0]}/dashboard/settings?tab=billing`,
+      successUrl || `${appOrigin()}/dashboard/settings/billing-success`,
+      cancelUrl || `${appOrigin()}/dashboard/settings?tab=billing`,
       org.discountPct ?? 0,
     );
 
@@ -211,7 +214,7 @@ router.post(
 
     const url = await createPortalSession(
       orgId,
-      returnUrl || `${process.env.CORS_ORIGIN?.split(",")[0]}/dashboard/settings?tab=billing`,
+      returnUrl || `${appOrigin()}/dashboard/settings?tab=billing`,
     );
 
     res.json({ data: { url } });
@@ -385,6 +388,87 @@ router.get(
     if (!row) throw new ApiError(404, "Invoice not found");
 
     res.json({ data: serializeCustomerInvoice(row, org) });
+  }),
+);
+
+// ─── GET /billing/invoices/:id ──────────────────────────────────────
+// One Stripe subscription invoice, reshaped to the Leadey invoice-document
+// format so the app renders it in our own style instead of redirecting to
+// Stripe's hosted page.
+router.get(
+  "/billing/invoices/:id",
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({
+        stripeCustomerId: organizations.stripeCustomerId,
+        name: organizations.name,
+        billingName: organizations.billingName,
+        billingEmail: organizations.billingEmail,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org?.stripeCustomerId) throw new ApiError(404, "Invoice not found");
+
+    const inv = await stripe.invoices.retrieve(String(req.params.id));
+    // Tenancy check: the invoice must belong to this org's Stripe customer.
+    const invCustomer = typeof inv.customer === "string" ? inv.customer : inv.customer?.id;
+    if (!inv || invCustomer !== org.stripeCustomerId) throw new ApiError(404, "Invoice not found");
+
+    const lineItems = (inv.lines?.data ?? []).map((li: any) => ({
+      description: li.description || "Subscription",
+      quantity: li.quantity ?? 1,
+      unit: "seat",
+      amountMinor: li.amount ?? 0,
+    }));
+    // Discounts as a negative line so the document shows them explicitly.
+    const discountTotal = (inv.total_discount_amounts ?? []).reduce(
+      (a: number, d: any) => a + (d.amount || 0),
+      0,
+    );
+    if (discountTotal > 0) {
+      const pctLabels = (inv.discounts ?? [])
+        .map((d: any) => (typeof d === "object" && d?.coupon?.percent_off ? `${d.coupon.percent_off}% off` : null))
+        .filter(Boolean);
+      lineItems.push({
+        description: `Discount${pctLabels.length ? ` (${pctLabels.join(", ")})` : ""}`,
+        quantity: 1,
+        unit: "discount",
+        amountMinor: -discountTotal,
+      });
+    }
+
+    res.json({
+      data: {
+        id: inv.id,
+        number: inv.number || inv.id,
+        type: "subscription",
+        status: inv.status === "paid" ? "paid" : "open",
+        period: null,
+        periodLabel:
+          inv.lines?.data?.[0]?.period?.start && inv.lines?.data?.[0]?.period?.end
+            ? `${new Date(inv.lines.data[0].period.start * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })} – ${new Date(inv.lines.data[0].period.end * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}`
+            : null,
+        currency: inv.currency,
+        lineItems,
+        subtotalMinor: inv.subtotal ?? 0,
+        totalMinor: inv.total ?? 0,
+        amountPaidMinor: inv.amount_paid ?? 0,
+        paymentUrl: inv.status === "open" ? (inv.hosted_invoice_url ?? null) : null,
+        issuedAt: new Date(inv.created * 1000).toISOString(),
+        dueAt: inv.due_date ? new Date(inv.due_date * 1000).toISOString() : null,
+        paidAt: inv.status_transitions?.paid_at
+          ? new Date(inv.status_transitions.paid_at * 1000).toISOString()
+          : null,
+        orgName: org.name,
+        billingName: org.billingName,
+        billingEmail: org.billingEmail,
+        billingAddress: org.billingAddress,
+        billingVat: org.billingVat,
+      },
+    });
   }),
 );
 

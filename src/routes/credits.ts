@@ -4,7 +4,7 @@ import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { creditTransactions } from "../db/schema/credits";
 import { getOrgId } from "../lib/auth";
-import { ApiError } from "../lib/helpers";
+import { ApiError, appOrigin } from "../lib/helpers";
 import { getBalance, CREDIT_COSTS, CREDIT_CENTS_PER } from "../lib/credits";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
 import { maybeAutoTopup } from "../lib/telephony-credits";
@@ -278,7 +278,7 @@ router.post(
       ? (await db.query.users.findFirst({ where: eq(users.id, auth.userId) }))?.email || ""
       : "";
 
-    const origin = process.env.CORS_ORIGIN?.split(",")[0] || "";
+    const origin = appOrigin();
     const url = await createCreditCheckoutSession(
       orgId,
       org.name,

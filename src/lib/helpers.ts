@@ -123,3 +123,11 @@ export function dedupeKey(name: string, company: string, email: string): string 
   if (email) return `email:${email.toLowerCase()}`;
   return `name_company:${name.toLowerCase()}|${company.toLowerCase()}`;
 }
+
+/** The customer app's origin for Stripe return URLs. CORS_ORIGIN lists the
+ *  admin panel FIRST, so naively taking [0] sent Stripe checkouts back to
+ *  admin.leadey.ai (a 404 for customers). Prefer the app.* origin. */
+export function appOrigin(): string {
+  const origins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return origins.find((o) => o.includes("//app.")) || origins[0] || "";
+}
