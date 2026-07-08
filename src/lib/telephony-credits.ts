@@ -211,6 +211,7 @@ export async function creditAutoTopupOnce(
   amountMinor: number,
   paymentIntentId: string,
   currency: string,
+  description = "Auto top-up",
 ): Promise<void> {
   if (amountMinor <= 0) return;
   await db.transaction(async (tx) => {
@@ -226,7 +227,7 @@ export async function creditAutoTopupOnce(
       kind: "topup",
       amountMinor,
       stripeSessionId: paymentIntentId,
-      description: "Auto top-up",
+      description,
       metadata: { currency, paymentIntentId, auto: true },
     });
   });
@@ -235,6 +236,153 @@ export async function creditAutoTopupOnce(
 const AUTOTOPUP_COOLDOWN_MIN = 20; // one attempt per window across instances
 const AUTOTOPUP_MIN_CHARGE_MINOR = 100; // Stripe minimums + sanity
 const AUTOTOPUP_MAX_CHARGE_MINOR = 1_000_000; // $10k cap per single charge
+
+/** Find a reusable saved payment method for off-session charges. Order:
+ *  customer default → subscription default → any saved card → any saved
+ *  Link method (subscription checkouts paid via Stripe Link attach a
+ *  "link"-type method, not a card — it charges off-session just fine). */
+async function resolveSavedPaymentMethod(
+  stripeApi: typeof import("./stripe").stripe,
+  customerId: string,
+  subscriptionId?: string | null,
+): Promise<string | null> {
+  const customer = await stripeApi.customers.retrieve(customerId);
+  if (!customer.deleted) {
+    const def = customer.invoice_settings?.default_payment_method;
+    const id = typeof def === "string" ? def : (def?.id ?? null);
+    if (id) return id;
+  }
+  if (subscriptionId) {
+    try {
+      const sub = await stripeApi.subscriptions.retrieve(subscriptionId);
+      const def = sub.default_payment_method;
+      const id = typeof def === "string" ? def : (def?.id ?? null);
+      if (id) return id;
+    } catch {
+      /* subscription gone — fall through */
+    }
+  }
+  for (const type of ["card", "link"] as const) {
+    const pms = await stripeApi.paymentMethods.list({ customer: customerId, type, limit: 1 });
+    if (pms.data[0]?.id) return pms.data[0].id;
+  }
+  return null;
+}
+
+/**
+ * Charge the org's saved payment method off-session and credit the wallet.
+ * Shared by auto top-up and the customer's manual top-up. Idempotent
+ * crediting via the PaymentIntent id. Returns the error message on failure.
+ */
+export async function chargeSavedCardAndCredit(
+  orgId: string,
+  amountMinor: number,
+  description: string,
+  metadataType: "telephony_autotopup" | "telephony_topup",
+): Promise<{ charged: boolean; error?: string; settledInvoices?: string[] }> {
+  const [org] = await db
+    .select({
+      name: organizations.name,
+      stripeCustomerId: organizations.stripeCustomerId,
+      stripeSubscriptionId: organizations.stripeSubscriptionId,
+    })
+    .from(organizations)
+    .where(eq(organizations.id, orgId));
+  if (!org?.stripeCustomerId) {
+    return { charged: false, error: "No billing profile on file — subscribe to a plan first." };
+  }
+
+  try {
+    const { stripe } = await import("./stripe");
+    const paymentMethod = await resolveSavedPaymentMethod(
+      stripe,
+      org.stripeCustomerId,
+      org.stripeSubscriptionId,
+    );
+    if (!paymentMethod) {
+      return {
+        charged: false,
+        error: "No saved payment method — subscribe to a plan first so a card is on file.",
+      };
+    }
+
+    const currency = (await getAccountCurrency()).toLowerCase();
+    const pi = await stripe.paymentIntents.create({
+      amount: amountMinor,
+      currency,
+      customer: org.stripeCustomerId,
+      payment_method: paymentMethod,
+      off_session: true,
+      confirm: true,
+      description: `${description} — ${org.name}`,
+      metadata: { type: metadataType, orgId },
+    });
+    if (pi.status !== "succeeded") {
+      return { charged: false, error: `Card charge did not complete (status: ${pi.status}).` };
+    }
+
+    await creditAutoTopupOnce(orgId, amountMinor, pi.id, currency, description);
+    const settledInvoices = await settleOpenTelephonyInvoices(orgId);
+    return { charged: true, settledInvoices };
+  } catch (err: any) {
+    return { charged: false, error: err?.message || "Card charge failed." };
+  }
+}
+
+/**
+ * Settle open telephony invoices oldest-first from the wallet. Coverage =
+ * how much of the invoiced usage the wallet now funds: sum of the open
+ * invoices' usage plus the (possibly negative) balance. Each fully-covered
+ * invoice is marked paid ("Settled by balance top-up") WITHOUT crediting the
+ * wallet again — the top-up already put the money in. A shortfall leaves the
+ * newest invoice(s) open; their remainder is exactly the wallet's remaining
+ * negative balance, cleared by the next top-up.
+ */
+export async function settleOpenTelephonyInvoices(orgId: string): Promise<string[]> {
+  const balance = await getTelephonyBalance(orgId);
+  const open = await db
+    .select()
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.organizationId, orgId),
+        eq(invoices.type, "telephony"),
+        eq(invoices.status, "open"),
+      ),
+    )
+    .orderBy(invoices.issuedAt);
+  if (!open.length) return [];
+
+  const usageOf = (inv: typeof invoices.$inferSelect) =>
+    Number((inv.meta as Record<string, unknown>)?.usageMinor ?? inv.totalMinor) || inv.totalMinor;
+
+  let coverage = open.reduce((a, inv) => a + usageOf(inv), 0) + balance;
+  const settled: string[] = [];
+  for (const inv of open) {
+    const usage = usageOf(inv);
+    if (coverage < usage) break;
+    coverage -= usage;
+    await db
+      .update(invoices)
+      .set({
+        status: "paid",
+        paidAt: new Date(),
+        notes: "Settled by balance top-up.",
+      })
+      .where(and(eq(invoices.id, inv.id), eq(invoices.status, "open")));
+    if (inv.stripePaymentLinkId) {
+      try {
+        const { stripe } = await import("./stripe");
+        await stripe.paymentLinks.update(inv.stripePaymentLinkId, { active: false });
+      } catch {
+        /* best-effort — a dead link that still gets paid is reconciled by the webhook */
+      }
+    }
+    settled.push(inv.number);
+    console.log(`[TelephonyCredits] invoice ${inv.number} settled by top-up (org ${orgId})`);
+  }
+  return settled;
+}
 
 /**
  * Auto top-up: if enabled and the wallet is below the org's threshold, charge
@@ -279,66 +427,28 @@ export async function maybeAutoTopup(
     .returning({ id: organizations.id });
   if (!claimed.length) return { charged: false };
 
-  const fail = async (error: string) => {
+  const result = await chargeSavedCardAndCredit(
+    orgId,
+    amountMinor,
+    "Leadey telephony auto top-up",
+    "telephony_autotopup",
+  );
+  if (!result.charged) {
+    const error = result.error || "Card charge failed.";
     await db
       .update(organizations)
       .set({ telephonyAutoTopupLastError: error, updatedAt: new Date() })
       .where(eq(organizations.id, orgId));
     console.warn(`[TelephonyAutoTopup] org ${orgId}: ${error}`);
-    return { charged: false as const, error };
-  };
-
-  if (!org.stripeCustomerId) {
-    return fail("No billing profile on file — subscribe to a plan or pay an invoice by card first.");
+    return { charged: false, error };
   }
 
-  try {
-    const { stripe } = await import("./stripe");
-
-    // Resolve a chargeable saved card: customer default → first saved card.
-    const customer = await stripe.customers.retrieve(org.stripeCustomerId);
-    let paymentMethod: string | null = null;
-    if (!customer.deleted) {
-      const def = customer.invoice_settings?.default_payment_method;
-      paymentMethod = typeof def === "string" ? def : (def?.id ?? null);
-    }
-    if (!paymentMethod) {
-      const pms = await stripe.paymentMethods.list({
-        customer: org.stripeCustomerId,
-        type: "card",
-        limit: 1,
-      });
-      paymentMethod = pms.data[0]?.id ?? null;
-    }
-    if (!paymentMethod) {
-      return fail("No saved card on file — add a payment method in the billing portal.");
-    }
-
-    const currency = (await getAccountCurrency()).toLowerCase();
-    const pi = await stripe.paymentIntents.create({
-      amount: amountMinor,
-      currency,
-      customer: org.stripeCustomerId,
-      payment_method: paymentMethod,
-      off_session: true,
-      confirm: true,
-      description: `Leadey telephony auto top-up — ${org.name}`,
-      metadata: { type: "telephony_autotopup", orgId },
-    });
-    if (pi.status !== "succeeded") {
-      return fail(`Card charge did not complete (status: ${pi.status}).`);
-    }
-
-    await creditAutoTopupOnce(orgId, amountMinor, pi.id, currency);
-    await db
-      .update(organizations)
-      .set({ telephonyAutoTopupLastError: null, updatedAt: new Date() })
-      .where(eq(organizations.id, orgId));
-    console.log(`[TelephonyAutoTopup] org ${orgId} charged ${amountMinor} minor (${pi.id})`);
-    return { charged: true, amountMinor };
-  } catch (err: any) {
-    return fail(err?.message || "Card charge failed.");
-  }
+  await db
+    .update(organizations)
+    .set({ telephonyAutoTopupLastError: null, updatedAt: new Date() })
+    .where(eq(organizations.id, orgId));
+  console.log(`[TelephonyAutoTopup] org ${orgId} charged ${amountMinor} minor`);
+  return { charged: true, amountMinor };
 }
 
 /** Admin add/remove/set. Negative balances allowed — this wallet tracks a

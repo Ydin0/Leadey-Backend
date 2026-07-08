@@ -7,7 +7,7 @@ import { getOrgId } from "../lib/auth";
 import { ApiError, appOrigin } from "../lib/helpers";
 import { getBalance, CREDIT_COSTS, CREDIT_CENTS_PER } from "../lib/credits";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
-import { maybeAutoTopup } from "../lib/telephony-credits";
+import { maybeAutoTopup, chargeSavedCardAndCredit, getTelephonyBalance } from "../lib/telephony-credits";
 import { getTelephonyBudgetStatus, invalidateTelephonyBudgetCache } from "../lib/telephony-budget";
 import { requirePerm } from "../lib/permission-service";
 import { createCreditCheckoutSession } from "../lib/stripe";
@@ -215,6 +215,32 @@ router.put(
         immediateTopup: topup,
       },
     });
+  }),
+);
+
+// ─── POST /credits/telephony/topup ──────────────────────────────────
+// One-off top-up: charges the org's saved payment method immediately and
+// settles open telephony invoices oldest-first with the new balance.
+router.post(
+  "/credits/telephony/topup",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const amountMinor = Math.round(Number(req.body?.amountMinor));
+    if (!Number.isFinite(amountMinor) || amountMinor < 500 || amountMinor > 1_000_000) {
+      throw new ApiError(400, "Top-up must be between 5 and 10,000");
+    }
+
+    const result = await chargeSavedCardAndCredit(
+      orgId,
+      amountMinor,
+      "Leadey telephony balance top-up",
+      "telephony_topup",
+    );
+    if (!result.charged) throw new ApiError(402, result.error || "Card charge failed");
+
+    const balanceMinor = await getTelephonyBalance(orgId);
+    res.json({ data: { balanceMinor, settledInvoices: result.settledInvoices ?? [] } });
   }),
 );
 

@@ -1568,10 +1568,18 @@ router.post("/stripe", async (req: Request, res: Response) => {
       // the server died in between this replays it. Idempotent on the PI id.
       case "payment_intent.succeeded": {
         const pi = event.data.object;
-        if (pi.metadata?.type === "telephony_autotopup" && pi.metadata?.orgId) {
-          const { creditAutoTopupOnce } = await import("../lib/telephony-credits");
-          await creditAutoTopupOnce(pi.metadata.orgId, pi.amount, pi.id, pi.currency);
-          console.log(`[Stripe] telephony auto top-up ${pi.id} ensured for org ${pi.metadata.orgId}`);
+        const piType = pi.metadata?.type;
+        if ((piType === "telephony_autotopup" || piType === "telephony_topup") && pi.metadata?.orgId) {
+          const { creditAutoTopupOnce, settleOpenTelephonyInvoices } = await import("../lib/telephony-credits");
+          await creditAutoTopupOnce(
+            pi.metadata.orgId,
+            pi.amount,
+            pi.id,
+            pi.currency,
+            piType === "telephony_topup" ? "Balance top-up" : "Auto top-up",
+          );
+          await settleOpenTelephonyInvoices(pi.metadata.orgId);
+          console.log(`[Stripe] telephony top-up ${pi.id} ensured for org ${pi.metadata.orgId}`);
         }
         break;
       }
