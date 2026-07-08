@@ -64,9 +64,10 @@ function priceIdForPlan(plan: string): string | undefined {
   return undefined;
 }
 
-function computeMrrPence(plan: string, seats: number): number {
+function computeMrrPence(plan: string, seats: number, discountPct = 0): number {
   const perSeat = PLAN_PRICES_PENCE[plan] || 0;
-  return perSeat * (seats || 0);
+  const gross = perSeat * (seats || 0);
+  return Math.round((gross * (100 - Math.min(100, Math.max(0, discountPct)))) / 100);
 }
 
 async function clerkFetch(path: string, init: RequestInit = {}): Promise<any> {
@@ -153,12 +154,13 @@ router.get(
         plan: organizations.plan,
         seats: organizations.seatsIncluded,
         status: organizations.planStatus,
+        discountPct: organizations.discountPct,
       })
       .from(organizations);
 
     const totalMrrPence = activeOrgs.reduce((sum, o) => {
       if (o.status !== "active") return sum;
-      return sum + computeMrrPence(o.plan, o.seats || 0);
+      return sum + computeMrrPence(o.plan, o.seats || 0, o.discountPct || 0);
     }, 0);
 
     res.json({
@@ -210,6 +212,7 @@ router.get(
         plan: organizations.plan,
         planStatus: organizations.planStatus,
         seatsIncluded: organizations.seatsIncluded,
+        discountPct: organizations.discountPct,
         trialEndsAt: organizations.trialEndsAt,
         currentPeriodEnd: organizations.currentPeriodEnd,
         createdAt: organizations.createdAt,
@@ -245,7 +248,8 @@ router.get(
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       userCount: r.userCount,
-      mrrPence: computeMrrPence(r.plan, r.seatsIncluded || 0),
+      discountPct: r.discountPct || 0,
+      mrrPence: computeMrrPence(r.plan, r.seatsIncluded || 0, r.discountPct || 0),
       accountManager: r.accountManagerId
         ? {
             id: r.accountManagerId,
@@ -286,7 +290,7 @@ router.get(
     const trialDaysLeft = org.trialEndsAt
       ? Math.max(0, Math.ceil((org.trialEndsAt.getTime() - Date.now()) / 86400000))
       : 0;
-    const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0);
+    const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0, org.discountPct || 0);
 
     // Source the member roster from CLERK (source of truth) enriched with our
     // users rows. The `users` table stores a single org per user, so a multi-org
@@ -343,6 +347,7 @@ router.get(
         callRecording: planConfig.callRecording,
         aiSummaries: planConfig.aiSummaries,
         mrrPence,
+        discountPct: org.discountPct || 0,
         billingEmail: org.billingEmail,
         billingName: org.billingName,
         billingAddress: org.billingAddress,
@@ -974,6 +979,61 @@ router.patch(
     });
 
     res.json({ data: { seats, seatAdjustment } });
+  }),
+);
+
+// ─── PATCH /organizations/:id/discount ────────────────────────────────────
+// Platform-admin negotiated discount %. Applies to the seat subscription:
+// attached to the live Stripe subscription immediately and to any future
+// checkout. 0 removes the discount. Telephony/credits unaffected.
+
+router.patch(
+  "/organizations/:id/discount",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const pct = Number(req.body?.pct);
+    const actor = getActorId(req);
+
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      throw new ApiError(400, "pct must be an integer between 0 and 100");
+    }
+
+    const [org] = await db
+      .select()
+      .from(organizations)
+      .where(eq(organizations.id, req.params.id));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const before = { discountPct: org.discountPct };
+
+    // Apply to the live subscription first — if Stripe rejects, nothing is
+    // stored and the admin sees the error.
+    if (org.stripeSubscriptionId) {
+      if (pct > 0) {
+        const { getOrCreateDiscountCoupon } = await import("../lib/stripe");
+        const coupon = await getOrCreateDiscountCoupon(pct);
+        await stripe.subscriptions.update(org.stripeSubscriptionId, {
+          discounts: [{ coupon }],
+        });
+      } else {
+        await stripe.subscriptions.update(org.stripeSubscriptionId, { discounts: "" });
+      }
+    }
+
+    await db
+      .update(organizations)
+      .set({ discountPct: pct, updatedAt: new Date() })
+      .where(eq(organizations.id, req.params.id));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.discount.change",
+      targetType: "organization",
+      targetId: req.params.id,
+      before,
+      after: { discountPct: pct },
+    });
+
+    res.json({ data: { discountPct: pct } });
   }),
 );
 
@@ -2023,6 +2083,7 @@ router.get(
         name: organizations.name,
         plan: organizations.plan,
         seatsIncluded: organizations.seatsIncluded,
+        discountPct: organizations.discountPct,
       })
       .from(organizations);
 
@@ -2032,7 +2093,7 @@ router.get(
         const sms = (smsByOrg.get(o.id) as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 };
         const rental = rentalByOrg.get(o.id);
         const breakdown = buildBreakdown(call, sms, rental?.rentals ?? 0, rental?.lineCount ?? 0);
-        const mrrPence = computeMrrPence(o.plan, o.seatsIncluded || 0);
+        const mrrPence = computeMrrPence(o.plan, o.seatsIncluded || 0, o.discountPct || 0);
         const margin = marginFor(mrrPence, breakdown.total, currency);
         return {
           orgId: o.id,
@@ -2087,7 +2148,7 @@ router.get(
     maybeAutoSync(range);
 
     const [org] = await db
-      .select({ id: organizations.id, name: organizations.name, plan: organizations.plan, seatsIncluded: organizations.seatsIncluded })
+      .select({ id: organizations.id, name: organizations.name, plan: organizations.plan, seatsIncluded: organizations.seatsIncluded, discountPct: organizations.discountPct })
       .from(organizations)
       .where(eq(organizations.id, orgId))
       .limit(1);
@@ -2114,7 +2175,7 @@ router.get(
       rental?.rentals ?? 0,
       rental?.lineCount ?? 0,
     );
-    const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0);
+    const mrrPence = computeMrrPence(org.plan, org.seatsIncluded || 0, org.discountPct || 0);
     const margin = marginFor(mrrPence, breakdown.total, currency);
 
     // Monthly trend (cost per month over the trailing window).

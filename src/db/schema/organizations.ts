@@ -19,6 +19,10 @@ export const organizations = pgTable("organizations", {
    *  (or restrictions) survive renewals and seat changes. 0 for orgs
    *  without a subscription — their seatsIncluded is set directly. */
   seatAdjustment: integer("seat_adjustment").notNull().default(0),
+  /** Platform-admin negotiated discount (0–100 %). Applies to the seat
+   *  subscription only: attached as a forever Stripe coupon at checkout and
+   *  on the live subscription. Telephony invoices/credits unaffected. */
+  discountPct: integer("discount_pct").notNull().default(0),
   creditsIncluded: integer("credits_included").notNull().default(10000),
   creditsUsed: integer("credits_used").notNull().default(0),
   /** Unified prepaid credit wallet — the single source of truth for spendable

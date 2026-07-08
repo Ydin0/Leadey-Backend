@@ -91,6 +91,7 @@ router.get(
         currentPeriodEnd: org.currentPeriodEnd?.toISOString() || null,
         stripeCustomerId: org.stripeCustomerId,
         stripeSubscriptionId: org.stripeSubscriptionId,
+        discountPct: org.discountPct ?? 0,
         // Limits — use actual org values from DB, not plan defaults
         seatsIncluded: org.seatsIncluded,
         creditsIncluded: org.creditsIncluded,
@@ -147,6 +148,7 @@ router.post(
       seatCount,
       successUrl || `${process.env.CORS_ORIGIN?.split(",")[0]}/dashboard/settings/billing-success`,
       cancelUrl || `${process.env.CORS_ORIGIN?.split(",")[0]}/dashboard/settings?tab=billing`,
+      org.discountPct ?? 0,
     );
 
     res.json({ data: { url } });

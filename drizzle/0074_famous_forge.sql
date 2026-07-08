@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN "discount_pct" integer DEFAULT 0 NOT NULL;

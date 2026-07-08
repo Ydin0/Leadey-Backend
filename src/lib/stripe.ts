@@ -131,6 +131,25 @@ export async function getOrCreateStripeCustomer(
   return customer.id;
 }
 
+/** Idempotent shared coupon per percentage: `leadey-15pct` = 15% off,
+ *  forever. One coupon serves every org on that discount tier. */
+export async function getOrCreateDiscountCoupon(pct: number): Promise<string> {
+  const id = `leadey-${pct}pct`;
+  try {
+    const existing = await stripe.coupons.retrieve(id);
+    if (existing && !existing.deleted) return id;
+  } catch (err: any) {
+    if (err?.code !== "resource_missing") throw err;
+  }
+  await stripe.coupons.create({
+    id,
+    percent_off: pct,
+    duration: "forever",
+    name: `Leadey ${pct}% discount`,
+  });
+  return id;
+}
+
 export async function createCheckoutSession(
   orgId: string,
   orgName: string,
@@ -139,13 +158,18 @@ export async function createCheckoutSession(
   seats: number,
   successUrl: string,
   cancelUrl: string,
+  discountPct = 0,
 ): Promise<string> {
   const customerId = await getOrCreateStripeCustomer(orgId, orgName, email);
+
+  const discounts =
+    discountPct > 0 ? [{ coupon: await getOrCreateDiscountCoupon(discountPct) }] : undefined;
 
   const session = await stripe.checkout.sessions.create({
     customer: customerId,
     mode: "subscription",
     line_items: [{ price: priceId, quantity: seats }],
+    ...(discounts ? { discounts } : {}),
     success_url: successUrl,
     cancel_url: cancelUrl,
     subscription_data: {

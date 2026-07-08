@@ -9,6 +9,7 @@ export type AuditAction =
   | "org.delete"
   | "org.plan.change"
   | "org.seats.change"
+  | "org.discount.change"
   | "org.trial.extend"
   | "org.subscription.cancel"
   | "org.subscription.reactivate"
