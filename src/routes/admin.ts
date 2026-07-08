@@ -2685,6 +2685,8 @@ router.get(
         seatsIncluded: organizations.seatsIncluded,
         discountPct: organizations.discountPct,
         telephonyBufferPct: organizations.telephonyBufferPct,
+        stripeCustomerId: organizations.stripeCustomerId,
+        createdAt: organizations.createdAt,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId))
@@ -2692,17 +2694,57 @@ router.get(
     if (!org) throw new ApiError(404, "Organization not found");
     const cfg = await getTelephonyBillingConfig(orgId);
 
-    // Seat revenue: the discounted subscription price (GBP), USD via the
-    // same FX approximation the Costs tab uses. Zero for trial/cancelled.
-    const paidPlan = org.planStatus === "active" && ["starter", "growth", "scale"].includes(org.plan);
-    const seatsGbpPence = paidPlan ? computeMrrPence(org.plan, org.seatsIncluded || 0, org.discountPct || 0) : 0;
-    const seatsUsd = Math.round(((seatsGbpPence / 100) * GBP_TO_USD) * 100) / 100;
-
     const round2 = (n: number) => Math.round(n * 100) / 100;
     const pct = (margin: number, revenue: number) => (revenue > 0 ? Math.round((margin / revenue) * 100) : null);
+    const currentPeriod = monthRange().period;
+    const createdPeriod = `${org.createdAt.getUTCFullYear()}-${String(org.createdAt.getUTCMonth() + 1).padStart(2, "0")}`;
 
-    /** One month's full P&L (USD major units). */
+    // ── Seat revenue per month ──
+    // Current month: accrual (the discounted subscription price). PAST months:
+    // what was ACTUALLY paid for seats that month — paid Leadey seat invoices
+    // (by period) + paid Stripe subscription invoices (by billing period) —
+    // so months before the org subscribed show zero, not a back-filled MRR.
+    const paidPlan = org.planStatus === "active" && ["starter", "growth", "scale"].includes(org.plan);
+    const accrualSeatsPence = paidPlan ? computeMrrPence(org.plan, org.seatsIncluded || 0, org.discountPct || 0) : 0;
+
+    const paidSeatsPenceByPeriod = new Map<string, number>();
+    const seatInvoiceRows = await db
+      .select({ period: invoices.period, totalMinor: invoices.totalMinor })
+      .from(invoices)
+      .where(and(eq(invoices.organizationId, orgId), eq(invoices.type, "seats"), eq(invoices.status, "paid")));
+    for (const r of seatInvoiceRows) {
+      if (r.period && /^\d{4}-\d{2}$/.test(r.period)) {
+        paidSeatsPenceByPeriod.set(r.period, (paidSeatsPenceByPeriod.get(r.period) ?? 0) + r.totalMinor);
+      }
+    }
+    if (org.stripeCustomerId) {
+      try {
+        const stripeInvs = await stripe.invoices.list({ customer: org.stripeCustomerId, status: "paid", limit: 24 });
+        for (const inv of stripeInvs.data) {
+          const startTs = inv.lines?.data?.[0]?.period?.start || inv.created;
+          const d = new Date(startTs * 1000);
+          const p = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+          paidSeatsPenceByPeriod.set(p, (paidSeatsPenceByPeriod.get(p) ?? 0) + (inv.amount_paid ?? 0));
+        }
+      } catch { /* Stripe history is best-effort */ }
+    }
+    const seatsForPeriod = (period: string): { gbpPence: number; usd: number } => {
+      const gbpPence = period === currentPeriod ? accrualSeatsPence : (paidSeatsPenceByPeriod.get(period) ?? 0);
+      return { gbpPence, usd: round2((gbpPence / 100) * GBP_TO_USD) };
+    };
+
+    const EMPTY_PNL = () => ({
+      breakdown: buildBreakdown(ZERO_CALL, { actual: 0, syncedCount: 0, totalCount: 0 }, 0, 0),
+      telephonyBilledUsd: 0,
+      creditTopupsUsd: 0,
+      telephonyCollectedUsd: 0,
+      enrichment: { phoneQty: 0, emailQty: 0, companyQty: 0, jobQty: 0, costUsd: 0 },
+    });
+
+    /** One month's full P&L (USD major units). Months before the org existed
+     *  are hard zeros. */
     async function monthPnl(period: string) {
+      if (period < createdPeriod) return EMPTY_PNL();
       const r = monthRange(period);
       const [call] = await db
         .select(callSelect())
@@ -2712,13 +2754,19 @@ router.get(
         .select(smsSelect())
         .from(smsMessages)
         .where(and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, r.start), lt(smsMessages.createdAt, r.end)));
+      // Rental cost only for lines that already existed in that month —
+      // reusing today's lines fabricated cost in pre-usage months.
       const [rental] = await db
         .select({
           rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)::float8`,
           lineCount: sql<number>`COUNT(*)::int`,
         })
         .from(phoneLines)
-        .where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.status, "active")));
+        .where(and(
+          eq(phoneLines.organizationId, orgId),
+          eq(phoneLines.status, "active"),
+          lt(phoneLines.createdAt, r.end),
+        ));
       const breakdown = buildBreakdown(
         (call as unknown as CallAgg) ?? ZERO_CALL,
         (smsA as unknown as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 },
@@ -2776,6 +2824,7 @@ router.get(
     }
 
     const current = await monthPnl(range.period);
+    const seats = seatsForPeriod(range.period);
 
     // Per-stream margins for the selected period.
     const telephonyCostUsd = current.breakdown.total;
@@ -2783,10 +2832,10 @@ router.get(
       {
         key: "seats",
         label: "Seat subscriptions",
-        revenueUsd: seatsUsd,
+        revenueUsd: seats.usd,
         costUsd: 0,
-        marginUsd: seatsUsd,
-        marginPct: seatsUsd > 0 ? 100 : null,
+        marginUsd: seats.usd,
+        marginPct: seats.usd > 0 ? 100 : null,
       },
       {
         key: "telephony",
@@ -2809,14 +2858,15 @@ router.get(
     const totalCostUsd = round2(streams.reduce((a, s) => a + s.costUsd, 0));
     const totalMarginUsd = round2(totalRevenueUsd - totalCostUsd);
 
-    // Trailing trend — seats held at the CURRENT plan config (same caveat as
-    // the Costs trend); telephony/costs/credits re-aggregated per month.
+    // Trailing trend — past months use ACTUAL paid seat revenue (invoices +
+    // Stripe); telephony/costs/credits re-aggregated per month; months before
+    // the org existed are zeros.
     const trend: { period: string; revenueUsd: number; costUsd: number; marginUsd: number }[] = [];
     for (let i = months - 1; i >= 0; i--) {
       const s = new Date(Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth() - i, 1));
       const period = `${s.getUTCFullYear()}-${String(s.getUTCMonth() + 1).padStart(2, "0")}`;
       const m = period === range.period ? current : await monthPnl(period);
-      const revenueUsd = round2(seatsUsd + m.telephonyBilledUsd + m.creditTopupsUsd);
+      const revenueUsd = round2(seatsForPeriod(period).usd + m.telephonyBilledUsd + m.creditTopupsUsd);
       const costUsd = round2(m.breakdown.total + m.enrichment.costUsd);
       trend.push({ period, revenueUsd, costUsd, marginUsd: round2(revenueUsd - costUsd) });
     }
@@ -2838,8 +2888,9 @@ router.get(
           bufferPct: org.telephonyBufferPct ?? 0,
         },
         revenue: {
-          seatsGbpPence,
-          seatsUsd,
+          seatsGbpPence: seats.gbpPence,
+          seatsUsd: seats.usd,
+          seatsBasis: range.period === currentPeriod ? "accrual" : "paid",
           telephonyBilledUsd: current.telephonyBilledUsd,
           creditTopupsUsd: current.creditTopupsUsd,
           totalUsd: totalRevenueUsd,
