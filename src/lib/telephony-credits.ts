@@ -279,7 +279,13 @@ export async function chargeSavedCardAndCredit(
   amountMinor: number,
   description: string,
   metadataType: "telephony_autotopup" | "telephony_topup",
-): Promise<{ charged: boolean; error?: string; settledInvoices?: string[] }> {
+): Promise<{
+  charged: boolean;
+  error?: string;
+  /** "no_payment_method" → the caller can fall back to a Checkout page. */
+  reason?: "no_payment_method";
+  settledInvoices?: string[];
+}> {
   const [org] = await db
     .select({
       name: organizations.name,
@@ -289,7 +295,11 @@ export async function chargeSavedCardAndCredit(
     .from(organizations)
     .where(eq(organizations.id, orgId));
   if (!org?.stripeCustomerId) {
-    return { charged: false, error: "No billing profile on file — subscribe to a plan first." };
+    return {
+      charged: false,
+      reason: "no_payment_method",
+      error: "No billing profile on file — make a one-off top-up to save a card.",
+    };
   }
 
   try {
@@ -302,7 +312,8 @@ export async function chargeSavedCardAndCredit(
     if (!paymentMethod) {
       return {
         charged: false,
-        error: "No saved payment method — subscribe to a plan first so a card is on file.",
+        reason: "no_payment_method",
+        error: "No saved payment method — make a one-off top-up to save a card.",
       };
     }
 

@@ -1396,6 +1396,20 @@ router.post("/stripe", async (req: Request, res: Response) => {
           break;
         }
 
+        // Telephony balance top-up via Checkout (no saved card) — credit the
+        // wallet + settle invoices. Idempotent on the PaymentIntent id, so
+        // the payment_intent.succeeded handler doing the same is harmless.
+        if (session.mode === "payment" && session.metadata?.type === "telephony_topup_checkout" && orgId) {
+          const piId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
+          if (piId && session.amount_total) {
+            const { creditAutoTopupOnce, settleOpenTelephonyInvoices } = await import("../lib/telephony-credits");
+            await creditAutoTopupOnce(orgId, session.amount_total, piId, session.currency || "usd", "Balance top-up");
+            await settleOpenTelephonyInvoices(orgId);
+            console.log(`[Stripe] telephony top-up checkout credited for org ${orgId}`);
+          }
+          break;
+        }
+
         // Leadey invoice payment (via per-invoice payment link) — mark the
         // invoice paid. Idempotent: an already-paid invoice is left alone, so
         // webhook replays never double-process. Also deactivates the link.

@@ -220,7 +220,9 @@ router.put(
 
 // ─── POST /credits/telephony/topup ──────────────────────────────────
 // One-off top-up: charges the org's saved payment method immediately and
-// settles open telephony invoices oldest-first with the new balance.
+// settles open telephony invoices oldest-first. With NO payment method on
+// file it falls back to a Stripe Checkout page instead — which also saves
+// the card, so future (auto) top-ups charge without another checkout.
 router.post(
   "/credits/telephony/topup",
   requirePerm("settings.manageBilling"),
@@ -237,6 +239,30 @@ router.post(
       "Leadey telephony balance top-up",
       "telephony_topup",
     );
+
+    if (!result.charged && result.reason === "no_payment_method") {
+      const [org] = await db.select().from(organizations).where(eq(organizations.id, orgId));
+      if (!org) throw new ApiError(404, "Organization not found");
+      const auth = getAuth(req);
+      const userEmail = auth?.userId
+        ? (await db.query.users.findFirst({ where: eq(users.id, auth.userId) }))?.email || ""
+        : "";
+      const currency = (await getAccountCurrency()).toLowerCase();
+      const origin = appOrigin();
+      const { createTelephonyTopupCheckout } = await import("../lib/stripe");
+      const checkoutUrl = await createTelephonyTopupCheckout(
+        orgId,
+        org.name,
+        userEmail,
+        amountMinor,
+        currency,
+        `${origin}/dashboard/settings?tab=credits&topup=success`,
+        `${origin}/dashboard/settings?tab=credits`,
+      );
+      res.json({ data: { checkoutUrl } });
+      return;
+    }
+
     if (!result.charged) throw new ApiError(402, result.error || "Card charge failed");
 
     const balanceMinor = await getTelephonyBalance(orgId);

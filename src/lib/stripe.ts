@@ -229,6 +229,51 @@ export async function createCreditCheckoutSession(
   return session.url!;
 }
 
+/**
+ * Checkout page for a telephony balance top-up when no payment method is on
+ * file. `setup_future_usage` saves the card, so subsequent manual/auto
+ * top-ups charge off-session without another checkout. The PaymentIntent
+ * carries type "telephony_topup", so the payment_intent.succeeded webhook
+ * credits the wallet + settles invoices; checkout.session.completed acts as
+ * a second idempotent path.
+ */
+export async function createTelephonyTopupCheckout(
+  orgId: string,
+  orgName: string,
+  email: string,
+  amountMinor: number,
+  currency: string,
+  successUrl: string,
+  cancelUrl: string,
+): Promise<string> {
+  const customerId = await getOrCreateStripeCustomer(orgId, orgName, email);
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: "payment",
+    line_items: [
+      {
+        price_data: {
+          currency,
+          unit_amount: amountMinor,
+          product_data: {
+            name: "Leadey telephony balance top-up",
+            description: "Funds calling, texting and phone-number rental.",
+          },
+        },
+        quantity: 1,
+      },
+    ],
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: { type: "telephony_topup_checkout", orgId },
+    payment_intent_data: {
+      setup_future_usage: "off_session",
+      metadata: { type: "telephony_topup", orgId },
+    },
+  });
+  return session.url!;
+}
+
 export async function createPortalSession(
   orgId: string,
   returnUrl: string,
