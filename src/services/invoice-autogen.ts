@@ -6,14 +6,12 @@ import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
 import { phoneLines } from "../db/schema/phone-lines";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
-import { getPlanConfig } from "../lib/stripe";
 import { createId } from "../lib/helpers";
 import { applyUsageDelta, maybeAutoTopup } from "../lib/telephony-credits";
 import {
   buildTelephonyInvoice,
   nextInvoiceNumber,
   monthRange,
-  PLAN_PRICES_PENCE,
   INVOICE_MULTIPLIER_DEFAULT,
 } from "../routes/admin";
 
@@ -159,54 +157,6 @@ async function upsertTelephonyInvoice(
     .where(eq(invoices.id, existing.id));
 }
 
-/** One auto seat invoice per org per month while the plan is active. */
-async function upsertSeatInvoice(
-  org: { id: string; plan: string; seatsIncluded: number },
-  period: string,
-) {
-  const unitPence = PLAN_PRICES_PENCE[org.plan] || 0;
-  const seats = org.seatsIncluded || 0;
-  if (!unitPence || !seats) return;
-
-  const planName = getPlanConfig(org.plan).name;
-  const lineItems: InvoiceLineItem[] = [
-    {
-      description: `${planName} plan — ${seats} seat${seats === 1 ? "" : "s"} × £${(unitPence / 100).toFixed(2)}/mo`,
-      quantity: seats,
-      unit: "seat",
-      amountMinor: seats * unitPence,
-    },
-  ];
-  const totalMinor = seats * unitPence;
-  const existing = await findAutoInvoice(org.id, "seats", period);
-
-  if (!existing) {
-    await insertAutoInvoice({
-      organizationId: org.id,
-      type: "seats",
-      period,
-      currency: "gbp",
-      lineItems,
-      totalMinor,
-      meta: { seats, unitPricePence: unitPence, plan: org.plan },
-      dueAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
-    });
-    return;
-  }
-
-  if (existing.status !== "open" || existing.stripePaymentLinkId) return;
-  if (existing.totalMinor === totalMinor) return;
-  await db
-    .update(invoices)
-    .set({
-      lineItems,
-      subtotalMinor: totalMinor,
-      totalMinor,
-      meta: { seats, unitPricePence: unitPence, plan: org.plan, auto: true },
-    })
-    .where(eq(invoices.id, existing.id));
-}
-
 export async function runInvoiceAutogen(): Promise<void> {
   const current = monthRange().period;
   const previous = prevPeriod(current);
@@ -260,44 +210,34 @@ export async function runInvoiceAutogen(): Promise<void> {
     }
   }
 
-  // Seats: active paid plans get this month's seat invoice — UNLESS the org
-  // pays through a Stripe subscription (the subscription IS the seat billing;
-  // a Leadey seat invoice on top would charge the same seats twice). For
-  // subscribed orgs, any open unsent auto seat invoice is voided so nothing
-  // stale is left to collect.
-  const paidOrgs = await db
-    .select({
-      id: organizations.id,
-      plan: organizations.plan,
-      seatsIncluded: organizations.seatsIncluded,
-      stripeSubscriptionId: organizations.stripeSubscriptionId,
-    })
-    .from(organizations)
-    .where(and(eq(organizations.planStatus, "active"), sql`${organizations.plan} IN ('starter','growth','scale')`));
-  let seatCount = 0;
-  for (const org of paidOrgs) {
+  // Seats are billed exclusively through Stripe subscriptions (Jul 2026) —
+  // auto seat invoices are retired. Any open unsent auto seat invoice left
+  // over from the invoice era is voided so nothing stale is collectable.
+  // (Manual seat invoices can still be raised in the admin panel.)
+  const staleSeatInvoices = await db
+    .select()
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.type, "seats"),
+        eq(invoices.status, "open"),
+        sql`${invoices.meta}->>'auto' = 'true'`,
+        sql`${invoices.stripePaymentLinkId} IS NULL`,
+      ),
+    );
+  for (const inv of staleSeatInvoices) {
     try {
-      if (org.stripeSubscriptionId) {
-        const existing = await findAutoInvoice(org.id, "seats", current);
-        if (existing && existing.status === "open" && !existing.stripePaymentLinkId) {
-          await db
-            .update(invoices)
-            .set({ status: "void", notes: "Voided automatically — seats are billed via Stripe subscription." })
-            .where(eq(invoices.id, existing.id));
-          console.log(`[InvoiceAutogen] voided seat invoice ${existing.number} for subscribed org ${org.id}`);
-        }
-        continue;
-      }
-      await upsertSeatInvoice(org, current);
-      seatCount++;
+      await db
+        .update(invoices)
+        .set({ status: "void", notes: "Voided automatically — seats are billed via Stripe subscription." })
+        .where(eq(invoices.id, inv.id));
+      console.log(`[InvoiceAutogen] voided stale seat invoice ${inv.number}`);
     } catch (err) {
-      console.error(`[InvoiceAutogen] seats failed for org ${org.id}:`, err);
+      console.error(`[InvoiceAutogen] void failed for ${inv.number}:`, err);
     }
   }
 
-  console.log(
-    `[InvoiceAutogen] swept ${processed} telephony org(s), ${seatCount} seat org(s) for ${previous}+${current}`,
-  );
+  console.log(`[InvoiceAutogen] swept ${processed} telephony org(s) for ${previous}+${current}`);
 }
 
 export function startInvoiceAutogen(): void {

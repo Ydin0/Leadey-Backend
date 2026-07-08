@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations } from "../db/schema/organizations";
 import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
@@ -292,10 +292,11 @@ router.get(
       .where(eq(organizations.id, orgId));
     if (!org) throw new ApiError(404, "Organization not found");
 
+    // Void invoices are internal corrections — customers never see them.
     const rows = await db
       .select()
       .from(invoices)
-      .where(eq(invoices.organizationId, orgId))
+      .where(and(eq(invoices.organizationId, orgId), sql`${invoices.status} <> 'void'`))
       .orderBy(desc(invoices.issuedAt))
       .limit(36);
 
@@ -324,7 +325,13 @@ router.get(
     const [row] = await db
       .select()
       .from(invoices)
-      .where(and(eq(invoices.id, String(req.params.id)), eq(invoices.organizationId, orgId)));
+      .where(
+        and(
+          eq(invoices.id, String(req.params.id)),
+          eq(invoices.organizationId, orgId),
+          sql`${invoices.status} <> 'void'`,
+        ),
+      );
     if (!row) throw new ApiError(404, "Invoice not found");
 
     res.json({ data: serializeCustomerInvoice(row, org) });
