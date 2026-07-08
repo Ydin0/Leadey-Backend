@@ -2782,6 +2782,16 @@ router.patch(
       after: { multiplier: markupX100 / 100, roundUp },
     });
 
+    // Re-derive this org's open invoices + wallet usage NOW, so the admin
+    // sees the new pricing on save instead of after the next 6h sweep.
+    // (Dynamic import: invoice-autogen imports from this module.)
+    try {
+      const { resweepTelephonyForOrg } = await import("../services/invoice-autogen");
+      await resweepTelephonyForOrg(orgId);
+    } catch (err) {
+      console.error(`[Admin] telephony resweep failed for org ${orgId}:`, err);
+    }
+
     res.json({ data: { markupMultiplier: markupX100 / 100, roundUp } });
   }),
 );
@@ -2815,6 +2825,14 @@ router.patch(
       before: { bufferPct: before.bufferPct },
       after: { bufferPct },
     });
+
+    // Buffer changes the invoice total too — re-derive immediately.
+    try {
+      const { resweepTelephonyForOrg } = await import("../services/invoice-autogen");
+      await resweepTelephonyForOrg(orgId);
+    } catch (err) {
+      console.error(`[Admin] telephony resweep failed for org ${orgId}:`, err);
+    }
 
     res.json({ data: { bufferPct } });
   }),

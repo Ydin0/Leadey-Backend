@@ -159,6 +159,37 @@ async function upsertTelephonyInvoice(
     .where(eq(invoices.id, existing.id));
 }
 
+/** Immediately re-derive ONE org's telephony invoices (previous + current
+ *  period) and wallet usage under its current billing config. Called when
+ *  the platform admin changes the org's margin/round-up/buffer so the
+ *  figures update on save instead of waiting for the next 6h sweep. */
+export async function resweepTelephonyForOrg(orgId: string): Promise<void> {
+  const current = monthRange().period;
+  const previous = prevPeriod(current);
+  const currency = (await getAccountCurrency()).toLowerCase();
+
+  const [org] = await db
+    .select({
+      bufferPct: organizations.telephonyBufferPct,
+      autoTopup: organizations.telephonyAutoTopupEnabled,
+      markupX100: organizations.telephonyMarkupX100,
+      roundUp: organizations.telephonyRoundUp,
+    })
+    .from(organizations)
+    .where(eq(organizations.id, orgId));
+  if (!org) return;
+
+  const cfg = {
+    bufferPct: org.bufferPct ?? 0,
+    autoTopup: org.autoTopup,
+    multiplier: (org.markupX100 ?? 200) / 100,
+    roundUp: org.roundUp ?? false,
+  };
+  await upsertTelephonyInvoice(orgId, previous, currency, cfg);
+  await upsertTelephonyInvoice(orgId, current, currency, cfg);
+  if (cfg.autoTopup) await maybeAutoTopup(orgId);
+}
+
 export async function runInvoiceAutogen(): Promise<void> {
   const current = monthRange().period;
   const previous = prevPeriod(current);
