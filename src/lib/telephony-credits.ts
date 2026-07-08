@@ -27,8 +27,12 @@ import { createId } from "./helpers";
 
 /** Ledger starts at this period. Earlier months were billed/paid before the
  *  wallet existed — debiting them (or crediting their late payments) would
- *  start every org at a meaningless negative/positive number. */
-export const TELEPHONY_LEDGER_EPOCH = "2026-07";
+ *  start every org at a meaningless negative/positive number.
+ *  Moved back to 2026-06 (Jul 2026): June invoices are still OPEN, so their
+ *  usage must show as owing in the wallet and their payments must credit it.
+ *  The sweeper covers previous+current period, so June backfills on the next
+ *  sweep automatically. */
+export const TELEPHONY_LEDGER_EPOCH = "2026-06";
 
 type TelephonyKind = "topup" | "usage" | "adjustment";
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
