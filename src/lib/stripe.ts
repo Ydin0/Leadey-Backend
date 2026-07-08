@@ -101,7 +101,21 @@ export async function getOrCreateStripeCustomer(
     .from(organizations)
     .where(eq(organizations.id, orgId));
 
-  if (org?.stripeCustomerId) return org.stripeCustomerId;
+  // Verify the stored customer still exists in THIS Stripe mode. Orgs that
+  // touched billing while the backend ran on the test key carry test-mode
+  // customer ids the live key can't see ("No such customer") — self-heal by
+  // minting a fresh customer instead of failing every checkout forever.
+  if (org?.stripeCustomerId) {
+    try {
+      const existing = await stripe.customers.retrieve(org.stripeCustomerId);
+      if (!existing.deleted) return org.stripeCustomerId;
+    } catch (err: any) {
+      if (err?.code !== "resource_missing") throw err;
+      console.warn(
+        `[Stripe] stored customer ${org.stripeCustomerId} not found (mode mismatch?) — creating a new one for org ${orgId}`,
+      );
+    }
+  }
 
   const customer = await stripe.customers.create({
     name: orgName,

@@ -185,10 +185,20 @@ router.get(
       return;
     }
 
-    const invoices = await stripe.invoices.list({
-      customer: org.stripeCustomerId,
-      limit: 12,
-    });
+    let invoices;
+    try {
+      invoices = await stripe.invoices.list({
+        customer: org.stripeCustomerId,
+        limit: 12,
+      });
+    } catch (err: any) {
+      // Test-mode leftover customer id — no live invoices exist for it.
+      if (err?.code === "resource_missing") {
+        res.json({ data: [] });
+        return;
+      }
+      throw err;
+    }
 
     res.json({
       data: invoices.data.map((inv) => ({
