@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN "seat_adjustment" integer DEFAULT 0 NOT NULL;

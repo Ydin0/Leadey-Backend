@@ -14,6 +14,11 @@ export const organizations = pgTable("organizations", {
   trialEndsAt: timestamp("trial_ends_at", { withTimezone: true }),
   currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
   seatsIncluded: integer("seats_included").notNull().default(5),
+  /** Platform-admin seat override: a ± delta applied ON TOP of the Stripe
+   *  subscription quantity whenever webhooks sync seats, so admin grants
+   *  (or restrictions) survive renewals and seat changes. 0 for orgs
+   *  without a subscription — their seatsIncluded is set directly. */
+  seatAdjustment: integer("seat_adjustment").notNull().default(0),
   creditsIncluded: integer("credits_included").notNull().default(10000),
   creditsUsed: integer("credits_used").notNull().default(0),
   /** Unified prepaid credit wallet — the single source of truth for spendable

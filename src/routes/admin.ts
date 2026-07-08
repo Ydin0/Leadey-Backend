@@ -934,17 +934,18 @@ router.patch(
       .where(eq(organizations.id, req.params.id));
     if (!org) throw new ApiError(404, "Organization not found");
 
-    const before = { seats: org.seatsIncluded };
+    const before = { seats: org.seatsIncluded, seatAdjustment: org.seatAdjustment };
 
+    // Platform-admin override: NEVER touches the customer's Stripe billing.
+    // For subscribed orgs the difference vs the paid quantity is stored as a
+    // persistent adjustment so webhook syncs (renewals, seat changes) keep
+    // re-applying it. Paid-quantity changes happen through the company's own
+    // add-seats flow.
+    let seatAdjustment = 0;
     if (org.stripeSubscriptionId) {
       const sub: any = await stripe.subscriptions.retrieve(org.stripeSubscriptionId);
-      const item = sub.items?.data?.[0];
-      if (!item) throw new ApiError(500, "Subscription has no items");
-
-      await stripe.subscriptions.update(org.stripeSubscriptionId, {
-        items: [{ id: item.id, quantity: seats }],
-        proration_behavior: "create_prorations",
-      });
+      const paidQuantity = sub.items?.data?.[0]?.quantity || 1;
+      seatAdjustment = seats - paidQuantity;
     }
 
     const planConfig = getPlanConfig(org.plan);
@@ -952,6 +953,7 @@ router.patch(
       .update(organizations)
       .set({
         seatsIncluded: seats,
+        seatAdjustment,
         creditsIncluded: planConfig.scraperCredits * seats,
         updatedAt: new Date(),
       })
@@ -968,10 +970,10 @@ router.patch(
       targetType: "organization",
       targetId: req.params.id,
       before,
-      after: { seats },
+      after: { seats, seatAdjustment },
     });
 
-    res.json({ data: { seats } });
+    res.json({ data: { seats, seatAdjustment } });
   }),
 );
 

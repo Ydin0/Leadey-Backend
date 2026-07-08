@@ -1434,6 +1434,12 @@ router.post("/stripe", async (req: Request, res: Response) => {
           const plan = getPlanFromPriceId(priceId);
           const config = getPlanConfig(plan);
           const quantity = sub.items?.data?.[0]?.quantity || config.seats;
+          // Admin seat grants/restrictions persist across subscription syncs.
+          const [orgRow] = await db
+            .select({ adj: organizations.seatAdjustment })
+            .from(organizations)
+            .where(eq(organizations.id, orgId));
+          const seats = Math.max(1, quantity + (orgRow?.adj ?? 0));
 
           await db
             .update(organizations)
@@ -1444,13 +1450,13 @@ router.post("/stripe", async (req: Request, res: Response) => {
               plan,
               planStatus: "active",
               currentPeriodEnd: new Date(sub.current_period_end * 1000),
-              seatsIncluded: quantity,
-              creditsIncluded: config.scraperCredits * quantity,
+              seatsIncluded: seats,
+              creditsIncluded: config.scraperCredits * seats,
               updatedAt: new Date(),
             })
             .where(eq(organizations.id, orgId));
 
-          console.log(`[Stripe] Org ${orgId} subscribed to ${plan} with ${quantity} seats`);
+          console.log(`[Stripe] Org ${orgId} subscribed to ${plan} with ${quantity} paid seats (effective ${seats})`);
         }
         break;
       }
@@ -1471,6 +1477,12 @@ router.post("/stripe", async (req: Request, res: Response) => {
         const plan = getPlanFromPriceId(priceId);
         const config = getPlanConfig(plan);
         const quantity = sub.items?.data?.[0]?.quantity || config.seats;
+        // Admin seat grants/restrictions persist across subscription syncs.
+        const [orgRow] = await db
+          .select({ adj: organizations.seatAdjustment })
+          .from(organizations)
+          .where(eq(organizations.id, orgId));
+        const seats = Math.max(1, quantity + (orgRow?.adj ?? 0));
 
         const statusMap: Record<string, string> = {
           active: "active",
@@ -1488,8 +1500,8 @@ router.post("/stripe", async (req: Request, res: Response) => {
             plan,
             planStatus: statusMap[sub.status] || "active",
             currentPeriodEnd: new Date(sub.current_period_end * 1000),
-            seatsIncluded: quantity,
-            creditsIncluded: config.scraperCredits * quantity,
+            seatsIncluded: seats,
+            creditsIncluded: config.scraperCredits * seats,
             updatedAt: new Date(),
           })
           .where(eq(organizations.id, orgId));

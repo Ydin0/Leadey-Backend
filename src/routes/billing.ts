@@ -13,6 +13,7 @@ import {
   getPlanConfig,
   getPlanFromPriceId,
 } from "../lib/stripe";
+import { ensureOrgMembershipCap } from "../lib/invitations";
 import { getAuth } from "@clerk/express";
 
 const router = Router();
@@ -53,6 +54,7 @@ router.get(
           const plan = getPlanFromPriceId(priceId);
           const planConfig = getPlanConfig(plan);
           const quantity = sub.items?.data?.[0]?.quantity || planConfig.seats;
+          const seats = Math.max(1, quantity + (org.seatAdjustment ?? 0));
 
           await db.update(organizations).set({
             stripeSubscriptionId: sub.id,
@@ -60,8 +62,8 @@ router.get(
             plan,
             planStatus: "active",
             currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
-            seatsIncluded: quantity,
-            creditsIncluded: planConfig.scraperCredits * quantity,
+            seatsIncluded: seats,
+            creditsIncluded: planConfig.scraperCredits * seats,
             updatedAt: new Date(),
           }).where(eq(organizations.id, orgId));
 
@@ -180,18 +182,20 @@ router.post(
     });
 
     // The subscription.updated webhook syncs seats too; write through now so
-    // the UI reflects it immediately.
+    // the UI reflects it immediately. Admin seat grants stay applied on top.
     const config = getPlanConfig(org.plan);
+    const effectiveSeats = Math.max(1, newQuantity + (org.seatAdjustment ?? 0));
     await db
       .update(organizations)
       .set({
-        seatsIncluded: newQuantity,
-        creditsIncluded: config.scraperCredits * newQuantity,
+        seatsIncluded: effectiveSeats,
+        creditsIncluded: config.scraperCredits * effectiveSeats,
         updatedAt: new Date(),
       })
       .where(eq(organizations.id, orgId));
+    await ensureOrgMembershipCap(orgId, effectiveSeats);
 
-    res.json({ data: { seats: newQuantity } });
+    res.json({ data: { seats: effectiveSeats } });
   }),
 );
 
