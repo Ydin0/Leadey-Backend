@@ -260,18 +260,34 @@ export async function runInvoiceAutogen(): Promise<void> {
     }
   }
 
-  // Seats: active paid plans get this month's seat invoice.
+  // Seats: active paid plans get this month's seat invoice — UNLESS the org
+  // pays through a Stripe subscription (the subscription IS the seat billing;
+  // a Leadey seat invoice on top would charge the same seats twice). For
+  // subscribed orgs, any open unsent auto seat invoice is voided so nothing
+  // stale is left to collect.
   const paidOrgs = await db
     .select({
       id: organizations.id,
       plan: organizations.plan,
       seatsIncluded: organizations.seatsIncluded,
+      stripeSubscriptionId: organizations.stripeSubscriptionId,
     })
     .from(organizations)
     .where(and(eq(organizations.planStatus, "active"), sql`${organizations.plan} IN ('starter','growth','scale')`));
   let seatCount = 0;
   for (const org of paidOrgs) {
     try {
+      if (org.stripeSubscriptionId) {
+        const existing = await findAutoInvoice(org.id, "seats", current);
+        if (existing && existing.status === "open" && !existing.stripePaymentLinkId) {
+          await db
+            .update(invoices)
+            .set({ status: "void", notes: "Voided automatically — seats are billed via Stripe subscription." })
+            .where(eq(invoices.id, existing.id));
+          console.log(`[InvoiceAutogen] voided seat invoice ${existing.number} for subscribed org ${org.id}`);
+        }
+        continue;
+      }
       await upsertSeatInvoice(org, current);
       seatCount++;
     } catch (err) {
