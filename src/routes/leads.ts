@@ -448,6 +448,36 @@ router.get(
   }),
 );
 
+// ─── POST /leads/bulk-delete — org-wide permanent delete ────────────────────
+// The org Leads page shows every enrollment row across campaigns; deleting a
+// selection removes exactly those rows (events/tasks/docs cascade). Behind a
+// typed confirmation client-side.
+router.post(
+  "/leads/bulk-delete",
+  requirePerm("leads.delete"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const leadIds: string[] = Array.isArray(req.body?.leadIds)
+      ? (req.body.leadIds as unknown[]).map(String).filter(Boolean)
+      : [];
+    if (leadIds.length === 0) throw new ApiError(400, "leadIds is required");
+    if (leadIds.length > 5000) throw new ApiError(400, "Too many leads in one request (max 5000)");
+
+    // Only rows that genuinely belong to this org count as targets.
+    const targets = await db
+      .select({ id: leads.id })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), inArray(leads.id, leadIds)));
+
+    const ids = targets.map((t) => t.id);
+    for (let i = 0; i < ids.length; i += 500) {
+      await db.delete(leads).where(inArray(leads.id, ids.slice(i, i + 500)));
+    }
+    res.json({ data: { deleted: ids.length } });
+  }),
+);
+
 // ─── GET /leads/:id/funnel — resolve a lead's campaign id (standalone profile)
 // Lets the org-wide Leads page open a lead's full profile without already
 // knowing which campaign owns it (e.g. a pasted /dashboard/leads/:id link).

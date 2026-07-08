@@ -66,6 +66,24 @@ function applyText(expr: SQL, op: Op, value: unknown, isEnum: boolean): SQL | nu
   return null;
 }
 
+/** Phone matching is digit-normalized on BOTH sides — "+44 7911 220866",
+ *  "+447911220866" and "07911220866" must all match a "+447" query. The UK
+ *  trunk form (leading 0) is also tried as its international form (44…). */
+function applyPhone(expr: SQL, op: Op, value: unknown): SQL | null {
+  if (op === "is_set") return sql`coalesce(${expr}, '') <> ''`;
+  if (op === "is_empty") return sql`coalesce(${expr}, '') = ''`;
+  if (!hasVal(value)) return null;
+  const q = String(Array.isArray(value) ? value[0] : value).replace(/\D/g, "");
+  if (!q) return applyText(expr, op, value, false);
+  const digits = sql`regexp_replace(coalesce(${expr}, ''), '[^0-9]', '', 'g')`;
+  const intl = sql`(case when regexp_replace(coalesce(${expr}, ''), '[^0-9]', '', 'g') like '0%' then '44' || substring(regexp_replace(coalesce(${expr}, ''), '[^0-9]', '', 'g') from 2) else regexp_replace(coalesce(${expr}, ''), '[^0-9]', '', 'g') end)`;
+  if (op === "contains") return sql`(${digits} like ${`%${q}%`} or ${intl} like ${`%${q}%`})`;
+  if (op === "not_contains") return sql`not (${digits} like ${`%${q}%`} or ${intl} like ${`%${q}%`})`;
+  if (op === "is") return sql`(${digits} = ${q} or ${intl} = ${q})`;
+  if (op === "is_not") return sql`(${digits} <> ${q} and ${intl} <> ${q})`;
+  return null;
+}
+
 // Generic operator application against a numeric value expression.
 function applyNum(expr: SQL, op: Op, value: unknown): SQL | null {
   if (op === "is_set") return sql`${expr} is not null`;
@@ -146,6 +164,7 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
   const col = COL[field];
   if (!col) return null;
 
+  if (field === "phone") return applyPhone(col, op, c.value);
   if (NUM_FIELDS.has(field)) return applyNum(col, op, c.value);
   if (DATE_FIELDS.has(field)) {
     if (op === "is_set") return sql`${col} is not null`;
