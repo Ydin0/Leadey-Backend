@@ -67,6 +67,9 @@ export const workflowEnrollments = pgTable(
       .notNull()
       .references(() => leads.id, { onDelete: "cascade" }),
     status: text("status").notNull().default("active"), // active | completed | exited | failed
+    /** User whose action fired the trigger (status change, manual enroll…) —
+     *  lets email/SMS nodes send AS that person (senderMode "actor"). */
+    triggeredBy: text("triggered_by"),
     currentNodeId: text("current_node_id"),
     nextRunAt: timestamp("next_run_at", { withTimezone: true }),
     /** Event the enrollment is parked on (wait-for-event), e.g. "replied". */

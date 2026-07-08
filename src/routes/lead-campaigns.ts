@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { getAuth } from "@clerk/express";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
@@ -196,7 +197,7 @@ router.post(
     });
 
     // Enroll into any "lead enters campaign" workflows (fire-and-forget).
-    void fireTrigger(orgId, targetFunnelId, id, "lead_enters_campaign");
+    void fireTrigger(orgId, targetFunnelId, id, "lead_enters_campaign", { actorUserId: getAuth(req)?.userId ?? null });
 
     const refreshed = await findMemberships(orgId, base);
     res.status(201).json({ data: refreshed.map((m) => serialize(m, base.id)) });
@@ -347,7 +348,7 @@ router.post(
 
     // One batched enrollment into any "lead enters campaign" workflows.
     if (newLeads.length > 0) {
-      void fireTrigger(orgId, funnelId, newLeads.map((l) => l.id), "lead_enters_campaign");
+      void fireTrigger(orgId, funnelId, newLeads.map((l) => l.id), "lead_enters_campaign", { actorUserId: getAuth(req)?.userId ?? null });
     }
 
     res.status(201).json({ data: { added: newLeads.length, skipped } });

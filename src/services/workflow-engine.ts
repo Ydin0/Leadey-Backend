@@ -41,7 +41,7 @@ export function triggerTypeFromLabel(label: string): TriggerType {
 }
 
 /** Context carried by a trigger so its config can filter (status-to, tag, …). */
-export interface TriggerCtx { status?: string; tag?: string }
+export interface TriggerCtx { status?: string; tag?: string; actorUserId?: string | null }
 
 function graphOf(w: { graph: WorkflowGraph | null }): WorkflowGraph {
   return w.graph && Array.isArray(w.graph.nodes) ? w.graph : { nodes: [], edges: [] };
@@ -157,16 +157,24 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const accounts = await db.select().from(emailAccounts).where(eq(emailAccounts.organizationId, orgId));
       const accountId = typeof d.accountId === "string" ? d.accountId : "";
       const fromAddr = typeof d.from === "string" ? d.from : "";
-      const account =
+      let account =
         (accountId ? accounts.find((a) => a.id === accountId) : undefined) ||
         (fromAddr ? accounts.find((a) => a.email === fromAddr) : undefined) ||
         accounts.find((a) => a.isDefault) || accounts[0];
+      // "Send as the user who triggered": prefer the actor's own mailbox;
+      // fall back to the configured/default account when they have none.
+      const actorSender = d.senderMode === "actor" && !!enr.triggeredBy;
+      if (actorSender) {
+        const own = accounts.filter((a) => a.userId === enr.triggeredBy);
+        const actorAcc = own.find((a) => a.isDefault) || own[0];
+        if (actorAcc) account = actorAcc;
+      }
       try {
         if (account) {
           const res = await sendEmailVia(account, { to: lead.email, subject, html, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,
-            funnelId: lead.funnelId, userId: null, direction: "outbound", fromEmail: account.email,
+            funnelId: lead.funnelId, userId: actorSender ? enr.triggeredBy : null, direction: "outbound", fromEmail: account.email,
             fromName: account.fromName || "", toEmail: lead.email, subject, bodyHtml: html,
             providerMessageId: res.providerMessageId, providerThreadId: res.providerThreadId,
             messageIdHeader: res.messageIdHeader, status: "sent", createdAt: new Date(),
@@ -193,7 +201,14 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const dest = phoneCountry(lead.phone);
       const same = (l: { number: string }) => dest === "other" || phoneCountry(l.number) === dest;
       const lineId = typeof d.lineId === "string" ? d.lineId : "";
-      const line = (lineId ? active.find((l) => l.id === lineId) : undefined) || active.find(same) || active[0];
+      let line = (lineId ? active.find((l) => l.id === lineId) : undefined) || active.find(same) || active[0];
+      // "Send as the user who triggered": prefer a line assigned to the
+      // actor (country-matched first); fall back to the configured pick.
+      if (d.senderMode === "actor" && enr.triggeredBy) {
+        const mine = active.filter((l) => l.assignedTo === enr.triggeredBy);
+        const actorLine = mine.find(same) || mine[0];
+        if (actorLine) line = actorLine;
+      }
       if (!line) { await logRun(enr, node, "skipped", { reason: "no phone line" }); return; }
       // Telephony spend gates (balance floor + monthly budget) — workflows
       // must respect them too.
@@ -272,7 +287,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         stepIndex: 0, meta: { source: "workflow", from: lead.status }, timestamp: new Date(),
       });
       await logRun(enr, node, "done", { status: key });
-      void fireTriggerForLead(lead.id, "status_changed", { status: key }); // chain status-change workflows
+      void fireTriggerForLead(lead.id, "status_changed", { status: key, actorUserId: enr.triggeredBy }); // chain status-change workflows
       return;
     }
     case "tag": {
@@ -282,7 +297,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const next = d.mode === "remove" ? current.filter((t) => t !== tag) : Array.from(new Set([...current, tag]));
       await db.update(leads).set({ tags: next, updatedAt: new Date() }).where(eq(leads.id, lead.id));
       await logRun(enr, node, "done", { tag, mode: d.mode });
-      if (d.mode !== "remove") void fireTriggerForLead(lead.id, "tag_added", { tag }); // chain tag-added workflows
+      if (d.mode !== "remove") void fireTriggerForLead(lead.id, "tag_added", { tag, actorUserId: enr.triggeredBy }); // chain tag-added workflows
       return;
     }
     case "field": {
@@ -521,7 +536,7 @@ export async function fireTrigger(
         const want = String(tdata.tag || "").trim();
         if (want && ctx?.tag !== want) continue; // empty = any tag
       }
-      await enrollInto(wf, ids);
+      await enrollInto(wf, ids, ctx?.actorUserId ?? null);
     }
   } catch (e) {
     console.error("[workflow-engine] fireTrigger error:", e instanceof Error ? e.message : e);
@@ -530,7 +545,7 @@ export async function fireTrigger(
 
 /** Create active enrollments for the given leads into one workflow, honoring its
  *  re-enrollment policy. Returns how many were enrolled. */
-async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[]): Promise<number> {
+async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[], actorUserId: string | null = null): Promise<number> {
   const g = graphOf(wf);
   const start = triggerStart(g);
   if (!start || ids.length === 0) return 0;
@@ -549,17 +564,17 @@ async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[]): Pro
   if (toEnroll.length === 0) return 0;
   await db.insert(workflowEnrollments).values(toEnroll.map((leadId) => ({
     id: createId("wfe"), workflowId: wf.id, organizationId: wf.organizationId, leadId,
-    status: "active", currentNodeId: start, nextRunAt: new Date(),
+    status: "active", currentNodeId: start, nextRunAt: new Date(), triggeredBy: actorUserId,
   })));
   return toEnroll.length;
 }
 
 /** Manually enroll specific leads into a specific workflow (the "Enroll leads"
  *  button), regardless of its trigger type. Returns how many were enrolled. */
-export async function enrollLeadsDirect(orgId: string, workflowId: string, leadIds: string[]): Promise<number> {
+export async function enrollLeadsDirect(orgId: string, workflowId: string, leadIds: string[], actorUserId: string | null = null): Promise<number> {
   const [wf] = await db.select().from(workflows).where(and(eq(workflows.id, workflowId), eq(workflows.organizationId, orgId)));
   if (!wf) return 0;
-  return enrollInto(wf, leadIds);
+  return enrollInto(wf, leadIds, actorUserId);
 }
 
 /** Convenience for callers that only have a leadId (reply hooks): resolve the

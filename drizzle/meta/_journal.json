@@ -540,6 +540,13 @@
       "when": 1783547092561,
       "tag": "0076_legal_rumiko_fujikawa",
       "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1783549842489,
+      "tag": "0077_loving_bloodstrike",
+      "breakpoints": true
     }
   ]
 }

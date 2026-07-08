@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { getAuth } from "@clerk/express";
 import { eq, and, sql, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { funnels } from "../db/schema/funnels";
@@ -204,7 +205,7 @@ router.post(
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
     const leadIds = Array.isArray(req.body?.leadIds) ? (req.body.leadIds as unknown[]).map(String) : [];
     if (leadIds.length === 0) throw new ApiError(400, "leadIds required");
-    const enrolled = await enrollLeadsDirect(orgId, w.id, leadIds);
+    const enrolled = await enrollLeadsDirect(orgId, w.id, leadIds, getAuth(req as unknown as Request)?.userId ?? null);
     res.json({ data: { enrolled } });
   }),
 );

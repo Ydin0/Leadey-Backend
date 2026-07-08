@@ -1,0 +1,1 @@
+ALTER TABLE "workflow_enrollments" ADD COLUMN "triggered_by" text;

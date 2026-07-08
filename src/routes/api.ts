@@ -1688,7 +1688,7 @@ router.post(
     // Enroll the freshly-imported leads into any active "lead enters campaign"
     // workflows (one batched call; fire-and-forget).
     if (leadsToInsert.length > 0) {
-      void fireTrigger(orgId, funnel.id, leadsToInsert.map((l) => l.id), "lead_enters_campaign");
+      void fireTrigger(orgId, funnel.id, leadsToInsert.map((l) => l.id), "lead_enters_campaign", { actorUserId: getAuth(req as unknown as Request)?.userId ?? null });
     }
 
     res.status(201).json({
@@ -1764,7 +1764,7 @@ router.patch(
 
     // Enroll into any active "status changes" workflows (fire-and-forget) —
     // pass the new status so a "changes to X" trigger only fires on a match.
-    void fireTrigger(orgId, funnel.id, lead.id, "status_changed", { status });
+    void fireTrigger(orgId, funnel.id, lead.id, "status_changed", { status, actorUserId: getAuth(req as unknown as Request)?.userId ?? null });
 
     res.json({ data: { id: lead.id, status, company: lead.company } });
   }),
@@ -2502,7 +2502,7 @@ router.post(
     }
 
     // Enroll into any active "lead enters campaign" workflows (fire-and-forget).
-    void fireTrigger(orgId, funnel.id, id, "lead_enters_campaign");
+    void fireTrigger(orgId, funnel.id, id, "lead_enters_campaign", { actorUserId: getAuth(req as unknown as Request)?.userId ?? null });
 
     const refreshed = getFunnelOrThrow(
       await loadFunnel(orgId, funnel.id, { withEvents: true, fullLeadId: id }),
