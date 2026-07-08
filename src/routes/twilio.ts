@@ -378,7 +378,9 @@ webhookRouter.post(
             const budget = await getTelephonyBudgetStatus(line.orgId);
             if (budget.blocked) {
               response.say(
-                "Your organization's monthly telephony budget has been reached. Please raise the limit in Settings, then try again.",
+                budget.reason === "floor"
+                  ? "Your organization is out of calling credit. Please top up your telephony balance in Settings, then try again."
+                  : "Your organization's monthly telephony budget has been reached. Please raise the limit in Settings, then try again.",
               );
               response.hangup();
               res.type("text/xml").send(response.toString());

@@ -2665,6 +2665,7 @@ router.get(
         bufferPct: organizations.telephonyBufferPct,
         markupX100: organizations.telephonyMarkupX100,
         roundUp: organizations.telephonyRoundUp,
+        floorMinor: organizations.telephonyFloorMinor,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId));
@@ -2686,6 +2687,7 @@ router.get(
         bufferPct: org.bufferPct,
         markupMultiplier: (org.markupX100 ?? 200) / 100,
         roundUp: org.roundUp ?? false,
+        floorMinor: org.floorMinor ?? -10000,
         currency,
         transactions: txns.map((t) => ({
           id: t.id,
@@ -2750,7 +2752,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const actor = getActorId(req);
     const orgId = req.params.id;
-    const body = req.body as { multiplier?: number; roundUp?: boolean };
+    const body = req.body as { multiplier?: number; roundUp?: boolean; floorMinor?: number };
 
     const multiplier = Number(body.multiplier);
     if (!Number.isFinite(multiplier) || multiplier < 1 || multiplier > 10) {
@@ -2763,14 +2765,28 @@ router.patch(
       .select({
         markupX100: organizations.telephonyMarkupX100,
         roundUp: organizations.telephonyRoundUp,
+        floorMinor: organizations.telephonyFloorMinor,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId));
     if (!before) throw new ApiError(404, "Organization not found");
 
+    let floorMinor = before.floorMinor ?? -10000;
+    if (body.floorMinor !== undefined) {
+      floorMinor = Math.round(Number(body.floorMinor));
+      if (!Number.isFinite(floorMinor) || floorMinor < -10_000_000 || floorMinor > 1_000_000) {
+        throw new ApiError(400, "floorMinor must be between -10,000,000 and 1,000,000");
+      }
+    }
+
     await db
       .update(organizations)
-      .set({ telephonyMarkupX100: markupX100, telephonyRoundUp: roundUp, updatedAt: new Date() })
+      .set({
+        telephonyMarkupX100: markupX100,
+        telephonyRoundUp: roundUp,
+        telephonyFloorMinor: floorMinor,
+        updatedAt: new Date(),
+      })
       .where(eq(organizations.id, orgId));
 
     await recordAudit({
@@ -2778,8 +2794,12 @@ router.patch(
       action: "org.telephony_billing.change",
       targetType: "organization",
       targetId: orgId,
-      before: { multiplier: (before.markupX100 ?? 200) / 100, roundUp: before.roundUp },
-      after: { multiplier: markupX100 / 100, roundUp },
+      before: {
+        multiplier: (before.markupX100 ?? 200) / 100,
+        roundUp: before.roundUp,
+        floorMinor: before.floorMinor,
+      },
+      after: { multiplier: markupX100 / 100, roundUp, floorMinor },
     });
 
     // Re-derive this org's open invoices + wallet usage NOW, so the admin
@@ -2788,11 +2808,13 @@ router.patch(
     try {
       const { resweepTelephonyForOrg } = await import("../services/invoice-autogen");
       await resweepTelephonyForOrg(orgId);
+      const { invalidateTelephonyBudgetCache } = await import("../lib/telephony-budget");
+      invalidateTelephonyBudgetCache(orgId);
     } catch (err) {
       console.error(`[Admin] telephony resweep failed for org ${orgId}:`, err);
     }
 
-    res.json({ data: { markupMultiplier: markupX100 / 100, roundUp } });
+    res.json({ data: { markupMultiplier: markupX100 / 100, roundUp, floorMinor } });
   }),
 );
 

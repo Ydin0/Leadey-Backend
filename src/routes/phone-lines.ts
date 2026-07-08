@@ -24,6 +24,7 @@ function phoneKey(raw: string | null | undefined): string | null {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 import { getOrgId } from "../lib/auth";
+import { assertTelephonyNotBlocked } from "../lib/telephony-budget";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm, scopeOf } from "../lib/permission-catalog";
 import { createId, ApiError } from "../lib/helpers";
@@ -316,6 +317,7 @@ router.post(
   "/phone-lines/auto-allocate",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+    await assertTelephonyNotBlocked(orgId); // buying a number is Twilio spend
     const {
       countryCode,
       country,
@@ -466,6 +468,7 @@ router.post(
   "/phone-lines/provision",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
+    await assertTelephonyNotBlocked(orgId); // buying a number is Twilio spend
     const {
       phoneNumber,
       friendlyName,

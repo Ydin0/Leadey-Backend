@@ -155,6 +155,30 @@ router.get(
           targetMinor: org.autoTopupTargetMinor,
           lastError: org.autoTopupLastError,
         },
+        floor: {
+          floorMinor: budget.floorMinor,
+          liveBalanceMinor: budget.liveBalanceMinor,
+          blocked: budget.floorBlocked,
+        },
+      },
+    });
+  }),
+);
+
+// ─── GET /credits/telephony/status ──────────────────────────────────
+// Lightweight spend-gate status for ANY org member (the dialer / SMS UI
+// checks it before Twilio actions). 60s-cached server-side.
+router.get(
+  "/credits/telephony/status",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const s = await getTelephonyBudgetStatus(orgId);
+    res.json({
+      data: {
+        blocked: s.blocked,
+        reason: s.reason,
+        floorMinor: s.floorMinor,
+        liveBalanceMinor: s.liveBalanceMinor,
       },
     });
   }),

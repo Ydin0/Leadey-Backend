@@ -77,12 +77,15 @@ router.post(
     if (!lead) throw new ApiError(404, "Lead not found");
     if (!lead.phone) throw new ApiError(400, "This lead has no phone number");
 
-    // Monthly telephony budget backstop (Close-style spending limit).
+    // Telephony spend gates: balance floor + monthly budget. The "out of
+    // calling credit" phrase is matched client-side — keep it stable.
     const budget = await getTelephonyBudgetStatus(orgId);
     if (budget.blocked) {
       throw new ApiError(
         403,
-        "Your monthly telephony budget has been reached — raise the limit in Settings → Credits to keep sending texts.",
+        budget.reason === "floor"
+          ? "Out of calling credit — your telephony balance has reached its floor. Top up in Settings → Credits to keep sending texts."
+          : "Your monthly telephony budget has been reached — raise the limit in Settings → Credits to keep sending texts.",
       );
     }
 

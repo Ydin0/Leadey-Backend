@@ -195,11 +195,15 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const lineId = typeof d.lineId === "string" ? d.lineId : "";
       const line = (lineId ? active.find((l) => l.id === lineId) : undefined) || active.find(same) || active[0];
       if (!line) { await logRun(enr, node, "skipped", { reason: "no phone line" }); return; }
-      // Monthly telephony budget backstop — workflows must respect it too.
+      // Telephony spend gates (balance floor + monthly budget) — workflows
+      // must respect them too.
       try {
         const { getTelephonyBudgetStatus } = await import("../lib/telephony-budget");
-        if ((await getTelephonyBudgetStatus(orgId)).blocked) {
-          await logRun(enr, node, "skipped", { reason: "monthly telephony budget reached" });
+        const gate = await getTelephonyBudgetStatus(orgId);
+        if (gate.blocked) {
+          await logRun(enr, node, "skipped", {
+            reason: gate.reason === "floor" ? "telephony balance floor reached" : "monthly telephony budget reached",
+          });
           return;
         }
       } catch { /* budget check is best-effort */ }

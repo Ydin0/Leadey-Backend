@@ -42,6 +42,11 @@ export const organizations = pgTable("organizations", {
   /** Round each call/message/rental cost UP to the next cent before the
    *  markup (0.014 → 0.02). Platform-admin set, per org. */
   telephonyRoundUp: boolean("telephony_round_up").notNull().default(false),
+  /** Hard spend cut-off: when the (live) wallet balance falls to/below this
+   *  floor, outbound calls, SMS and number purchases are blocked until a
+   *  top-up. Minor units; default −$100. 0 = strict prepaid. Platform-admin
+   *  set, per org. */
+  telephonyFloorMinor: integer("telephony_floor_minor").notNull().default(-10000),
   /** Monthly telephony spending limit (account-currency minor units). NULL/0 =
    *  no limit. Once the month's billed usage reaches it, outbound calls and
    *  SMS are blocked until the limit is raised or the month rolls over. */

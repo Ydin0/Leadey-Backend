@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN "telephony_floor_minor" integer DEFAULT -10000 NOT NULL;
