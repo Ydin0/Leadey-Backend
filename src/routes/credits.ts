@@ -3,9 +3,11 @@ import { and, eq, desc, gte, count, sql } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { creditTransactions } from "../db/schema/credits";
+import { telephonyCreditTransactions } from "../db/schema/telephony-credits";
 import { getOrgId } from "../lib/auth";
 import { ApiError } from "../lib/helpers";
 import { getBalance, CREDIT_COSTS, CREDIT_CENTS_PER } from "../lib/credits";
+import { getAccountCurrency } from "../lib/twilio-cost-sync";
 import { createCreditCheckoutSession } from "../lib/stripe";
 import { getAuth } from "@clerk/express";
 
@@ -99,6 +101,52 @@ router.get(
           totalAdded,
         },
         recent: recent.map(serializeTx),
+      },
+    });
+  }),
+);
+
+// ─── GET /credits/telephony ─────────────────────────────────────────
+// The org's telephony money wallet (customer-facing, read-only): balance,
+// buffer %, and recent activity. Usage draws it down daily; paid telephony
+// invoices (usage + buffer) top it up.
+router.get(
+  "/credits/telephony",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({
+        balanceMinor: organizations.telephonyCreditBalanceMinor,
+        bufferPct: organizations.telephonyBufferPct,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const [currency, recent] = await Promise.all([
+      getAccountCurrency(),
+      db
+        .select({
+          id: telephonyCreditTransactions.id,
+          kind: telephonyCreditTransactions.kind,
+          period: telephonyCreditTransactions.period,
+          amountMinor: telephonyCreditTransactions.amountMinor,
+          balanceAfterMinor: telephonyCreditTransactions.balanceAfterMinor,
+          description: telephonyCreditTransactions.description,
+          createdAt: telephonyCreditTransactions.createdAt,
+        })
+        .from(telephonyCreditTransactions)
+        .where(eq(telephonyCreditTransactions.organizationId, orgId))
+        .orderBy(desc(telephonyCreditTransactions.createdAt))
+        .limit(10),
+    ]);
+
+    res.json({
+      data: {
+        balanceMinor: org.balanceMinor ?? 0,
+        bufferPct: org.bufferPct ?? 0,
+        currency: currency.toLowerCase(),
+        recent: recent.map((t) => ({ ...t, createdAt: t.createdAt.toISOString() })),
       },
     });
   }),
