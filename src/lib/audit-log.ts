@@ -16,6 +16,7 @@ export type AuditAction =
   | "org.credits.adjust"
   | "org.telephony_credits.adjust"
   | "org.telephony_buffer.change"
+  | "org.telephony_billing.change"
   | "org.invoice.refund"
   | "invoice.create"
   | "invoice.status.change"

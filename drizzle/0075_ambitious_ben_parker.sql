@@ -1,0 +1,2 @@
+ALTER TABLE "organizations" ADD COLUMN "telephony_markup_x100" integer DEFAULT 200 NOT NULL;--> statement-breakpoint
+ALTER TABLE "organizations" ADD COLUMN "telephony_round_up" boolean DEFAULT false NOT NULL;

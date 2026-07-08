@@ -2663,6 +2663,8 @@ router.get(
       .select({
         balance: organizations.telephonyCreditBalanceMinor,
         bufferPct: organizations.telephonyBufferPct,
+        markupX100: organizations.telephonyMarkupX100,
+        roundUp: organizations.telephonyRoundUp,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId));
@@ -2682,6 +2684,8 @@ router.get(
       data: {
         balanceMinor: org.balance,
         bufferPct: org.bufferPct,
+        markupMultiplier: (org.markupX100 ?? 200) / 100,
+        roundUp: org.roundUp ?? false,
         currency,
         transactions: txns.map((t) => ({
           id: t.id,
@@ -2734,6 +2738,51 @@ router.post(
     });
 
     res.json({ data: { balanceMinor, delta } });
+  }),
+);
+
+// PATCH /api/admin/organizations/:id/telephony-billing — markup + round-up.
+// Controls how usage invoices are priced: billed = real Twilio cost
+// (optionally each item ceiled to the next cent) × multiplier. Takes effect
+// on the next autogen sweep (open unsent invoices re-derive automatically).
+router.patch(
+  "/organizations/:id/telephony-billing",
+  asyncHandler(async (req, res) => {
+    const actor = getActorId(req);
+    const orgId = req.params.id;
+    const body = req.body as { multiplier?: number; roundUp?: boolean };
+
+    const multiplier = Number(body.multiplier);
+    if (!Number.isFinite(multiplier) || multiplier < 1 || multiplier > 10) {
+      throw new ApiError(400, "multiplier must be between 1 and 10");
+    }
+    const roundUp = Boolean(body.roundUp);
+    const markupX100 = Math.round(multiplier * 100);
+
+    const [before] = await db
+      .select({
+        markupX100: organizations.telephonyMarkupX100,
+        roundUp: organizations.telephonyRoundUp,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!before) throw new ApiError(404, "Organization not found");
+
+    await db
+      .update(organizations)
+      .set({ telephonyMarkupX100: markupX100, telephonyRoundUp: roundUp, updatedAt: new Date() })
+      .where(eq(organizations.id, orgId));
+
+    await recordAudit({
+      actorUserId: actor,
+      action: "org.telephony_billing.change",
+      targetType: "organization",
+      targetId: orgId,
+      before: { multiplier: (before.markupX100 ?? 200) / 100, roundUp: before.roundUp },
+      after: { multiplier: markupX100 / 100, roundUp },
+    });
+
+    res.json({ data: { markupMultiplier: markupX100 / 100, roundUp } });
   }),
 );
 
@@ -2798,23 +2847,59 @@ export async function nextInvoiceNumber(attempt = 0): Promise<string> {
 /** Build the telephony line items for one org + month at a billing
  *  multiplier. Amounts are 2× (by default) the real Twilio charges in the
  *  account currency; per-direction splits make the invoice readable. */
+/** Per-org telephony billing knobs (markup multiplier + cent round-up),
+ *  platform-admin controlled. Single source for autogen, manual invoices
+ *  and the customer-facing budget/spend figures. */
+export async function getTelephonyBillingConfig(
+  orgId: string,
+): Promise<{ multiplier: number; roundUp: boolean; bufferPct: number }> {
+  const [org] = await db
+    .select({
+      x100: organizations.telephonyMarkupX100,
+      roundUp: organizations.telephonyRoundUp,
+      bufferPct: organizations.telephonyBufferPct,
+    })
+    .from(organizations)
+    .where(eq(organizations.id, orgId));
+  return {
+    multiplier: (org?.x100 ?? 100 * INVOICE_MULTIPLIER_DEFAULT) / 100,
+    roundUp: org?.roundUp ?? false,
+    bufferPct: org?.bufferPct ?? 0,
+  };
+}
+
 export async function buildTelephonyInvoice(
   orgId: string,
   period: string | undefined,
   multiplier: number,
   bufferPct = 0,
+  roundUp = false,
 ) {
   const range = monthRange(period);
   const R = COST_RATES;
 
+  // Round-up mode: each item's REAL cost is ceiled to the next cent before
+  // summing (0.014 → 0.02), for synced prices and per-call/per-msg fallback
+  // estimates alike. The markup multiplies the rounded figure.
+  const callPrice = roundUp
+    ? sql`CEIL(${callRecords.twilioPrice} * 100) / 100.0`
+    : sql`${callRecords.twilioPrice}`;
+  const callFallback = sql`CEIL((${SANE_DURATION} / 60.0) * ${R.voicePerMinFallback} * 100) / 100.0`;
+  const smsPrice = roundUp
+    ? sql`CEIL(${smsMessages.twilioPrice} * 100) / 100.0`
+    : sql`${smsMessages.twilioPrice}`;
+  const smsFallbackRate = roundUp ? Math.ceil(R.smsPerMsgFallback * 100) / 100 : R.smsPerMsgFallback;
+
   const [call] = await db
     .select({
-      actualOut: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
-      actualIn: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
+      actualOut: sql<number>`COALESCE(SUM(${callPrice}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
+      actualIn: sql<number>`COALESCE(SUM(${callPrice}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
       secondsOut: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} = 'outbound'), 0)::float8`,
       secondsIn: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.direction} <> 'outbound'), 0)::float8`,
       unsyncedSecondsOut: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} = 'outbound'), 0)::float8`,
       unsyncedSecondsIn: sql<number>`COALESCE(SUM(${SANE_DURATION}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} <> 'outbound'), 0)::float8`,
+      unsyncedCeilOut: sql<number>`COALESCE(SUM(${callFallback}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} = 'outbound'), 0)::float8`,
+      unsyncedCeilIn: sql<number>`COALESCE(SUM(${callFallback}) FILTER (WHERE ${callRecords.twilioPrice} IS NULL AND ${callRecords.direction} <> 'outbound'), 0)::float8`,
       countOut: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} = 'outbound')::int`,
       countIn: sql<number>`COUNT(*) FILTER (WHERE ${callRecords.direction} <> 'outbound')::int`,
       // Billed transcription minutes: each transcribed call rounds UP to the
@@ -2833,8 +2918,8 @@ export async function buildTelephonyInvoice(
 
   const [smsAgg] = await db
     .select({
-      actualOut: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}) FILTER (WHERE ${smsMessages.direction} <> 'inbound'), 0)::float8`,
-      actualIn: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}) FILTER (WHERE ${smsMessages.direction} = 'inbound'), 0)::float8`,
+      actualOut: sql<number>`COALESCE(SUM(${smsPrice}) FILTER (WHERE ${smsMessages.direction} <> 'inbound'), 0)::float8`,
+      actualIn: sql<number>`COALESCE(SUM(${smsPrice}) FILTER (WHERE ${smsMessages.direction} = 'inbound'), 0)::float8`,
       unsyncedOut: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL AND ${smsMessages.direction} <> 'inbound')::int`,
       unsyncedIn: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.twilioPrice} IS NULL AND ${smsMessages.direction} = 'inbound')::int`,
       countOut: sql<number>`COUNT(*) FILTER (WHERE ${smsMessages.direction} <> 'inbound')::int`,
@@ -2849,9 +2934,12 @@ export async function buildTelephonyInvoice(
       ),
     );
 
+  const rentalPrice = roundUp
+    ? sql`CEIL(${phoneLines.monthlyCost} * 100) / 100.0`
+    : sql`${phoneLines.monthlyCost}`;
   const [rental] = await db
     .select({
-      rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)::float8`,
+      rentals: sql<number>`COALESCE(SUM(${rentalPrice}), 0)::float8`,
       lineCount: sql<number>`COUNT(*)::int`,
     })
     .from(phoneLines)
@@ -2859,12 +2947,18 @@ export async function buildTelephonyInvoice(
 
   // Real Twilio charge per bucket (billed price where synced, per-unit
   // fallback for the not-yet-synced remainder), then × multiplier.
-  const voiceOutCost = call.actualOut + (call.unsyncedSecondsOut / 60) * R.voicePerMinFallback;
-  const voiceInCost = call.actualIn + (call.unsyncedSecondsIn / 60) * R.voicePerMinFallback;
-  const smsOutCost = smsAgg.actualOut + smsAgg.unsyncedOut * R.smsPerMsgFallback;
-  const smsInCost = smsAgg.actualIn + smsAgg.unsyncedIn * R.smsPerMsgFallback;
+  const voiceOutCost =
+    call.actualOut + (roundUp ? call.unsyncedCeilOut : (call.unsyncedSecondsOut / 60) * R.voicePerMinFallback);
+  const voiceInCost =
+    call.actualIn + (roundUp ? call.unsyncedCeilIn : (call.unsyncedSecondsIn / 60) * R.voicePerMinFallback);
+  const smsOutCost = smsAgg.actualOut + smsAgg.unsyncedOut * smsFallbackRate;
+  const smsInCost = smsAgg.actualIn + smsAgg.unsyncedIn * smsFallbackRate;
   const rentalCost = rental?.rentals ?? 0;
   const min = (secs: number) => Math.round((secs / 60) * 10) / 10;
+  // Bucket totals: nearest-cent normally; ceil (with float-noise guard) in
+  // round-up mode so the invoice never rounds a fraction of a cent down.
+  const lineMinor = (major: number) =>
+    roundUp ? Math.ceil(major * 100 - 1e-7) : toMinor(major);
 
   const lineItems: InvoiceLineItem[] = [];
   if (call.countOut > 0)
@@ -2872,35 +2966,35 @@ export async function buildTelephonyInvoice(
       description: `Outbound calls — ${call.countOut.toLocaleString()} calls`,
       quantity: min(call.secondsOut),
       unit: "min",
-      amountMinor: toMinor(voiceOutCost * multiplier),
+      amountMinor: lineMinor(voiceOutCost * multiplier),
     });
   if (call.countIn > 0)
     lineItems.push({
       description: `Inbound calls — ${call.countIn.toLocaleString()} calls`,
       quantity: min(call.secondsIn),
       unit: "min",
-      amountMinor: toMinor(voiceInCost * multiplier),
+      amountMinor: lineMinor(voiceInCost * multiplier),
     });
   if (smsAgg.countOut > 0)
     lineItems.push({
       description: "Outbound SMS messages",
       quantity: smsAgg.countOut,
       unit: "msg",
-      amountMinor: toMinor(smsOutCost * multiplier),
+      amountMinor: lineMinor(smsOutCost * multiplier),
     });
   if (smsAgg.countIn > 0)
     lineItems.push({
       description: "Inbound SMS messages",
       quantity: smsAgg.countIn,
       unit: "msg",
-      amountMinor: toMinor(smsInCost * multiplier),
+      amountMinor: lineMinor(smsInCost * multiplier),
     });
   if ((rental?.lineCount ?? 0) > 0)
     lineItems.push({
       description: "Phone number rental",
       quantity: rental.lineCount,
       unit: "line",
-      amountMinor: toMinor(rentalCost * multiplier),
+      amountMinor: lineMinor(rentalCost * multiplier),
     });
   // Transcription is billed at the flat customer rate — NOT × multiplier.
   if (call.transcribedCount > 0 && call.transcribedBilledMin > 0)
@@ -2933,6 +3027,7 @@ export async function buildTelephonyInvoice(
     bufferMinor,
     meta: {
       multiplier,
+      roundUp,
       bufferPct,
       usageMinor,
       baseCost: {
@@ -3088,12 +3183,12 @@ router.post(
       const multiplier =
         Number.isFinite(body.multiplier) && Number(body.multiplier) >= 1 && Number(body.multiplier) <= 10
           ? Number(body.multiplier)
-          : INVOICE_MULTIPLIER_DEFAULT;
+          : (org.telephonyMarkupX100 ?? 100 * INVOICE_MULTIPLIER_DEFAULT) / 100;
       const bufferPct =
         Number.isInteger(body.bufferPct) && Number(body.bufferPct) >= 0 && Number(body.bufferPct) <= 100
           ? Number(body.bufferPct)
           : org.telephonyBufferPct ?? 0;
-      const built = await buildTelephonyInvoice(orgId, body.period, multiplier, bufferPct);
+      const built = await buildTelephonyInvoice(orgId, body.period, multiplier, bufferPct, org.telephonyRoundUp ?? false);
       if (!built.lineItems.length) {
         throw new ApiError(400, `No telephony usage found for ${built.period}`);
       }

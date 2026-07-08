@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations } from "../db/schema/organizations";
-import { buildTelephonyInvoice, monthRange, INVOICE_MULTIPLIER_DEFAULT } from "../routes/admin";
+import { buildTelephonyInvoice, monthRange, getTelephonyBillingConfig } from "../routes/admin";
 
 /**
  * Monthly telephony spending limit (Close-style). "Spend" is this month's
@@ -42,7 +42,8 @@ export async function getTelephonyBudgetStatus(
   const limitMinor = org?.limitMinor && org.limitMinor > 0 ? org.limitMinor : null;
 
   const period = monthRange().period;
-  const built = await buildTelephonyInvoice(orgId, period, INVOICE_MULTIPLIER_DEFAULT, 0);
+  const cfg = await getTelephonyBillingConfig(orgId);
+  const built = await buildTelephonyInvoice(orgId, period, cfg.multiplier, 0, cfg.roundUp);
   const spentMinor = built.usageMinor;
 
   const status: TelephonyBudgetStatus = {

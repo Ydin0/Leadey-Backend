@@ -12,7 +12,6 @@ import {
   buildTelephonyInvoice,
   nextInvoiceNumber,
   monthRange,
-  INVOICE_MULTIPLIER_DEFAULT,
 } from "../routes/admin";
 
 /**
@@ -103,10 +102,10 @@ async function upsertTelephonyInvoice(
   orgId: string,
   period: string,
   currency: string,
-  bufferPct: number,
-  autoTopupEnabled: boolean,
+  cfg: { bufferPct: number; autoTopup: boolean; multiplier: number; roundUp: boolean },
 ) {
-  const built = await buildTelephonyInvoice(orgId, period, INVOICE_MULTIPLIER_DEFAULT, bufferPct);
+  const { bufferPct, autoTopup: autoTopupEnabled, multiplier, roundUp } = cfg;
+  const built = await buildTelephonyInvoice(orgId, period, multiplier, bufferPct, roundUp);
 
   // Wallet draw-down FIRST — before any early return. Usage keeps accruing
   // after a payment link freezes the invoice, and a period whose usage was
@@ -139,11 +138,14 @@ async function upsertTelephonyInvoice(
 
   // Frozen: paid/void, or a payment link exists (its amount is fixed).
   if (existing.status !== "open" || existing.stripePaymentLinkId) return;
-  // A buffer-% change can leave the total coincidentally unchanged while the
-  // line items are stale — compare both before short-circuiting.
+  // A billing-config change can leave the total coincidentally unchanged
+  // while the line items are stale — compare config before short-circuiting.
+  const meta = existing.meta as Record<string, unknown>;
   if (
     existing.totalMinor === built.totalMinor &&
-    (existing.meta as Record<string, unknown>)?.bufferPct === bufferPct
+    meta?.bufferPct === bufferPct &&
+    meta?.multiplier === multiplier &&
+    (meta?.roundUp ?? false) === roundUp
   )
     return;
   await db
@@ -181,26 +183,35 @@ export async function runInvoiceAutogen(): Promise<void> {
   ]);
   for (const r of [...callOrgs, ...smsOrgs, ...lineOrgs]) if (r.orgId) orgIds.add(r.orgId);
 
-  // Per-org buffer % + auto top-up flag (configurable in admin / settings).
-  const orgConfig = new Map<string, { bufferPct: number; autoTopup: boolean }>();
+  // Per-org billing config (buffer %, markup, round-up, auto top-up).
+  type OrgCfg = { bufferPct: number; autoTopup: boolean; multiplier: number; roundUp: boolean };
+  const orgConfig = new Map<string, OrgCfg>();
   if (orgIds.size) {
     const rows = await db
       .select({
         id: organizations.id,
         bufferPct: organizations.telephonyBufferPct,
         autoTopup: organizations.telephonyAutoTopupEnabled,
+        markupX100: organizations.telephonyMarkupX100,
+        roundUp: organizations.telephonyRoundUp,
       })
       .from(organizations)
       .where(inArray(organizations.id, [...orgIds]));
-    for (const r of rows) orgConfig.set(r.id, { bufferPct: r.bufferPct ?? 0, autoTopup: r.autoTopup });
+    for (const r of rows)
+      orgConfig.set(r.id, {
+        bufferPct: r.bufferPct ?? 0,
+        autoTopup: r.autoTopup,
+        multiplier: (r.markupX100 ?? 200) / 100,
+        roundUp: r.roundUp ?? false,
+      });
   }
 
   let processed = 0;
   for (const orgId of orgIds) {
     try {
-      const cfg = orgConfig.get(orgId) ?? { bufferPct: 0, autoTopup: false };
-      await upsertTelephonyInvoice(orgId, previous, currency, cfg.bufferPct, cfg.autoTopup);
-      await upsertTelephonyInvoice(orgId, current, currency, cfg.bufferPct, cfg.autoTopup);
+      const cfg = orgConfig.get(orgId) ?? { bufferPct: 0, autoTopup: false, multiplier: 2, roundUp: false };
+      await upsertTelephonyInvoice(orgId, previous, currency, cfg);
+      await upsertTelephonyInvoice(orgId, current, currency, cfg);
       // After the draw-downs land: recharge the wallet if it fell below the
       // org's auto top-up threshold.
       if (cfg.autoTopup) await maybeAutoTopup(orgId);

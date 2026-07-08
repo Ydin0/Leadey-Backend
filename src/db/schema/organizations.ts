@@ -36,6 +36,12 @@ export const organizations = pgTable("organizations", {
   telephonyCreditBalanceMinor: integer("telephony_credit_balance_minor").notNull().default(0),
   /** Extra % added to telephony invoices as a "calling credit buffer" line. */
   telephonyBufferPct: integer("telephony_buffer_pct").notNull().default(20),
+  /** Telephony markup multiplier applied to real Twilio costs on usage
+   *  invoices, stored ×100 (200 = 2.0×). Platform-admin set, per org. */
+  telephonyMarkupX100: integer("telephony_markup_x100").notNull().default(200),
+  /** Round each call/message/rental cost UP to the next cent before the
+   *  markup (0.014 → 0.02). Platform-admin set, per org. */
+  telephonyRoundUp: boolean("telephony_round_up").notNull().default(false),
   /** Monthly telephony spending limit (account-currency minor units). NULL/0 =
    *  no limit. Once the month's billed usage reaches it, outbound calls and
    *  SMS are blocked until the limit is raised or the month rolls over. */
