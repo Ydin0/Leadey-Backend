@@ -25,7 +25,7 @@
 | Telephony buffer | **+20%** prepaid float | `organizations.telephony_buffer_pct` |
 | Transcription bill | **$0.02 / min flat** (not ×2) | `routes/admin.ts:2711` |
 | Number rental base | ~$1.15/mo (live-synced) → **~$2.30 billed** | `routes/calls.ts`, `lib/twilio-cost-sync.ts` |
-| Current seat prices | Starter **£49** · Growth **£79** · Scale **£139** /seat/mo | `routes/admin.ts:53-57`, `routes/billing.ts:101-105` |
+| Current seat prices | Starter **£49** · Growth **£69** · Scale **£99** /seat/mo (repriced Jul 8 2026; was 49/79/139) | `routes/admin.ts:53-57`, `routes/billing.ts:101-105` |
 | Trial | **60 days** | `routes/webhooks.ts` (org.created) |
 
 **Enforcement reality today:** seat limits (invite path) and the credit wallet
@@ -267,7 +267,9 @@ Only seats + the credit wallet are enforced now. To make the matrix real:
 
 ## 10. Open decisions
 
-- **Prices:** adopt the **£49 / £89 / £149** uplift, or keep £49/£79/£139 and
+- **Prices: DECIDED Jul 8 2026 — £49 / £69 / £99 shipped** (the owner chose a
+  markdown rather than this doc's proposed uplift). The remaining open items
+  below still stand. ~~Adopt the **£49 / £89 / £149** uplift, or keep £49/£79/£139 and~~
   change only packaging? *(Recommend the uplift for Growth/Scale.)*
 - **Currency:** seats in **GBP** (current) vs USD.
 - **Calling in Starter?** *(Recommend no — Growth gate; matches current config.)*

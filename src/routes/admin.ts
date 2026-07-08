@@ -50,11 +50,11 @@ function getActorId(req: Request<any>): string {
   return id;
 }
 
-// Per-seat prices in GBP pence — must match billing.ts
+// Per-seat prices in GBP pence — must match billing.ts (repriced Jul 2026)
 export const PLAN_PRICES_PENCE: Record<string, number> = {
   starter: 4900,
-  growth: 7900,
-  scale: 13900,
+  growth: 6900,
+  scale: 9900,
 };
 
 function priceIdForPlan(plan: string): string | undefined {

@@ -100,8 +100,8 @@ router.get(
         // Pricing (per seat, GBP pence)
         prices: {
           starter: { priceId: process.env.STRIPE_STARTER_PRICE_ID || "", amount: 4900 },
-          growth: { priceId: process.env.STRIPE_GROWTH_PRICE_ID || "", amount: 7900 },
-          scale: { priceId: process.env.STRIPE_SCALE_PRICE_ID || "", amount: 13900 },
+          growth: { priceId: process.env.STRIPE_GROWTH_PRICE_ID || "", amount: 6900 },
+          scale: { priceId: process.env.STRIPE_SCALE_PRICE_ID || "", amount: 9900 },
         },
       },
     });
