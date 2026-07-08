@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, jsonb, AnyPgColumn } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, timestamp, jsonb, AnyPgColumn } from "drizzle-orm/pg-core";
 
 export const organizations = pgTable("organizations", {
   id: text("id").primaryKey(),
@@ -27,6 +27,22 @@ export const organizations = pgTable("organizations", {
   telephonyCreditBalanceMinor: integer("telephony_credit_balance_minor").notNull().default(0),
   /** Extra % added to telephony invoices as a "calling credit buffer" line. */
   telephonyBufferPct: integer("telephony_buffer_pct").notNull().default(20),
+  /** Monthly telephony spending limit (account-currency minor units). NULL/0 =
+   *  no limit. Once the month's billed usage reaches it, outbound calls and
+   *  SMS are blocked until the limit is raised or the month rolls over. */
+  telephonyMonthlyLimitMinor: integer("telephony_monthly_limit_minor"),
+  /** Auto top-up: when the wallet balance drops below thresholdMinor, charge
+   *  the org's saved card off-session to bring it back to targetMinor. While
+   *  enabled, NEW monthly telephony invoices are suppressed (the card charges
+   *  ARE the billing) — see invoice-autogen. */
+  telephonyAutoTopupEnabled: boolean("telephony_autotopup_enabled").notNull().default(false),
+  telephonyAutoTopupThresholdMinor: integer("telephony_autotopup_threshold_minor").notNull().default(0),
+  telephonyAutoTopupTargetMinor: integer("telephony_autotopup_target_minor").notNull().default(0),
+  /** Claim timestamp — one charge attempt per cooldown window across
+   *  overlapping sweeper instances. */
+  telephonyAutoTopupLastAt: timestamp("telephony_autotopup_last_at", { withTimezone: true }),
+  /** Last failed charge attempt, surfaced in Settings → Credits. NULL = ok. */
+  telephonyAutoTopupLastError: text("telephony_autotopup_last_error"),
   /** Billing contact + legal details rendered on Leadey invoices. All
    *  nullable — invoices fall back to the org name / first member email. */
   billingEmail: text("billing_email"),

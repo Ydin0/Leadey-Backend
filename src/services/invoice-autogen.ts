@@ -8,7 +8,7 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
 import { getPlanConfig } from "../lib/stripe";
 import { createId } from "../lib/helpers";
-import { applyUsageDelta } from "../lib/telephony-credits";
+import { applyUsageDelta, maybeAutoTopup } from "../lib/telephony-credits";
 import {
   buildTelephonyInvoice,
   nextInvoiceNumber,
@@ -101,13 +101,26 @@ async function insertAutoInvoice(values: {
 /** Regenerate-or-create one org's auto telephony invoice for a period, and
  *  bring the telephony credit ledger's usage draw-down in line with the
  *  period's billed usage. */
-async function upsertTelephonyInvoice(orgId: string, period: string, currency: string, bufferPct: number) {
+async function upsertTelephonyInvoice(
+  orgId: string,
+  period: string,
+  currency: string,
+  bufferPct: number,
+  autoTopupEnabled: boolean,
+) {
   const built = await buildTelephonyInvoice(orgId, period, INVOICE_MULTIPLIER_DEFAULT, bufferPct);
 
   // Wallet draw-down FIRST — before any early return. Usage keeps accruing
   // after a payment link freezes the invoice, and a period whose usage was
   // revised down still needs its refund delta. usageMinor excludes the buffer.
   await applyUsageDelta(orgId, period, built.usageMinor);
+
+  // Prepaid mode: with auto top-up on, the org's card is charged whenever the
+  // wallet dips below its threshold — that IS the telephony billing. Creating
+  // or refreshing a monthly usage invoice on top would charge the same usage
+  // twice, so invoices are suppressed while enabled (existing open invoices
+  // are left as-is for the admin to settle or void).
+  if (autoTopupEnabled) return;
 
   const existing = await findAutoInvoice(orgId, "telephony", period);
 
@@ -218,22 +231,29 @@ export async function runInvoiceAutogen(): Promise<void> {
   ]);
   for (const r of [...callOrgs, ...smsOrgs, ...lineOrgs]) if (r.orgId) orgIds.add(r.orgId);
 
-  // Per-org buffer % (configurable in the admin panel; default 20).
-  const bufferByOrg = new Map<string, number>();
+  // Per-org buffer % + auto top-up flag (configurable in admin / settings).
+  const orgConfig = new Map<string, { bufferPct: number; autoTopup: boolean }>();
   if (orgIds.size) {
     const rows = await db
-      .select({ id: organizations.id, bufferPct: organizations.telephonyBufferPct })
+      .select({
+        id: organizations.id,
+        bufferPct: organizations.telephonyBufferPct,
+        autoTopup: organizations.telephonyAutoTopupEnabled,
+      })
       .from(organizations)
       .where(inArray(organizations.id, [...orgIds]));
-    for (const r of rows) bufferByOrg.set(r.id, r.bufferPct ?? 0);
+    for (const r of rows) orgConfig.set(r.id, { bufferPct: r.bufferPct ?? 0, autoTopup: r.autoTopup });
   }
 
   let processed = 0;
   for (const orgId of orgIds) {
     try {
-      const bufferPct = bufferByOrg.get(orgId) ?? 0;
-      await upsertTelephonyInvoice(orgId, previous, currency, bufferPct);
-      await upsertTelephonyInvoice(orgId, current, currency, bufferPct);
+      const cfg = orgConfig.get(orgId) ?? { bufferPct: 0, autoTopup: false };
+      await upsertTelephonyInvoice(orgId, previous, currency, cfg.bufferPct, cfg.autoTopup);
+      await upsertTelephonyInvoice(orgId, current, currency, cfg.bufferPct, cfg.autoTopup);
+      // After the draw-downs land: recharge the wallet if it fell below the
+      // org's auto top-up threshold.
+      if (cfg.autoTopup) await maybeAutoTopup(orgId);
       processed++;
     } catch (err) {
       console.error(`[InvoiceAutogen] telephony failed for org ${orgId}:`, err);

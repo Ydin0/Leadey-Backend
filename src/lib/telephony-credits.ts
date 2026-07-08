@@ -202,6 +202,145 @@ export async function applyUsageDelta(orgId: string, period: string, usageMinor:
   });
 }
 
+/** Credit one auto top-up charge exactly once, keyed on the PaymentIntent id.
+ *  Called both in-process right after a successful off-session charge AND from
+ *  the payment_intent.succeeded webhook (backstop if the process died between
+ *  charge and credit) — the ledger lookup makes replays no-ops. */
+export async function creditAutoTopupOnce(
+  orgId: string,
+  amountMinor: number,
+  paymentIntentId: string,
+  currency: string,
+): Promise<void> {
+  if (amountMinor <= 0) return;
+  await db.transaction(async (tx) => {
+    await lockOrg(tx, orgId);
+    const [dup] = await tx
+      .select({ id: telephonyCreditTransactions.id })
+      .from(telephonyCreditTransactions)
+      .where(eq(telephonyCreditTransactions.stripeSessionId, paymentIntentId))
+      .limit(1);
+    if (dup) return;
+    await applyLedgerRow(tx, {
+      orgId,
+      kind: "topup",
+      amountMinor,
+      stripeSessionId: paymentIntentId,
+      description: "Auto top-up",
+      metadata: { currency, paymentIntentId, auto: true },
+    });
+  });
+}
+
+const AUTOTOPUP_COOLDOWN_MIN = 20; // one attempt per window across instances
+const AUTOTOPUP_MIN_CHARGE_MINOR = 100; // Stripe minimums + sanity
+const AUTOTOPUP_MAX_CHARGE_MINOR = 1_000_000; // $10k cap per single charge
+
+/**
+ * Auto top-up: if enabled and the wallet is below the org's threshold, charge
+ * the saved card off-session to bring the balance back to the target. Runs
+ * from the autogen sweeper (every 6h) and immediately after settings save.
+ * A conditional-UPDATE claim on last_at stops overlapping instances from
+ * double-charging; `force` (settings save) skips the cooldown but not the
+ * threshold check. Failures land in telephony_autotopup_last_error.
+ */
+export async function maybeAutoTopup(
+  orgId: string,
+  opts: { force?: boolean } = {},
+): Promise<{ charged: boolean; amountMinor?: number; error?: string }> {
+  const [org] = await db
+    .select({
+      enabled: organizations.telephonyAutoTopupEnabled,
+      thresholdMinor: organizations.telephonyAutoTopupThresholdMinor,
+      targetMinor: organizations.telephonyAutoTopupTargetMinor,
+      balance: organizations.telephonyCreditBalanceMinor,
+      stripeCustomerId: organizations.stripeCustomerId,
+      name: organizations.name,
+    })
+    .from(organizations)
+    .where(eq(organizations.id, orgId));
+  if (!org?.enabled || org.targetMinor <= 0) return { charged: false };
+  if (org.balance >= org.thresholdMinor) return { charged: false };
+
+  const amountMinor = Math.min(org.targetMinor - org.balance, AUTOTOPUP_MAX_CHARGE_MINOR);
+  if (amountMinor < AUTOTOPUP_MIN_CHARGE_MINOR) return { charged: false };
+
+  // Claim the attempt window (concurrency + retry-storm guard).
+  const claimWhere = opts.force
+    ? eq(organizations.id, orgId)
+    : and(
+        eq(organizations.id, orgId),
+        sql`(${organizations.telephonyAutoTopupLastAt} IS NULL OR ${organizations.telephonyAutoTopupLastAt} < now() - interval '${sql.raw(String(AUTOTOPUP_COOLDOWN_MIN))} minutes')`,
+      );
+  const claimed = await db
+    .update(organizations)
+    .set({ telephonyAutoTopupLastAt: new Date() })
+    .where(claimWhere)
+    .returning({ id: organizations.id });
+  if (!claimed.length) return { charged: false };
+
+  const fail = async (error: string) => {
+    await db
+      .update(organizations)
+      .set({ telephonyAutoTopupLastError: error, updatedAt: new Date() })
+      .where(eq(organizations.id, orgId));
+    console.warn(`[TelephonyAutoTopup] org ${orgId}: ${error}`);
+    return { charged: false as const, error };
+  };
+
+  if (!org.stripeCustomerId) {
+    return fail("No billing profile on file — subscribe to a plan or pay an invoice by card first.");
+  }
+
+  try {
+    const { stripe } = await import("./stripe");
+
+    // Resolve a chargeable saved card: customer default → first saved card.
+    const customer = await stripe.customers.retrieve(org.stripeCustomerId);
+    let paymentMethod: string | null = null;
+    if (!customer.deleted) {
+      const def = customer.invoice_settings?.default_payment_method;
+      paymentMethod = typeof def === "string" ? def : (def?.id ?? null);
+    }
+    if (!paymentMethod) {
+      const pms = await stripe.paymentMethods.list({
+        customer: org.stripeCustomerId,
+        type: "card",
+        limit: 1,
+      });
+      paymentMethod = pms.data[0]?.id ?? null;
+    }
+    if (!paymentMethod) {
+      return fail("No saved card on file — add a payment method in the billing portal.");
+    }
+
+    const currency = (await getAccountCurrency()).toLowerCase();
+    const pi = await stripe.paymentIntents.create({
+      amount: amountMinor,
+      currency,
+      customer: org.stripeCustomerId,
+      payment_method: paymentMethod,
+      off_session: true,
+      confirm: true,
+      description: `Leadey telephony auto top-up — ${org.name}`,
+      metadata: { type: "telephony_autotopup", orgId },
+    });
+    if (pi.status !== "succeeded") {
+      return fail(`Card charge did not complete (status: ${pi.status}).`);
+    }
+
+    await creditAutoTopupOnce(orgId, amountMinor, pi.id, currency);
+    await db
+      .update(organizations)
+      .set({ telephonyAutoTopupLastError: null, updatedAt: new Date() })
+      .where(eq(organizations.id, orgId));
+    console.log(`[TelephonyAutoTopup] org ${orgId} charged ${amountMinor} minor (${pi.id})`);
+    return { charged: true, amountMinor };
+  } catch (err: any) {
+    return fail(err?.message || "Card charge failed.");
+  }
+}
+
 /** Admin add/remove/set. Negative balances allowed — this wallet tracks a
  *  float, it doesn't gate spending. Returns the new balance + applied delta. */
 export async function adjustTelephonyBalance(args: {

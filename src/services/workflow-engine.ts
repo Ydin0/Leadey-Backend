@@ -195,6 +195,14 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const lineId = typeof d.lineId === "string" ? d.lineId : "";
       const line = (lineId ? active.find((l) => l.id === lineId) : undefined) || active.find(same) || active[0];
       if (!line) { await logRun(enr, node, "skipped", { reason: "no phone line" }); return; }
+      // Monthly telephony budget backstop — workflows must respect it too.
+      try {
+        const { getTelephonyBudgetStatus } = await import("../lib/telephony-budget");
+        if ((await getTelephonyBudgetStatus(orgId)).blocked) {
+          await logRun(enr, node, "skipped", { reason: "monthly telephony budget reached" });
+          return;
+        }
+      } catch { /* budget check is best-effort */ }
       try {
         const base = process.env.PUBLIC_API_URL || process.env.API_BASE_URL || "";
         const msg = await twilio().messages.create({

@@ -505,6 +505,13 @@
       "when": 1783457098950,
       "tag": "0071_foamy_sabretooth",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1783531842156,
+      "tag": "0072_mute_diamondback",
+      "breakpoints": true
     }
   ]
 }

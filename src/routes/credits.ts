@@ -3,11 +3,13 @@ import { and, eq, desc, gte, count, sql } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { creditTransactions } from "../db/schema/credits";
-import { telephonyCreditTransactions } from "../db/schema/telephony-credits";
 import { getOrgId } from "../lib/auth";
 import { ApiError } from "../lib/helpers";
 import { getBalance, CREDIT_COSTS, CREDIT_CENTS_PER } from "../lib/credits";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
+import { maybeAutoTopup } from "../lib/telephony-credits";
+import { getTelephonyBudgetStatus, invalidateTelephonyBudgetCache } from "../lib/telephony-budget";
+import { requirePerm } from "../lib/permission-service";
 import { createCreditCheckoutSession } from "../lib/stripe";
 import { getAuth } from "@clerk/express";
 
@@ -107,9 +109,8 @@ router.get(
 );
 
 // ─── GET /credits/telephony ─────────────────────────────────────────
-// The org's telephony money wallet (customer-facing, read-only): balance,
-// buffer %, and recent activity. Usage draws it down daily; paid telephony
-// invoices (usage + buffer) top it up.
+// The org's telephony money wallet (customer-facing): balance, buffer %,
+// this month's spend vs the monthly budget, and auto top-up settings.
 router.get(
   "/credits/telephony",
   asyncHandler(async (req, res) => {
@@ -118,27 +119,18 @@ router.get(
       .select({
         balanceMinor: organizations.telephonyCreditBalanceMinor,
         bufferPct: organizations.telephonyBufferPct,
+        autoTopupEnabled: organizations.telephonyAutoTopupEnabled,
+        autoTopupThresholdMinor: organizations.telephonyAutoTopupThresholdMinor,
+        autoTopupTargetMinor: organizations.telephonyAutoTopupTargetMinor,
+        autoTopupLastError: organizations.telephonyAutoTopupLastError,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId));
     if (!org) throw new ApiError(404, "Organization not found");
 
-    const [currency, recent] = await Promise.all([
+    const [currency, budget] = await Promise.all([
       getAccountCurrency(),
-      db
-        .select({
-          id: telephonyCreditTransactions.id,
-          kind: telephonyCreditTransactions.kind,
-          period: telephonyCreditTransactions.period,
-          amountMinor: telephonyCreditTransactions.amountMinor,
-          balanceAfterMinor: telephonyCreditTransactions.balanceAfterMinor,
-          description: telephonyCreditTransactions.description,
-          createdAt: telephonyCreditTransactions.createdAt,
-        })
-        .from(telephonyCreditTransactions)
-        .where(eq(telephonyCreditTransactions.organizationId, orgId))
-        .orderBy(desc(telephonyCreditTransactions.createdAt))
-        .limit(10),
+      getTelephonyBudgetStatus(orgId, { fresh: true }),
     ]);
 
     res.json({
@@ -146,7 +138,81 @@ router.get(
         balanceMinor: org.balanceMinor ?? 0,
         bufferPct: org.bufferPct ?? 0,
         currency: currency.toLowerCase(),
-        recent: recent.map((t) => ({ ...t, createdAt: t.createdAt.toISOString() })),
+        budget: {
+          period: budget.period,
+          limitMinor: budget.limitMinor,
+          spentMinor: budget.spentMinor,
+          blocked: budget.blocked,
+        },
+        autoTopup: {
+          enabled: org.autoTopupEnabled,
+          thresholdMinor: org.autoTopupThresholdMinor,
+          targetMinor: org.autoTopupTargetMinor,
+          lastError: org.autoTopupLastError,
+        },
+      },
+    });
+  }),
+);
+
+// ─── PUT /credits/telephony/settings ────────────────────────────────
+// Monthly spending limit + auto top-up config. Enabling auto top-up (or
+// saving while below the threshold) attempts an immediate charge so the
+// user sees straight away whether their card works.
+const MAX_LIMIT_MINOR = 10_000_000; // $100k/month
+const MAX_TARGET_MINOR = 1_000_000; // $10k float
+router.put(
+  "/credits/telephony/settings",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const body = req.body as {
+      monthlyLimitMinor?: number | null;
+      autoTopupEnabled?: boolean;
+      autoTopupThresholdMinor?: number;
+      autoTopupTargetMinor?: number;
+    };
+
+    const asMinor = (v: unknown, max: number, label: string): number => {
+      const n = Math.round(Number(v));
+      if (!Number.isFinite(n) || n < 0 || n > max) {
+        throw new ApiError(400, `${label} must be between 0 and ${(max / 100).toLocaleString()}`);
+      }
+      return n;
+    };
+
+    const limitMinor =
+      body.monthlyLimitMinor == null || Number(body.monthlyLimitMinor) === 0
+        ? null
+        : asMinor(body.monthlyLimitMinor, MAX_LIMIT_MINOR, "Monthly limit");
+    const enabled = Boolean(body.autoTopupEnabled);
+    const thresholdMinor = asMinor(body.autoTopupThresholdMinor ?? 0, MAX_TARGET_MINOR, "Threshold");
+    const targetMinor = asMinor(body.autoTopupTargetMinor ?? 0, MAX_TARGET_MINOR, "Recharge target");
+    if (enabled && targetMinor <= thresholdMinor) {
+      throw new ApiError(400, "Recharge target must be higher than the threshold");
+    }
+
+    await db
+      .update(organizations)
+      .set({
+        telephonyMonthlyLimitMinor: limitMinor,
+        telephonyAutoTopupEnabled: enabled,
+        telephonyAutoTopupThresholdMinor: thresholdMinor,
+        telephonyAutoTopupTargetMinor: targetMinor,
+        // Turning it off clears any stale failure banner.
+        ...(enabled ? {} : { telephonyAutoTopupLastError: null }),
+        updatedAt: new Date(),
+      })
+      .where(eq(organizations.id, orgId));
+    invalidateTelephonyBudgetCache(orgId);
+
+    const topup = enabled ? await maybeAutoTopup(orgId, { force: true }) : { charged: false as const };
+
+    res.json({
+      data: {
+        monthlyLimitMinor: limitMinor,
+        autoTopup: { enabled, thresholdMinor, targetMinor },
+        immediateTopup: topup,
       },
     });
   }),

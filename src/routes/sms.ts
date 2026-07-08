@@ -12,6 +12,7 @@ import { masterContacts } from "../db/schema/master";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { requirePerm } from "../lib/permission-service";
+import { getTelephonyBudgetStatus } from "../lib/telephony-budget";
 
 /** Rough dial-country of a number, so we text a UK lead from a UK number and a
  *  US lead from a US number (Twilio rejects mismatched From/To combinations). */
@@ -75,6 +76,15 @@ router.post(
       .where(and(eq(leads.id, leadId), eq(leads.funnelId, funnelId), eq(funnels.organizationId, orgId)));
     if (!lead) throw new ApiError(404, "Lead not found");
     if (!lead.phone) throw new ApiError(400, "This lead has no phone number");
+
+    // Monthly telephony budget backstop (Close-style spending limit).
+    const budget = await getTelephonyBudgetStatus(orgId);
+    if (budget.blocked) {
+      throw new ApiError(
+        403,
+        "Your monthly telephony budget has been reached — raise the limit in Settings → Credits to keep sending texts.",
+      );
+    }
 
     // Pick the sender line: the rep's assigned active line, else the org's
     // first active line.

@@ -358,6 +358,37 @@ webhookRouter.post(
       } catch (err) {
         console.warn("[Twilio Voice] DNC check failed (allowing call):", err);
       }
+      // Monthly telephony budget backstop: resolve the org from the caller-ID
+      // line and refuse to dial once this month's usage has hit the org's
+      // limit (mirrors the SMS-side check; status is cached ~60s so power-
+      // dialer bursts don't hammer the aggregates).
+      try {
+        const { db } = await import("../db");
+        const { phoneLines } = await import("../db/schema/phone-lines");
+        const { sql: s } = await import("drizzle-orm");
+        const cidDigits = (safeCallerId || "").replace(/[^\d]/g, "");
+        if (cidDigits) {
+          const [line] = await db
+            .select({ orgId: phoneLines.organizationId })
+            .from(phoneLines)
+            .where(s`regexp_replace(${phoneLines.number}, '[^0-9]', '', 'g') = ${cidDigits}`)
+            .limit(1);
+          if (line?.orgId) {
+            const { getTelephonyBudgetStatus } = await import("../lib/telephony-budget");
+            const budget = await getTelephonyBudgetStatus(line.orgId);
+            if (budget.blocked) {
+              response.say(
+                "Your organization's monthly telephony budget has been reached. Please raise the limit in Settings, then try again.",
+              );
+              response.hangup();
+              res.type("text/xml").send(response.toString());
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[Twilio Voice] budget check failed (allowing call):", err);
+      }
       // Outbound call to a phone number (cleaned).
       const dial = response.dial(dialOptions as any);
       dial.number(cleanedTo);

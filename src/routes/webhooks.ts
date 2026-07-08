@@ -1551,6 +1551,19 @@ router.post("/stripe", async (req: Request, res: Response) => {
         break;
       }
 
+      // Telephony auto top-up backstop: the charge is normally credited to
+      // the wallet in-process right after the PaymentIntent succeeds, but if
+      // the server died in between this replays it. Idempotent on the PI id.
+      case "payment_intent.succeeded": {
+        const pi = event.data.object;
+        if (pi.metadata?.type === "telephony_autotopup" && pi.metadata?.orgId) {
+          const { creditAutoTopupOnce } = await import("../lib/telephony-credits");
+          await creditAutoTopupOnce(pi.metadata.orgId, pi.amount, pi.id, pi.currency);
+          console.log(`[Stripe] telephony auto top-up ${pi.id} ensured for org ${pi.metadata.orgId}`);
+        }
+        break;
+      }
+
       case "invoice.payment_failed": {
         const invoice = event.data.object;
         const customerId = invoice.customer;
