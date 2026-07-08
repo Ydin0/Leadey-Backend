@@ -2650,6 +2650,223 @@ router.patch(
   }),
 );
 
+// ─── GET /organizations/:id/profitability — full per-org P&L ─────────────
+// Every revenue stream (seats at the discounted subscription price, telephony
+// billed at the org's markup incl. round-up + flat-rate transcription, credit
+// top-ups) against every REAL cost (Twilio voice/SMS/rentals, AssemblyAI
+// transcription, OpenAI summaries, recording storage, enrichment provider
+// estimates), with per-stream + blended margins and a trailing trend.
+
+/** REAL enrichment provider unit costs (USD). NOT verified against provider
+ *  invoices yet — env-overridable so finance can tune them without a deploy.
+ *  Surfaced to the UI with estimate: true. */
+const ENRICHMENT_COST_RATES: Record<string, number> = {
+  phone_enrichment: Number(process.env.COST_PHONE_ENRICH_USD ?? 0.2),
+  email_enrichment: Number(process.env.COST_EMAIL_ENRICH_USD ?? 0.02),
+  company_enrichment: Number(process.env.COST_COMPANY_ENRICH_USD ?? 0.02),
+  job_scraping: Number(process.env.COST_JOB_SCRAPE_USD ?? 0.002),
+};
+
+router.get(
+  "/organizations/:id/profitability",
+  asyncHandler<OrgParams>(async (req, res) => {
+    const orgId = req.params.id;
+    const months = Math.min(Math.max(Number(req.query.months) || 6, 1), 12);
+    const range = monthRange(req.query.period as string | undefined);
+    const currency = await getAccountCurrency();
+    maybeAutoSync(range);
+
+    const [org] = await db
+      .select({
+        id: organizations.id,
+        name: organizations.name,
+        plan: organizations.plan,
+        planStatus: organizations.planStatus,
+        seatsIncluded: organizations.seatsIncluded,
+        discountPct: organizations.discountPct,
+        telephonyBufferPct: organizations.telephonyBufferPct,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId))
+      .limit(1);
+    if (!org) throw new ApiError(404, "Organization not found");
+    const cfg = await getTelephonyBillingConfig(orgId);
+
+    // Seat revenue: the discounted subscription price (GBP), USD via the
+    // same FX approximation the Costs tab uses. Zero for trial/cancelled.
+    const paidPlan = org.planStatus === "active" && ["starter", "growth", "scale"].includes(org.plan);
+    const seatsGbpPence = paidPlan ? computeMrrPence(org.plan, org.seatsIncluded || 0, org.discountPct || 0) : 0;
+    const seatsUsd = Math.round(((seatsGbpPence / 100) * GBP_TO_USD) * 100) / 100;
+
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const pct = (margin: number, revenue: number) => (revenue > 0 ? Math.round((margin / revenue) * 100) : null);
+
+    /** One month's full P&L (USD major units). */
+    async function monthPnl(period: string) {
+      const r = monthRange(period);
+      const [call] = await db
+        .select(callSelect())
+        .from(callRecords)
+        .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, r.start), lt(callRecords.calledAt, r.end)));
+      const [smsA] = await db
+        .select(smsSelect())
+        .from(smsMessages)
+        .where(and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, r.start), lt(smsMessages.createdAt, r.end)));
+      const [rental] = await db
+        .select({
+          rentals: sql<number>`COALESCE(SUM(${phoneLines.monthlyCost}), 0)::float8`,
+          lineCount: sql<number>`COUNT(*)::int`,
+        })
+        .from(phoneLines)
+        .where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.status, "active")));
+      const breakdown = buildBreakdown(
+        (call as unknown as CallAgg) ?? ZERO_CALL,
+        (smsA as unknown as SmsAgg) ?? { actual: 0, syncedCount: 0, totalCount: 0 },
+        rental?.rentals ?? 0,
+        rental?.lineCount ?? 0,
+      );
+
+      // What the period was BILLED for telephony (org markup + round-up +
+      // flat-rate transcription) — the exact invoice/wallet figure.
+      const built = await buildTelephonyInvoice(orgId, period, cfg.multiplier, 0, cfg.roundUp);
+      const telephonyBilledUsd = built.usageMinor / 100;
+
+      // Credit wallet: top-up cash in + enrichment usage quantities.
+      const [creditAgg] = await db
+        .select({
+          topupUsdCents: sql<number>`COALESCE(SUM(${creditTransactions.amountUsdCents}) FILTER (WHERE ${creditTransactions.kind} = 'topup'), 0)::int`,
+          phoneQty: sql<number>`COALESCE(SUM(${creditTransactions.quantity}) FILTER (WHERE ${creditTransactions.kind} = 'debit' AND ${creditTransactions.action} = 'phone_enrichment'), 0)::int`,
+          emailQty: sql<number>`COALESCE(SUM(${creditTransactions.quantity}) FILTER (WHERE ${creditTransactions.kind} = 'debit' AND ${creditTransactions.action} = 'email_enrichment'), 0)::int`,
+          companyQty: sql<number>`COALESCE(SUM(${creditTransactions.quantity}) FILTER (WHERE ${creditTransactions.kind} = 'debit' AND ${creditTransactions.action} = 'company_enrichment'), 0)::int`,
+          jobQty: sql<number>`COALESCE(SUM(${creditTransactions.quantity}) FILTER (WHERE ${creditTransactions.kind} = 'debit' AND ${creditTransactions.action} = 'job_scraping'), 0)::int`,
+        })
+        .from(creditTransactions)
+        .where(and(eq(creditTransactions.organizationId, orgId), gte(creditTransactions.createdAt, r.start), lt(creditTransactions.createdAt, r.end)));
+
+      const [telCash] = await db
+        .select({
+          n: sql<number>`COALESCE(SUM(${telephonyCreditTransactions.amountMinor}) FILTER (WHERE ${telephonyCreditTransactions.kind} = 'topup'), 0)::int`,
+        })
+        .from(telephonyCreditTransactions)
+        .where(and(
+          eq(telephonyCreditTransactions.organizationId, orgId),
+          gte(telephonyCreditTransactions.createdAt, r.start),
+          lt(telephonyCreditTransactions.createdAt, r.end),
+        ));
+
+      const enrichmentCostUsd =
+        (creditAgg?.phoneQty ?? 0) * ENRICHMENT_COST_RATES.phone_enrichment +
+        (creditAgg?.emailQty ?? 0) * ENRICHMENT_COST_RATES.email_enrichment +
+        (creditAgg?.companyQty ?? 0) * ENRICHMENT_COST_RATES.company_enrichment +
+        (creditAgg?.jobQty ?? 0) * ENRICHMENT_COST_RATES.job_scraping;
+
+      return {
+        breakdown,
+        telephonyBilledUsd: round2(telephonyBilledUsd),
+        creditTopupsUsd: round2((creditAgg?.topupUsdCents ?? 0) / 100),
+        telephonyCollectedUsd: round2((telCash?.n ?? 0) / 100),
+        enrichment: {
+          phoneQty: creditAgg?.phoneQty ?? 0,
+          emailQty: creditAgg?.emailQty ?? 0,
+          companyQty: creditAgg?.companyQty ?? 0,
+          jobQty: creditAgg?.jobQty ?? 0,
+          costUsd: round2(enrichmentCostUsd),
+        },
+      };
+    }
+
+    const current = await monthPnl(range.period);
+
+    // Per-stream margins for the selected period.
+    const telephonyCostUsd = current.breakdown.total;
+    const streams = [
+      {
+        key: "seats",
+        label: "Seat subscriptions",
+        revenueUsd: seatsUsd,
+        costUsd: 0,
+        marginUsd: seatsUsd,
+        marginPct: seatsUsd > 0 ? 100 : null,
+      },
+      {
+        key: "telephony",
+        label: "Telephony (billed at markup)",
+        revenueUsd: current.telephonyBilledUsd,
+        costUsd: round2(telephonyCostUsd),
+        marginUsd: round2(current.telephonyBilledUsd - telephonyCostUsd),
+        marginPct: pct(current.telephonyBilledUsd - telephonyCostUsd, current.telephonyBilledUsd),
+      },
+      {
+        key: "credits",
+        label: "Credit top-ups",
+        revenueUsd: current.creditTopupsUsd,
+        costUsd: current.enrichment.costUsd,
+        marginUsd: round2(current.creditTopupsUsd - current.enrichment.costUsd),
+        marginPct: pct(current.creditTopupsUsd - current.enrichment.costUsd, current.creditTopupsUsd),
+      },
+    ];
+    const totalRevenueUsd = round2(streams.reduce((a, s) => a + s.revenueUsd, 0));
+    const totalCostUsd = round2(streams.reduce((a, s) => a + s.costUsd, 0));
+    const totalMarginUsd = round2(totalRevenueUsd - totalCostUsd);
+
+    // Trailing trend — seats held at the CURRENT plan config (same caveat as
+    // the Costs trend); telephony/costs/credits re-aggregated per month.
+    const trend: { period: string; revenueUsd: number; costUsd: number; marginUsd: number }[] = [];
+    for (let i = months - 1; i >= 0; i--) {
+      const s = new Date(Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth() - i, 1));
+      const period = `${s.getUTCFullYear()}-${String(s.getUTCMonth() + 1).padStart(2, "0")}`;
+      const m = period === range.period ? current : await monthPnl(period);
+      const revenueUsd = round2(seatsUsd + m.telephonyBilledUsd + m.creditTopupsUsd);
+      const costUsd = round2(m.breakdown.total + m.enrichment.costUsd);
+      trend.push({ period, revenueUsd, costUsd, marginUsd: round2(revenueUsd - costUsd) });
+    }
+
+    res.json({
+      data: {
+        orgId,
+        name: org.name,
+        period: range.period,
+        currency,
+        fx: { gbpToUsd: GBP_TO_USD, approx: currency !== "GBP" },
+        config: {
+          plan: org.plan,
+          planStatus: org.planStatus,
+          seats: org.seatsIncluded,
+          discountPct: org.discountPct || 0,
+          markupMultiplier: cfg.multiplier,
+          roundUp: cfg.roundUp,
+          bufferPct: org.telephonyBufferPct ?? 0,
+        },
+        revenue: {
+          seatsGbpPence,
+          seatsUsd,
+          telephonyBilledUsd: current.telephonyBilledUsd,
+          creditTopupsUsd: current.creditTopupsUsd,
+          totalUsd: totalRevenueUsd,
+          cash: { telephonyCollectedUsd: current.telephonyCollectedUsd },
+        },
+        costs: {
+          voice: current.breakdown.voice,
+          sms: current.breakdown.sms,
+          rentals: current.breakdown.rentals,
+          recording: current.breakdown.recording,
+          ai: current.breakdown.ai,
+          enrichment: { ...current.enrichment, rates: ENRICHMENT_COST_RATES, isEstimate: true },
+          totalUsd: totalCostUsd,
+        },
+        streams,
+        totals: {
+          revenueUsd: totalRevenueUsd,
+          costUsd: totalCostUsd,
+          marginUsd: totalMarginUsd,
+          marginPct: pct(totalMarginUsd, totalRevenueUsd),
+        },
+        trend,
+      },
+    });
+  }),
+);
+
 // ─── Telephony credits ─────────────────────────────────────────────────
 // Money wallet (account-currency minor units) fed by paid telephony
 // invoices and drawn down by billed usage. Track-only: may go negative.
