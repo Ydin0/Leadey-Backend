@@ -2353,6 +2353,64 @@ router.delete(
   }),
 );
 
+// ─── POST /funnels/:funnelId/leads/bulk-delete ───────────────────────────
+// Bulk remove selected leads. mode="campaign" deletes ONLY these enrollments
+// (the person stays in other campaigns / the org leads list); mode="everywhere"
+// also deletes the same person's enrollments across ALL the org's campaigns
+// (matched by master contact, email fallback) — the destructive option behind
+// the typed confirmation. Master contacts are never deleted.
+router.post(
+  "/funnels/:funnelId/leads/bulk-delete",
+  requirePerm("leads.delete"),
+  asyncHandler<FunnelParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = req.params.funnelId;
+    getFunnelOrThrow(await loadFunnel(orgId, funnelId), funnelId);
+
+    const leadIds: string[] = Array.isArray(req.body?.leadIds)
+      ? (req.body.leadIds as unknown[]).map(String).filter(Boolean)
+      : [];
+    const mode = req.body?.mode === "everywhere" ? "everywhere" : "campaign";
+    if (leadIds.length === 0) throw new ApiError(400, "leadIds is required");
+    if (leadIds.length > 5000) throw new ApiError(400, "Too many leads in one request (max 5000)");
+
+    // Only rows that genuinely belong to THIS funnel count as targets.
+    const targets = await db
+      .select({ id: leads.id, masterContactId: leads.masterContactId, email: leads.email })
+      .from(leads)
+      .where(and(eq(leads.funnelId, funnelId), inArray(leads.id, leadIds)));
+    if (targets.length === 0) {
+      res.json({ data: { deleted: 0 } });
+      return;
+    }
+
+    let idsToDelete = targets.map((t) => t.id);
+    if (mode === "everywhere") {
+      // Expand to the same people's enrollments in every org campaign.
+      const mcIds = [...new Set(targets.map((t) => t.masterContactId).filter(Boolean) as string[])];
+      const emails = [...new Set(targets.map((t) => (t.email || "").trim().toLowerCase()).filter(Boolean))];
+      const siblings = await db
+        .select({ id: leads.id })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(
+          eq(funnels.organizationId, orgId),
+          or(
+            mcIds.length ? inArray(leads.masterContactId, mcIds) : sql`false`,
+            emails.length ? inArray(sql`lower(${leads.email})`, emails) : sql`false`,
+          ),
+        ));
+      idsToDelete = [...new Set([...idsToDelete, ...siblings.map((s) => s.id)])];
+    }
+
+    // Chunked delete (events/tasks/docs/custom-fields/enrollments cascade).
+    for (let i = 0; i < idsToDelete.length; i += 500) {
+      await db.delete(leads).where(inArray(leads.id, idsToDelete.slice(i, i + 500)));
+    }
+    res.json({ data: { deleted: idsToDelete.length } });
+  }),
+);
+
 // ─── POST /funnels/:funnelId/leads ───────────────────────────────────────
 // Create a single lead manually from the campaign (the "Individual contact"
 // flow + "Add contact" on a lead profile). Only name + company required — the
