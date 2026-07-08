@@ -1,7 +1,8 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations } from "../db/schema/organizations";
+import { invoices, type InvoiceLineItem } from "../db/schema/invoices";
 import { getOrgId } from "../lib/auth";
 import { requirePerm } from "../lib/permission-service";
 import { ApiError } from "../lib/helpers";
@@ -204,6 +205,119 @@ router.get(
         createdAt: new Date(inv.created * 1000).toISOString(),
       })),
     });
+  }),
+);
+
+// ─── Leadey invoices (telephony + seats), customer-facing ───────────
+
+function periodName(period: string | null): string {
+  if (!period || !/^\d{4}-\d{2}$/.test(period)) return period ?? "";
+  const [y, m] = period.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString("en-GB", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+/** Customers see telephony invoices as ONE summary line — the per-bucket
+ *  breakdown (call/SMS/rental/buffer lines) stays internal. Other invoice
+ *  types keep their line items as issued. */
+function customerLineItems(row: typeof invoices.$inferSelect): InvoiceLineItem[] {
+  if (row.type === "telephony") {
+    return [
+      {
+        description: `Telephony services — ${periodName(row.period) || "usage"}`,
+        quantity: 1,
+        unit: "period",
+        amountMinor: row.totalMinor,
+      },
+    ];
+  }
+  return row.lineItems;
+}
+
+function serializeCustomerInvoice(
+  row: typeof invoices.$inferSelect,
+  org: { name: string; billingName: string | null; billingEmail: string | null; billingAddress: string | null; billingVat: string | null },
+) {
+  return {
+    id: row.id,
+    number: row.number,
+    type: row.type,
+    status: row.status,
+    period: row.period,
+    currency: row.currency,
+    lineItems: customerLineItems(row),
+    // Telephony collapses to one line, so its subtotal shows as the total.
+    subtotalMinor: row.type === "telephony" ? row.totalMinor : row.subtotalMinor,
+    totalMinor: row.totalMinor,
+    paymentUrl: row.stripePaymentUrl,
+    issuedAt: row.issuedAt.toISOString(),
+    dueAt: row.dueAt ? row.dueAt.toISOString() : null,
+    paidAt: row.paidAt ? row.paidAt.toISOString() : null,
+    orgName: org.name,
+    billingName: org.billingName,
+    billingEmail: org.billingEmail,
+    billingAddress: org.billingAddress,
+    billingVat: org.billingVat,
+  };
+}
+
+// GET /billing/leadey-invoices — the org's Leadey invoices (newest first)
+router.get(
+  "/billing/leadey-invoices",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({
+        name: organizations.name,
+        billingName: organizations.billingName,
+        billingEmail: organizations.billingEmail,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const rows = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.organizationId, orgId))
+      .orderBy(desc(invoices.issuedAt))
+      .limit(36);
+
+    res.json({ data: rows.map((r) => serializeCustomerInvoice(r, org)) });
+  }),
+);
+
+// GET /billing/leadey-invoices/:id — one invoice (must belong to the org)
+router.get(
+  "/billing/leadey-invoices/:id",
+  requirePerm("settings.manageBilling"),
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({
+        name: organizations.name,
+        billingName: organizations.billingName,
+        billingEmail: organizations.billingEmail,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+
+    const [row] = await db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.id, String(req.params.id)), eq(invoices.organizationId, orgId)));
+    if (!row) throw new ApiError(404, "Invoice not found");
+
+    res.json({ data: serializeCustomerInvoice(row, org) });
   }),
 );
 
