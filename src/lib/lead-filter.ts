@@ -138,6 +138,49 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return null;
   }
 
+  // Opportunity stage — the stage NAME of the lead's linked opportunity
+  // (case-insensitive, so same-named stages across pipelines match together).
+  if (field === "oppStage") {
+    const expr = sql`(select lower(ps.label) from opportunities o join pipeline_stages ps on ps.id = o.stage_id where o.id = ${leads.opportunityId})`;
+    if (op === "is_set") return sql`${expr} is not null`;
+    if (op === "is_empty") return sql`${expr} is null`;
+    const arr = asArray(c.value).map((s) => s.toLowerCase());
+    if (arr.length === 0) return null;
+    const inList = sql.join(arr.map((s) => sql`${s}`), sql`, `);
+    if (op === "is") return sql`${expr} in (${inList})`;
+    if (op === "is_not") return sql`coalesce(${expr} not in (${inList}), true)`;
+    return null;
+  }
+
+  // AI call categorization — the sales outcome the transcription pipeline
+  // classified (call_records.outcome, org-defined label set). A lead matches
+  // when ANY of its calls carries one of the selected outcomes. Calls attach
+  // by lead id, with the callCount-style phone fallback for ad-hoc dials.
+  if (field === "callOutcome") {
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    if (op === "is_set") return sql`exists (select 1 from call_records cr where ${callMatch} and cr.outcome is not null)`;
+    if (op === "is_empty") return sql`not exists (select 1 from call_records cr where ${callMatch} and cr.outcome is not null)`;
+    const arr = asArray(c.value).map((s) => s.toLowerCase());
+    if (arr.length === 0) return null;
+    const inList = sql.join(arr.map((s) => sql`${s}`), sql`, `);
+    const match = sql`exists (select 1 from call_records cr where ${callMatch} and lower(coalesce(cr.outcome, '')) in (${inList}))`;
+    if (op === "is") return match;
+    if (op === "is_not") return sql`not ${match}`;
+    return null;
+  }
+
+  // Transcript keyword search — a lead matches when any of its calls'
+  // transcripts contains the phrase.
+  if (field === "transcriptKeywords") {
+    if (!hasVal(c.value)) return null;
+    const kw = String(Array.isArray(c.value) ? c.value[0] : c.value);
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    const match = sql`exists (select 1 from call_records cr where ${callMatch} and cr.transcript ilike ${`%${kw}%`})`;
+    if (op === "contains") return match;
+    if (op === "not_contains") return sql`not ${match}`;
+    return null;
+  }
+
   // Campaign membership (org all-leads page). A lead belongs to exactly one
   // funnel; "is any of" matches per enrollment. Ids are org-scoped upstream.
   if (field === "funnelId") {

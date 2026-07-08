@@ -448,6 +448,78 @@ router.get(
   }),
 );
 
+// ─── GET /leads/filter-insights — per-lead derived filter values ─────────────
+// Sparse map used by the client-side filter evaluator for fields the lead
+// rows don't carry: opportunity stage + AI call outcomes. Fetched only while
+// a filter actually uses those fields. ?funnelId= scopes to one campaign.
+router.get(
+  "/leads/filter-insights",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const funnelId = typeof req.query.funnelId === "string" ? req.query.funnelId : null;
+    const leadScope = and(
+      eq(funnels.organizationId, orgId),
+      funnelId ? eq(leads.funnelId, funnelId) : undefined,
+    );
+
+    const [stageRows, outcomeRows] = await Promise.all([
+      db
+        .select({ leadId: leads.id, stage: sql<string>`ps.label` })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .innerJoin(sql`opportunities o`, sql`o.id = ${leads.opportunityId}`)
+        .innerJoin(sql`pipeline_stages ps`, sql`ps.id = o.stage_id`)
+        .where(leadScope),
+      db
+        .select({ leadId: leads.id, outcome: sql<string>`cr.outcome` })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .innerJoin(
+          sql`call_records cr`,
+          sql`cr.organization_id = ${orgId} and cr.outcome is not null and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`,
+        )
+        .where(leadScope),
+    ]);
+
+    const insights: Record<string, { oppStage: string | null; callOutcomes: string[] }> = {};
+    const entry = (id: string) => (insights[id] ??= { oppStage: null, callOutcomes: [] });
+    for (const r of stageRows) entry(r.leadId).oppStage = r.stage;
+    for (const r of outcomeRows) {
+      const e = entry(r.leadId);
+      if (!e.callOutcomes.includes(r.outcome)) e.callOutcomes.push(r.outcome);
+    }
+    res.json({ data: { insights } });
+  }),
+);
+
+// ─── GET /leads/transcript-matches — leads whose calls mention a phrase ──────
+// ?q=<keyword>[&funnelId=] → lead ids with any call transcript containing it.
+router.get(
+  "/leads/transcript-matches",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const funnelId = typeof req.query.funnelId === "string" ? req.query.funnelId : null;
+    if (!q) {
+      res.json({ data: { leadIds: [] } });
+      return;
+    }
+
+    const rows = await db
+      .selectDistinct({ id: leads.id })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(
+        and(
+          eq(funnels.organizationId, orgId),
+          funnelId ? eq(leads.funnelId, funnelId) : undefined,
+          sql`exists (select 1 from call_records cr where cr.organization_id = ${orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g'))) and cr.transcript ilike ${`%${q}%`})`,
+        ),
+      );
+    res.json({ data: { leadIds: rows.map((r) => r.id) } });
+  }),
+);
+
 // ─── POST /leads/bulk-delete — org-wide permanent delete ────────────────────
 // The org Leads page shows every enrollment row across campaigns; deleting a
 // selection removes exactly those rows (events/tasks/docs cascade). Behind a
