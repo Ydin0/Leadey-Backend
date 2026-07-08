@@ -151,6 +151,50 @@ router.post(
   }),
 );
 
+// ─── POST /billing/add-seats ────────────────────────────────────────
+// Bump the EXISTING subscription's quantity (never a second checkout — a
+// parallel subscription would overwrite the org's plan state via webhooks).
+// Prorated and invoiced immediately.
+router.post(
+  "/billing/add-seats",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const add = Math.floor(Number(req.body?.seats) || 0);
+    if (add < 1 || add > 500) throw new ApiError(400, "Seats must be between 1 and 500");
+
+    const [org] = await db.select().from(organizations).where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+    if (!org.stripeSubscriptionId) {
+      throw new ApiError(400, "No active subscription — subscribe to a plan first");
+    }
+
+    const sub = (await stripe.subscriptions.retrieve(org.stripeSubscriptionId)) as any;
+    const item = sub.items?.data?.[0];
+    if (!item) throw new ApiError(400, "Subscription has no seat item");
+    const newQuantity = (item.quantity || 1) + add;
+
+    await stripe.subscriptions.update(org.stripeSubscriptionId, {
+      items: [{ id: item.id, quantity: newQuantity }],
+      proration_behavior: "always_invoice",
+    });
+
+    // The subscription.updated webhook syncs seats too; write through now so
+    // the UI reflects it immediately.
+    const config = getPlanConfig(org.plan);
+    await db
+      .update(organizations)
+      .set({
+        seatsIncluded: newQuantity,
+        creditsIncluded: config.scraperCredits * newQuantity,
+        updatedAt: new Date(),
+      })
+      .where(eq(organizations.id, orgId));
+
+    res.json({ data: { seats: newQuantity } });
+  }),
+);
+
 // ─── POST /billing/portal ───────────────────────────────────────────
 // Create a Stripe Customer Portal session
 router.post(
