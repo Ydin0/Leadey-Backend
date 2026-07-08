@@ -7,7 +7,12 @@ import { getOrgId } from "../lib/auth";
 import { ApiError, appOrigin } from "../lib/helpers";
 import { getBalance, CREDIT_COSTS, CREDIT_CENTS_PER } from "../lib/credits";
 import { getAccountCurrency } from "../lib/twilio-cost-sync";
-import { maybeAutoTopup, chargeSavedCardAndCredit, getTelephonyBalance } from "../lib/telephony-credits";
+import {
+  maybeAutoTopup,
+  chargeSavedCardAndCredit,
+  getTelephonyBalance,
+  getSavedPaymentMethodDetails,
+} from "../lib/telephony-credits";
 import { getTelephonyBudgetStatus, invalidateTelephonyBudgetCache } from "../lib/telephony-budget";
 import { requirePerm } from "../lib/permission-service";
 import { createCreditCheckoutSession } from "../lib/stripe";
@@ -215,6 +220,18 @@ router.put(
         immediateTopup: topup,
       },
     });
+  }),
+);
+
+// ─── GET /credits/telephony/payment-method ──────────────────────────
+// The saved payment method shown on the top-up confirmation dialog.
+router.get(
+  "/credits/telephony/payment-method",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const paymentMethod = await getSavedPaymentMethodDetails(orgId);
+    res.json({ data: { paymentMethod } });
   }),
 );
 

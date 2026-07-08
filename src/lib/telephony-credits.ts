@@ -269,6 +269,49 @@ async function resolveSavedPaymentMethod(
   return null;
 }
 
+/** Displayable details of the org's saved payment method (for the top-up
+ *  confirmation UI). Null when nothing is on file. */
+export async function getSavedPaymentMethodDetails(orgId: string): Promise<{
+  kind: string;
+  brand: string;
+  last4: string | null;
+  expMonth: number | null;
+  expYear: number | null;
+  email: string | null;
+} | null> {
+  const [org] = await db
+    .select({
+      stripeCustomerId: organizations.stripeCustomerId,
+      stripeSubscriptionId: organizations.stripeSubscriptionId,
+    })
+    .from(organizations)
+    .where(eq(organizations.id, orgId));
+  if (!org?.stripeCustomerId) return null;
+
+  try {
+    const { stripe } = await import("./stripe");
+    const pmId = await resolveSavedPaymentMethod(stripe, org.stripeCustomerId, org.stripeSubscriptionId);
+    if (!pmId) return null;
+    const pm = await stripe.paymentMethods.retrieve(pmId);
+    if (pm.type === "card" && pm.card) {
+      return {
+        kind: "card",
+        brand: pm.card.brand,
+        last4: pm.card.last4,
+        expMonth: pm.card.exp_month,
+        expYear: pm.card.exp_year,
+        email: null,
+      };
+    }
+    if (pm.type === "link") {
+      return { kind: "link", brand: "link", last4: null, expMonth: null, expYear: null, email: pm.link?.email ?? null };
+    }
+    return { kind: pm.type, brand: pm.type, last4: null, expMonth: null, expYear: null, email: null };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Charge the org's saved payment method off-session and credit the wallet.
  * Shared by auto top-up and the customer's manual top-up. Idempotent
