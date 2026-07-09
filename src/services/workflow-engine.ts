@@ -5,7 +5,7 @@ import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/w
 import type { WorkflowGraph, WorkflowNode, WorkflowSettings } from "../db/schema/workflows";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels, funnelMembers } from "../db/schema/funnels";
-import { emailAccounts, emailMessages } from "../db/schema/email-accounts";
+import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/schema/email-accounts";
 import { smsMessages } from "../db/schema/sms";
 import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
@@ -123,23 +123,31 @@ async function logRun(enr: Enrollment, node: WorkflowNode, status: string, detai
 }
 
 /** Load org-scoped template attachments referenced by a workflow email node.
- *  No-op for nodes without an attachmentIds array; missing files are skipped. */
-async function loadWorkflowAttachments(orgId: string, ids: unknown): Promise<EmailAttachment[]> {
-  if (!Array.isArray(ids) || ids.length === 0) return [];
+ *  Returns the sendable files plus a metadata snapshot to persist on the
+ *  message. No-op for nodes without an attachmentIds array; missing files are
+ *  skipped (logged). */
+async function loadWorkflowAttachments(
+  orgId: string,
+  ids: unknown,
+): Promise<{ files: EmailAttachment[]; refs: EmailAttachmentRef[] }> {
+  if (!Array.isArray(ids) || ids.length === 0) return { files: [], refs: [] };
   const rows = await db
     .select()
     .from(templateAttachments)
     .where(and(eq(templateAttachments.organizationId, orgId), inArray(templateAttachments.id, ids.map(String))));
-  const out: EmailAttachment[] = [];
+  const files: EmailAttachment[] = [];
+  const refs: EmailAttachmentRef[] = [];
   for (const r of rows) {
     const content = await readAttachmentFile(r.storedName);
-    if (content) out.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
-    else console.warn(`[workflow email] attachment file unreadable, skipping: ${r.id} (${r.fileName})`);
+    if (content) {
+      files.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+      refs.push({ id: r.id, fileName: r.fileName, mimeType: r.mimeType || "application/octet-stream", size: r.size });
+    } else console.warn(`[workflow email] attachment file unreadable, skipping: ${r.id} (${r.fileName})`);
   }
-  if (out.length < ids.length) {
-    console.warn(`[workflow email] ${ids.length - out.length}/${ids.length} attachment(s) missing for org ${orgId}`);
+  if (files.length < ids.length) {
+    console.warn(`[workflow email] ${ids.length - files.length}/${ids.length} attachment(s) missing for org ${orgId}`);
   }
-  return out;
+  return { files, refs };
 }
 
 // ─── Action executors (reuse existing senders / patterns) ────────────────
@@ -158,7 +166,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         ? renderTokens(String(d.bodyHtml), tokens)
         : renderTokens(String(d.body || ""), tokens).replace(/\n/g, "<br>");
       // Attachments the node references (e.g. a template's welcome-pack PDFs).
-      const attachments = await loadWorkflowAttachments(orgId, d.attachmentIds);
+      const { files: attachments, refs: attachmentRefs } = await loadWorkflowAttachments(orgId, d.attachmentIds);
       const accounts = await db.select().from(emailAccounts).where(eq(emailAccounts.organizationId, orgId));
       const accountId = typeof d.accountId === "string" ? d.accountId : "";
       const fromAddr = typeof d.from === "string" ? d.from : "";
@@ -183,7 +191,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
             funnelId: lead.funnelId, userId: actorSender ? enr.triggeredBy : null, direction: "outbound", fromEmail: account.email,
             fromName: account.fromName || "", toEmail: lead.email, subject, bodyHtml: htmlWithSig,
             providerMessageId: res.providerMessageId, providerThreadId: res.providerThreadId,
-            messageIdHeader: res.messageIdHeader, status: "sent", createdAt: new Date(),
+            messageIdHeader: res.messageIdHeader, status: "sent", attachments: attachmentRefs, createdAt: new Date(),
           });
         } else {
           await sendEmail({ to: lead.email, subject, html, from: String(d.from || "") || undefined });

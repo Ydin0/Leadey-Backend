@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
 import { eq, and, asc, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { emailAccounts, emailMessages } from "../db/schema/email-accounts";
+import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/schema/email-accounts";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
@@ -17,16 +17,21 @@ import { readAttachmentFile } from "../lib/template-attachment-storage";
 
 const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024; // providers cap ~25MB total incl. encoding
 
-/** Resolve org-scoped attachment ids into loadable email attachments. Unknown
- *  ids are skipped (attachment deleted); an unreadable file is an error — the
- *  sender picked it, so dropping it silently would send a broken email. */
-async function loadAttachments(orgId: string, ids: unknown): Promise<EmailAttachment[]> {
-  if (!Array.isArray(ids) || ids.length === 0) return [];
+/** Resolve org-scoped attachment ids into loadable email attachments AND a
+ *  metadata snapshot to persist on the message. Unknown ids are skipped
+ *  (attachment deleted); an unreadable file is an error — the sender picked
+ *  it, so dropping it silently would send a broken email. */
+async function loadAttachments(
+  orgId: string,
+  ids: unknown,
+): Promise<{ files: EmailAttachment[]; refs: EmailAttachmentRef[] }> {
+  if (!Array.isArray(ids) || ids.length === 0) return { files: [], refs: [] };
   const rows = await db
     .select()
     .from(templateAttachments)
     .where(and(eq(templateAttachments.organizationId, orgId), inArray(templateAttachments.id, ids.map(String))));
-  const out: EmailAttachment[] = [];
+  const files: EmailAttachment[] = [];
+  const refs: EmailAttachmentRef[] = [];
   let total = 0;
   for (const r of rows) {
     const content = await readAttachmentFile(r.storedName);
@@ -38,9 +43,10 @@ async function loadAttachments(orgId: string, ids: unknown): Promise<EmailAttach
     if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
       throw new ApiError(400, "Attachments exceed the 20MB total limit.");
     }
-    out.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+    files.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+    refs.push({ id: r.id, fileName: r.fileName, mimeType: r.mimeType || "application/octet-stream", size: r.size });
   }
-  return out;
+  return { files, refs };
 }
 
 const router = Router(); // authed, mounted at /api
@@ -323,7 +329,7 @@ router.post(
     const htmlWithSig = withSignature(bodyHtml, account.signature);
     const pixel = `<img src="${backendBase()}/track/email/${messageId}/open.gif" width="1" height="1" alt="" style="display:none" />`;
     const html = `${htmlWithSig}${pixel}`;
-    const attachments = await loadAttachments(orgId, req.body?.attachmentIds);
+    const { files: attachments, refs: attachmentRefs } = await loadAttachments(orgId, req.body?.attachmentIds);
 
     let result;
     try {
@@ -353,6 +359,7 @@ router.post(
       providerThreadId: result.providerThreadId,
       messageIdHeader: result.messageIdHeader,
       status: "sent",
+      attachments: attachmentRefs,
       createdAt: now,
     });
     await db.insert(leadEvents).values({
@@ -376,6 +383,7 @@ router.post(
         bodyHtml: htmlWithSig,
         status: "sent",
         openedAt: null,
+        attachments: attachmentRefs,
         createdAt: now.toISOString(),
       },
     });
@@ -408,12 +416,40 @@ router.get(
         openedAt: emailMessages.openedAt,
         openCount: emailMessages.openCount,
         userId: emailMessages.userId,
+        attachments: emailMessages.attachments,
         createdAt: emailMessages.createdAt,
       })
       .from(emailMessages)
       .where(and(eq(emailMessages.organizationId, orgId), eq(emailMessages.leadId, leadId)))
       .orderBy(asc(emailMessages.createdAt));
     res.json({ data: rows });
+  }),
+);
+
+// ── GET /email/attachments/:id/download — stream a sent attachment ──
+// Org-scoped download of an email attachment (same file store as templates).
+router.get(
+  "/email/attachments/:id/download",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [att] = await db
+      .select()
+      .from(templateAttachments)
+      .where(and(eq(templateAttachments.id, String(req.params.id)), eq(templateAttachments.organizationId, orgId)))
+      .limit(1);
+    if (!att) throw new ApiError(404, "Attachment not found");
+
+    const buffer = await readAttachmentFile(att.storedName);
+    if (!buffer) throw new ApiError(404, "Attachment file is no longer available");
+
+    res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
+    const asciiName = att.fileName.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "'");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(att.fileName)}`,
+    );
+    res.setHeader("Content-Length", String(buffer.length));
+    res.end(buffer);
   }),
 );
 

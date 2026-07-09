@@ -1,5 +1,16 @@
-import { pgTable, text, integer, boolean, timestamp, index, primaryKey } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, timestamp, index, primaryKey, jsonb } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
+
+/** Denormalised snapshot of a file attached to a sent email — kept ON the
+ *  message so the thread renders it even if the source template attachment is
+ *  later deleted. `id` still points at the template_attachments row for
+ *  downloads while the file exists. */
+export interface EmailAttachmentRef {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+}
 
 /** A rep's connected personal inbox (Gmail/Outlook OAuth or generic SMTP/IMAP)
  *  used to send 1:1 emails from the lead profile and capture replies. Secrets
@@ -73,6 +84,8 @@ export const emailMessages = pgTable(
     status: text("status").notNull().default("sent"), // sent | bounced | received | failed
     openedAt: timestamp("opened_at", { withTimezone: true }),
     openCount: integer("open_count").notNull().default(0),
+    /** Files sent with this message (snapshot; see EmailAttachmentRef). */
+    attachments: jsonb("attachments").$type<EmailAttachmentRef[]>().notNull().default([]),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

@@ -313,6 +313,7 @@ router.get(
           bodyHtml: m.bodyHtml || (m.bodyText ? m.bodyText.replace(/\n/g, "<br>") : ""),
           openedAt: m.openedAt?.toISOString() ?? null,
           status: m.status,
+          attachments: m.attachments ?? [],
           createdAt: m.createdAt.toISOString(),
         })),
       },

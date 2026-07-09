@@ -651,6 +651,7 @@ router.get(
           openedAt: m.openedAt ? m.openedAt.toISOString() : null,
           openCount: m.openCount,
           userId: m.userId,
+          attachments: m.attachments ?? [],
           createdAt: m.createdAt.toISOString(),
         },
       });
