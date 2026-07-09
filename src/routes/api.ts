@@ -6,6 +6,7 @@ import { funnelTags, funnelTagAssignments } from "../db/schema/funnel-tags";
 import { callRecords } from "../db/schema/call-records";
 import { users } from "../db/schema/organizations";
 import { leads, leadEvents } from "../db/schema/leads";
+import { leadDocuments } from "../db/schema/lead-documents";
 import { scraperSignals } from "../db/schema/scrapers";
 import { masterCompanies, masterContacts } from "../db/schema/master";
 import { imports } from "../db/schema/imports";
@@ -2051,8 +2052,11 @@ router.post(
   asyncHandler<LeadAdvanceParams>(async (req, res) => {
     const orgId = getOrgId(req);
     const text = normalizeString(req.body && req.body.text);
-    if (!text) {
-      throw new ApiError(400, "text is required");
+    const attachmentIds: string[] = Array.isArray(req.body?.attachmentIds)
+      ? req.body.attachmentIds.map(String).slice(0, 20)
+      : [];
+    if (!text && attachmentIds.length === 0) {
+      throw new ApiError(400, "text or attachmentIds is required");
     }
 
     const funnel = getFunnelOrThrow(
@@ -2064,6 +2068,21 @@ router.post(
       throw new ApiError(404, "Lead not found in funnel");
     }
 
+    // Attachments = lead documents already uploaded against this lead (so they
+    // also live in the Documents tab). Snapshot their metadata onto the note.
+    let attachmentRefs: { id: string; fileName: string; mimeType: string; size: number }[] = [];
+    if (attachmentIds.length) {
+      const docs = await db
+        .select()
+        .from(leadDocuments)
+        .where(and(
+          eq(leadDocuments.organizationId, orgId),
+          eq(leadDocuments.leadId, lead.id),
+          inArray(leadDocuments.id, attachmentIds),
+        ));
+      attachmentRefs = docs.map((d) => ({ id: d.id, fileName: d.fileName, mimeType: d.mimeType, size: d.size }));
+    }
+
     const id = createId("event");
     const stepIndex = clamp(
       (lead.currentStep || 1) - 1,
@@ -2071,7 +2090,11 @@ router.post(
       Math.max(funnel.steps.length - 1, 0),
     );
     const timestamp = new Date();
-    const noteMeta = { text, userId: getAuth(req as unknown as Request)?.userId ?? null };
+    const noteMeta = {
+      text,
+      userId: getAuth(req as unknown as Request)?.userId ?? null,
+      ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}),
+    };
     await db.insert(leadEvents).values({
       id,
       leadId: lead.id,
