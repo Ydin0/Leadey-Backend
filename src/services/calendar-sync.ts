@@ -10,7 +10,12 @@ interface CalTokens { access: string; refresh: string; expiresAt: number; scope?
 
 /** How far ahead we keep events synced. */
 const WINDOW_DAYS = 60;
+/** How far back each sync re-fetches. Past meetings inside this window stay
+ *  updated (and recover if ever pruned); anything older is kept as history
+ *  and never touched by the prune step. */
+const LOOKBACK_DAYS = 90;
 const SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const lookbackStart = () => new Date(Date.now() - LOOKBACK_DAYS * 86400_000);
 
 const GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email";
 const MS_SCOPE = "offline_access Calendars.Read User.Read";
@@ -102,7 +107,7 @@ function microsoftRsvp(s: string | undefined): RsvpStatus {
 }
 
 async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
-  const timeMin = new Date().toISOString();
+  const timeMin = lookbackStart().toISOString();
   const timeMax = new Date(Date.now() + WINDOW_DAYS * 86400_000).toISOString();
   const out: NormalizedEvent[] = [];
   let pageToken: string | undefined;
@@ -151,7 +156,7 @@ async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
 }
 
 async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
-  const start = new Date().toISOString();
+  const start = lookbackStart().toISOString();
   const end = new Date(Date.now() + WINDOW_DAYS * 86400_000).toISOString();
   const out: NormalizedEvent[] = [];
   let url: string | null =
@@ -230,12 +235,17 @@ export async function syncAccount(account: Account): Promise<void> {
     }
   }
 
-  // Prune future events this account no longer returns (cancelled/declined/removed).
+  // Prune events the provider no longer returns (cancelled/declined/removed) —
+  // but ONLY within the fetch window. Events older than the lookback were not
+  // fetched this pass, so absence from `seen` says nothing about them; they are
+  // history and must never be deleted.
+  const pruneFrom = lookbackStart();
   const stored = await db
-    .select({ id: calendarEvents.id, providerEventId: calendarEvents.providerEventId })
+    .select({ id: calendarEvents.id, providerEventId: calendarEvents.providerEventId, startTime: calendarEvents.startTime })
     .from(calendarEvents)
     .where(eq(calendarEvents.accountId, account.id));
   for (const row of stored) {
+    if (row.startTime && row.startTime < pruneFrom) continue; // keep history
     if (!seen.has(row.providerEventId)) {
       await db.delete(calendarEvents).where(eq(calendarEvents.id, row.id));
     }
