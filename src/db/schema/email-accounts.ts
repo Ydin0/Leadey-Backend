@@ -15,6 +15,10 @@ export const emailAccounts = pgTable(
     provider: text("provider").notNull(), // "gmail" | "outlook" | "smtp"
     email: text("email").notNull(),
     fromName: text("from_name").notNull().default(""),
+  /** Per-account signature appended to one-off + workflow emails (HTML, or
+   *  plain text converted to <br> at send time). Sequences (Smartlead) are
+   *  unaffected. */
+  signature: text("signature"),
     status: text("status").notNull().default("active"), // active | error | disconnected
     isDefault: boolean("is_default").notNull().default(false),
     // OAuth (gmail/outlook): encrypted JSON { access, refresh, expiresAt, scope }

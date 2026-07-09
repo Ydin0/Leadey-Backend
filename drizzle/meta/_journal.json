@@ -547,6 +547,13 @@
       "when": 1783549842489,
       "tag": "0077_loving_bloodstrike",
       "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1783601062120,
+      "tag": "0078_spooky_sumo",
+      "breakpoints": true
     }
   ]
 }

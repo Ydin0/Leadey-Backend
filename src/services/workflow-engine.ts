@@ -11,6 +11,7 @@ import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { sendEmail } from "../lib/email";
 import { sendEmailVia, type EmailAttachment } from "../lib/email-providers";
+import { withSignature } from "../routes/email-accounts";
 import { templateAttachments } from "../db/schema/template-attachments";
 import { readAttachmentFile } from "../lib/template-attachment-storage";
 import { sendWhatsapp } from "./whatsapp-sender";
@@ -171,11 +172,12 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       }
       try {
         if (account) {
-          const res = await sendEmailVia(account, { to: lead.email, subject, html, attachments });
+          const htmlWithSig = withSignature(html, account.signature);
+          const res = await sendEmailVia(account, { to: lead.email, subject, html: htmlWithSig, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,
             funnelId: lead.funnelId, userId: actorSender ? enr.triggeredBy : null, direction: "outbound", fromEmail: account.email,
-            fromName: account.fromName || "", toEmail: lead.email, subject, bodyHtml: html,
+            fromName: account.fromName || "", toEmail: lead.email, subject, bodyHtml: htmlWithSig,
             providerMessageId: res.providerMessageId, providerThreadId: res.providerThreadId,
             messageIdHeader: res.messageIdHeader, status: "sent", createdAt: new Date(),
           });

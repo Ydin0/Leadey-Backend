@@ -8,6 +8,8 @@ import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
 import { templateAttachments } from "../db/schema/template-attachments";
 import { getOrgId } from "../lib/auth";
+import { getPerms } from "../lib/permission-service";
+import { hasPerm } from "../lib/permission-catalog";
 import { ApiError, createId } from "../lib/helpers";
 import { signState, verifyState, encryptSecret } from "../lib/crypto";
 import { sendEmailVia, verifySmtp, packTokens, type EmailAttachment } from "../lib/email-providers";
@@ -61,10 +63,20 @@ function serializeAccount(a: typeof emailAccounts.$inferSelect) {
     provider: a.provider,
     email: a.email,
     fromName: a.fromName,
+    signature: a.signature ?? null,
     status: a.status,
     isDefault: a.isDefault,
     createdAt: a.createdAt.toISOString(),
   };
+}
+
+/** Append the account's signature to an outgoing HTML body. Plain-text
+ *  signatures (no tags) get their newlines converted; HTML passes through. */
+export function withSignature(bodyHtml: string, signature: string | null | undefined): string {
+  const sig = (signature || "").trim();
+  if (!sig) return bodyHtml;
+  const sigHtml = /<[a-z][\s\S]*>/i.test(sig) ? sig : sig.replace(/\n/g, "<br>");
+  return `${bodyHtml}<br><br>${sigHtml}`;
 }
 
 // ── OAuth provider config ───────────────────────────────────────────
@@ -92,17 +104,67 @@ type OAuthName = keyof typeof OAUTH;
 const redirectUri = (provider: OAuthName) => `${backendBase()}/api/email/oauth/${provider}/callback`;
 
 // ── GET /api/email/accounts — the caller's connected inboxes ─────────
+// ?scope=org (settings.manageIntegrations only): EVERY org mailbox with its
+// owner, so admins can audit what's connected and by whom.
 router.get(
   "/email/accounts",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
+
+    if (req.query.scope === "org") {
+      const perms = await getPerms(req);
+      if (!hasPerm(perms.permissions, "settings.manageIntegrations")) {
+        throw new ApiError(403, "You don't have permission to view all email accounts");
+      }
+      const rows = await db
+        .select({ account: emailAccounts, firstName: users.firstName, lastName: users.lastName })
+        .from(emailAccounts)
+        .leftJoin(users, eq(emailAccounts.userId, users.id))
+        .where(eq(emailAccounts.organizationId, orgId))
+        .orderBy(asc(emailAccounts.userId), asc(emailAccounts.createdAt));
+      res.json({
+        data: rows.map((r) => ({
+          ...serializeAccount(r.account),
+          userId: r.account.userId,
+          ownerName: [r.firstName, r.lastName].filter(Boolean).join(" ") || null,
+        })),
+      });
+      return;
+    }
+
     const rows = await db
       .select()
       .from(emailAccounts)
       .where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, userId)))
       .orderBy(asc(emailAccounts.createdAt));
     res.json({ data: rows.map(serializeAccount) });
+  }),
+);
+
+// ── PATCH /api/email/accounts/:id — from-name + signature ────────────
+router.patch(
+  "/email/accounts/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || "";
+    const body = req.body as { fromName?: string; signature?: string | null };
+
+    const patch: Partial<{ fromName: string; signature: string | null; updatedAt: Date }> = { updatedAt: new Date() };
+    if (body.fromName !== undefined) patch.fromName = String(body.fromName).slice(0, 120);
+    if (body.signature !== undefined) {
+      const sig = body.signature == null ? null : String(body.signature);
+      if (sig && sig.length > 10_000) throw new ApiError(400, "Signature is too long (max 10,000 characters)");
+      patch.signature = sig && sig.trim() ? sig : null;
+    }
+
+    const [updated] = await db
+      .update(emailAccounts)
+      .set(patch)
+      .where(and(eq(emailAccounts.id, String(req.params.id)), eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, userId)))
+      .returning();
+    if (!updated) throw new ApiError(404, "Email account not found");
+    res.json({ data: serializeAccount(updated) });
   }),
 );
 
@@ -253,9 +315,10 @@ router.post(
     if (!account) throw new ApiError(400, "No connected email account. Connect one in Settings → Email Accounts.");
 
     const messageId = createId("emsg");
-    // Open-tracking pixel (best-effort; blocked images simply won't register).
+    // Signature first, then the open-tracking pixel (best-effort).
+    const htmlWithSig = withSignature(bodyHtml, account.signature);
     const pixel = `<img src="${backendBase()}/track/email/${messageId}/open.gif" width="1" height="1" alt="" style="display:none" />`;
-    const html = `${bodyHtml}${pixel}`;
+    const html = `${htmlWithSig}${pixel}`;
     const attachments = await loadAttachments(orgId, req.body?.attachmentIds);
 
     let result;
@@ -281,7 +344,7 @@ router.post(
       fromName: account.fromName || "",
       toEmail,
       subject,
-      bodyHtml,
+      bodyHtml: htmlWithSig,
       providerMessageId: result.providerMessageId,
       providerThreadId: result.providerThreadId,
       messageIdHeader: result.messageIdHeader,
@@ -294,7 +357,7 @@ router.post(
       type: "step_outcome",
       outcome: "sent",
       stepIndex: Math.max(0, (lead.currentStep || 1) - 1),
-      meta: { channel: "email", direction: "outbound", subject, body: bodyHtml, fromEmail: account.email, fromName: account.fromName, toEmail, cc: cc || undefined, userId, userName },
+      meta: { channel: "email", direction: "outbound", subject, body: htmlWithSig, fromEmail: account.email, fromName: account.fromName, toEmail, cc: cc || undefined, userId, userName },
       timestamp: now,
     });
 
@@ -306,7 +369,7 @@ router.post(
         fromName: account.fromName,
         toEmail,
         subject,
-        bodyHtml,
+        bodyHtml: htmlWithSig,
         status: "sent",
         openedAt: null,
         createdAt: now.toISOString(),
