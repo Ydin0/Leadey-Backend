@@ -436,7 +436,7 @@ webhookRouter.post(
       const { smsMessages } = await import("../db/schema/sms");
       const { eq: e, and: a, desc: d } = await import("drizzle-orm");
       const { createId, phoneKey } = await import("../lib/helpers");
-      const { createNotification } = await import("./notifications");
+      const { createNotificationForUsers, recipientsForLine } = await import("./notifications");
 
       // Which org owns the number that was messaged?
       const toDigits = to.replace(/\D/g, "");
@@ -496,25 +496,37 @@ webhookRouter.post(
           void notifyWorkflowEvent(lead.id, "replied");
           void fireTriggerForLead(lead.id, "reply_received");
 
-          // Notify the rep who last texted this lead, else the line's owner.
+          // Notify the rep who last texted this lead, else the line's owner,
+          // else — an unassigned / org-wide number — everyone in the org.
           const [lastOut] = await db
             .select({ userId: smsMessages.userId })
             .from(smsMessages)
             .where(a(e(smsMessages.leadId, lead.id), e(smsMessages.direction, "outbound")))
             .orderBy(d(smsMessages.createdAt))
             .limit(1);
-          const targetUserId = lastOut?.userId || line?.assignedTo || null;
-          if (targetUserId) {
-            await createNotification({
-              orgId,
-              userId: targetUserId,
-              type: "sms_reply",
-              title: `${lead.name} replied`,
-              body: body.slice(0, 140),
-              leadId: lead.id,
-              funnelId: lead.funnelId,
-            });
-          }
+          const recipients = await recipientsForLine({
+            orgId,
+            assignedTo: line?.assignedTo ?? null,
+            preferUserId: lastOut?.userId ?? null,
+          });
+          await createNotificationForUsers(recipients, {
+            orgId,
+            type: "sms_reply",
+            title: `${lead.name} replied`,
+            body: body.slice(0, 140),
+            leadId: lead.id,
+            funnelId: lead.funnelId,
+          });
+        } else {
+          // Text from an unknown number to an org line — still worth surfacing
+          // (assigned owner, else org-wide). No lead deep-link.
+          const recipients = await recipientsForLine({ orgId, assignedTo: line?.assignedTo ?? null });
+          await createNotificationForUsers(recipients, {
+            orgId,
+            type: "sms_reply",
+            title: `New text from ${from}`,
+            body: body.slice(0, 140),
+          });
         }
       }
     } catch (err) {

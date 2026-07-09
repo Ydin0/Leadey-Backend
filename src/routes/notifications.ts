@@ -1,8 +1,9 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, desc, count } from "drizzle-orm";
+import { eq, and, desc, count, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { notifications } from "../db/schema/notifications";
+import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { createId } from "../lib/helpers";
 
@@ -42,6 +43,44 @@ export async function createNotification(params: {
   } catch (err) {
     console.error("[notifications] create failed:", err);
   }
+}
+
+/** Fan one notification out to several reps (deduped). Best-effort. */
+export async function createNotificationForUsers(
+  userIds: (string | null | undefined)[],
+  params: { orgId: string; type: string; title: string; body?: string; leadId?: string | null; funnelId?: string | null },
+): Promise<void> {
+  const unique = [...new Set(userIds.filter((u): u is string => !!u))];
+  await Promise.all(unique.map((userId) => createNotification({ ...params, userId })));
+}
+
+/** Active (non-suspended) member user ids for an org — the audience for
+ *  "org-wide" events (e.g. a text/missed call on an unassigned shared number). */
+export async function orgMemberUserIds(orgId: string): Promise<string[]> {
+  try {
+    const rows = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.organizationId, orgId), isNull(users.suspendedAt)));
+    return rows.map((r) => r.id);
+  } catch (err) {
+    console.error("[notifications] orgMemberUserIds failed:", err);
+    return [];
+  }
+}
+
+/** Who to notify for an event on a phone line/number:
+ *  - an explicit rep (e.g. the last person who texted this lead), else
+ *  - the number's assigned owner, else
+ *  - everyone in the org (an unassigned / org-wide shared number). */
+export async function recipientsForLine(params: {
+  orgId: string;
+  assignedTo?: string | null;
+  preferUserId?: string | null;
+}): Promise<string[]> {
+  if (params.preferUserId) return [params.preferUserId];
+  if (params.assignedTo) return [params.assignedTo];
+  return orgMemberUserIds(params.orgId);
 }
 
 // GET /api/notifications — this rep's notifications + unread count.

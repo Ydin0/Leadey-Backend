@@ -909,20 +909,23 @@ router.post("/twilio/inbound-status", async (req: Request, res: Response) => {
         calledAt: new Date(),
       });
 
-      if (line.assignedTo) {
-        try {
-          const { createNotification } = await import("./notifications");
-          await createNotification({
-            orgId: line.organizationId,
-            userId: line.assignedTo,
-            type: "missed_call",
-            title: `Missed call${contactName ? ` from ${contactName}` : ""}`,
-            body: from,
-            leadId,
-            funnelId,
-          });
-        } catch { /* non-fatal */ }
-      }
+      try {
+        const { createNotificationForUsers, recipientsForLine } = await import("./notifications");
+        // Assigned line → its owner; unassigned / org-wide shared number →
+        // everyone in the org.
+        const recipients = await recipientsForLine({
+          orgId: line.organizationId,
+          assignedTo: line.assignedTo ?? null,
+        });
+        await createNotificationForUsers(recipients, {
+          orgId: line.organizationId,
+          type: "missed_call",
+          title: `Missed call${contactName ? ` from ${contactName}` : ""}`,
+          body: from,
+          leadId,
+          funnelId,
+        });
+      } catch { /* non-fatal */ }
     } catch (err) {
       console.error("[Twilio inbound-status] error:", err);
     }

@@ -12,7 +12,7 @@ import { ApiError, createId, phoneKey } from "../lib/helpers";
 import { requirePerm } from "../lib/permission-service";
 import { encryptSecret } from "../lib/crypto";
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
-import { createNotification } from "./notifications";
+import { createNotificationForUsers, recipientsForLine } from "./notifications";
 import { sendWhatsapp, getWhatsappAccount } from "../services/whatsapp-sender";
 import {
   metaConfigured,
@@ -333,10 +333,12 @@ whatsappPublicRouter.post("/meta/whatsapp", asyncHandler(async (req, res) => {
               .where(and(eq(smsMessages.leadId, lead.id), eq(smsMessages.direction, "outbound")))
               .orderBy(desc(smsMessages.createdAt))
               .limit(1);
-            if (lastOut?.userId) {
-              await createNotification({
+            {
+              // The WhatsApp sender is org-level (no assigned rep), so notify
+              // the last texter, else everyone in the org.
+              const recipients = await recipientsForLine({ orgId, preferUserId: lastOut?.userId ?? null });
+              await createNotificationForUsers(recipients, {
                 orgId,
-                userId: lastOut.userId,
                 type: "sms_reply",
                 title: `${lead.name} replied on WhatsApp`,
                 body: text.slice(0, 140),
