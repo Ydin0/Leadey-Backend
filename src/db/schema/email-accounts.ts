@@ -1,4 +1,4 @@
-import { pgTable, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, timestamp, index, primaryKey } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 /** A rep's connected personal inbox (Gmail/Outlook OAuth or generic SMTP/IMAP)
@@ -82,4 +82,26 @@ export const emailMessages = pgTable(
     // Keyset-paginated timeline reads: (lead_id, created_at DESC).
     index("email_messages_lead_created_idx").on(t.leadId, t.createdAt),
   ],
+);
+
+/** Per-lead email conversation state for the org inbox: read cursor, star,
+ *  archive, snooze. A thread = all email_messages for one lead. Threads with
+ *  no row are treated as read/unstarred/active; the 0079 migration seeds rows
+ *  for pre-existing threads so history doesn't surface as unread. */
+export const emailThreadState = pgTable(
+  "email_thread_state",
+  {
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    leadId: text("lead_id").notNull(),
+    // unread = markedUnread OR an inbound message newer than lastReadAt.
+    lastReadAt: timestamp("last_read_at", { withTimezone: true }),
+    markedUnread: boolean("marked_unread").notNull().default(false),
+    starred: boolean("starred").notNull().default(false),
+    archived: boolean("archived").notNull().default(false),
+    snoozedUntil: timestamp("snoozed_until", { withTimezone: true }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.organizationId, t.leadId] })],
 );

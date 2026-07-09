@@ -11,6 +11,7 @@ import { masterContacts } from "../db/schema/master";
 import { calendlyMeetings } from "../db/schema/calendly";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
+import { unreadEmailThreadCount } from "./email-threads";
 
 const router = Router();
 
@@ -87,13 +88,14 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
-    if (!userId) { res.json({ data: { tasks: 0, reminders: 0, calls: 0, messages: 0, potential: 0, total: 0 } }); return; }
+    if (!userId) { res.json({ data: { tasks: 0, reminders: 0, calls: 0, messages: 0, emails: 0, potential: 0, total: 0 } }); return; }
 
-    const [tasks, calls, sms, potential] = await Promise.all([
+    const [tasks, calls, sms, potential, emails] = await Promise.all([
       dueTasksForUser(orgId, userId),
       callbacksForOrg(orgId),
       needsReplySms(orgId),
       potentialContacts(orgId),
+      unreadEmailThreadCount(orgId),
     ]);
     const reminders = tasks.filter((t) => t.task.category === "reminder").length;
     const counts = {
@@ -101,8 +103,9 @@ router.get(
       reminders,
       calls: calls.length,
       messages: sms.length,
+      emails,
       potential: potential.length,
-      total: tasks.length + calls.length + sms.length + potential.length,
+      total: tasks.length + calls.length + sms.length + potential.length + emails,
     };
     res.json({ data: counts });
   }),

@@ -11,7 +11,7 @@ export { imports } from "./imports";
 export { smsMessages } from "./sms";
 export { whatsappAccounts } from "./whatsapp-accounts";
 export { notifications } from "./notifications";
-export { emailAccounts, emailMessages } from "./email-accounts";
+export { emailAccounts, emailMessages, emailThreadState } from "./email-accounts";
 export { calendlyAccounts, calendlyMeetings } from "./calendly";
 export { calendarAccounts, calendarEvents } from "./calendar";
 export { settings } from "./settings";

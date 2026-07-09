@@ -554,6 +554,13 @@
       "when": 1783601062120,
       "tag": "0078_spooky_sumo",
       "breakpoints": true
+    },
+    {
+      "idx": 79,
+      "version": "7",
+      "when": 1783603038291,
+      "tag": "0079_narrow_caretaker",
+      "breakpoints": true
     }
   ]
 }
