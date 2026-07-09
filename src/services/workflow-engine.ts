@@ -134,6 +134,10 @@ async function loadWorkflowAttachments(orgId: string, ids: unknown): Promise<Ema
   for (const r of rows) {
     const content = await readAttachmentFile(r.storedName);
     if (content) out.push({ filename: r.fileName, content, contentType: r.mimeType || "application/octet-stream" });
+    else console.warn(`[workflow email] attachment file unreadable, skipping: ${r.id} (${r.fileName})`);
+  }
+  if (out.length < ids.length) {
+    console.warn(`[workflow email] ${ids.length - out.length}/${ids.length} attachment(s) missing for org ${orgId}`);
   }
   return out;
 }

@@ -158,10 +158,13 @@ async function sendSmtp(account: Account, input: SendInput): Promise<SendResult>
 async function sendGmail(account: Account, input: SendInput): Promise<SendResult> {
   const token = await getAccessToken(account);
   const { raw, messageId } = await buildMime(account, input);
-  const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+  // Media upload (raw RFC-822 bytes) instead of the JSON endpoint: the JSON
+  // body caps at ~5MB, which base64 inflation turns into a ~3.5MB attachment
+  // ceiling. The upload endpoint takes messages up to 35MB.
+  const res = await fetch("https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media", {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ raw: raw.toString("base64url") }),
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "message/rfc822" },
+    body: new Uint8Array(raw),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`Gmail send failed: ${data?.error?.message || res.status}`);

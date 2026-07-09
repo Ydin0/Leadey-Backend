@@ -18,7 +18,8 @@ import { readAttachmentFile } from "../lib/template-attachment-storage";
 const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024; // providers cap ~25MB total incl. encoding
 
 /** Resolve org-scoped attachment ids into loadable email attachments. Unknown
- *  ids and missing files are skipped; throws only if the total exceeds the cap. */
+ *  ids are skipped (attachment deleted); an unreadable file is an error — the
+ *  sender picked it, so dropping it silently would send a broken email. */
 async function loadAttachments(orgId: string, ids: unknown): Promise<EmailAttachment[]> {
   if (!Array.isArray(ids) || ids.length === 0) return [];
   const rows = await db
@@ -29,7 +30,10 @@ async function loadAttachments(orgId: string, ids: unknown): Promise<EmailAttach
   let total = 0;
   for (const r of rows) {
     const content = await readAttachmentFile(r.storedName);
-    if (!content) continue;
+    if (!content) {
+      console.error(`[email send] attachment file unreadable: ${r.id} (${r.fileName})`);
+      throw new ApiError(400, `Attachment "${r.fileName}" could not be read — remove it and upload the file again.`);
+    }
     total += content.length;
     if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
       throw new ApiError(400, "Attachments exceed the 20MB total limit.");
