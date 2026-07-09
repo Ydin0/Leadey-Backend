@@ -478,7 +478,7 @@ router.get(
         .innerJoin(funnels, eq(leads.funnelId, funnels.id))
         .innerJoin(
           sql`call_records cr`,
-          sql`cr.organization_id = ${orgId} and cr.outcome is not null and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`,
+          sql`cr.organization_id = ${orgId} and cr.outcome is not null and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`,
         )
         .where(leadScope),
     ]);
@@ -515,7 +515,7 @@ router.get(
         and(
           eq(funnels.organizationId, orgId),
           funnelId ? eq(leads.funnelId, funnelId) : undefined,
-          sql`exists (select 1 from call_records cr where cr.organization_id = ${orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g'))) and cr.transcript ilike ${`%${q}%`})`,
+          sql`exists (select 1 from call_records cr where cr.organization_id = ${orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g'))) and cr.transcript ilike ${`%${q}%`})`,
         ),
       );
     res.json({ data: { leadIds: rows.map((r) => r.id) } });

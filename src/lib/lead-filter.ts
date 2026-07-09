@@ -119,7 +119,7 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return applyNum(expr, op, c.value);
   }
   if (field === "callCount") {
-    const expr = sql`(select count(*) from call_records cr where cr.organization_id = ${ctx.orgId} and cr.direction = 'outbound' and ${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g'))`;
+    const expr = sql`(select count(*) from call_records cr where cr.organization_id = ${ctx.orgId} and cr.direction = 'outbound' and ${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g'))`;
     return applyNum(expr, op, c.value);
   }
   if (field === "emailCount") {
@@ -157,7 +157,7 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
   // when ANY of its calls carries one of the selected outcomes. Calls attach
   // by lead id, with the callCount-style phone fallback for ad-hoc dials.
   if (field === "callOutcome") {
-    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
     if (op === "is_set") return sql`exists (select 1 from call_records cr where ${callMatch} and cr.outcome is not null)`;
     if (op === "is_empty") return sql`not exists (select 1 from call_records cr where ${callMatch} and cr.outcome is not null)`;
     const arr = asArray(c.value).map((s) => s.toLowerCase());
@@ -174,7 +174,7 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
   if (field === "transcriptKeywords") {
     if (!hasVal(c.value)) return null;
     const kw = String(Array.isArray(c.value) ? c.value[0] : c.value);
-    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(coalesce(cr.to_number, ''), '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
     const match = sql`exists (select 1 from call_records cr where ${callMatch} and cr.transcript ilike ${`%${kw}%`})`;
     if (op === "contains") return match;
     if (op === "not_contains") return sql`not ${match}`;
