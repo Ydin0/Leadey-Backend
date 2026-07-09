@@ -138,8 +138,10 @@ function serializeLeadFull(
 }
 
 /** Hard ceiling for the load-all org table — beyond this the response flags
- *  `truncated` and the UI tells the user to refine/export. */
-const ALL_LEADS_CAP = 20_000;
+ *  `truncated` and the UI tells the user to refine/export. Raised 20k -> 50k
+ *  (Jul 2026, org crossed 23.5k); past ~50k the answer is server-side
+ *  pagination/filtering, not a bigger cap — the payload stops being sane. */
+const ALL_LEADS_CAP = 50_000;
 
 // ─── GET /leads — every campaign lead across the org, filtered + paginated ──
 // `all=1` switches to the load-all mode that feeds the org leads TABLE: full
