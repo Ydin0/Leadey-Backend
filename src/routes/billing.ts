@@ -472,6 +472,97 @@ router.get(
   }),
 );
 
+// Label a telephony/one-off PaymentIntent for display.
+function labelForPayment(pi: any): string {
+  const t = pi.metadata?.type;
+  if (t === "telephony_autotopup") return "Calling credit auto top-up";
+  if (t === "telephony_topup" || t === "telephony_topup_checkout") return "Calling credit top-up";
+  return pi.description || "Payment";
+}
+
+// ─── GET /billing/payments ──────────────────────────────────────────
+// Standalone Stripe payments (calling-credit top-ups + one-off charges).
+// These are PaymentIntents, not invoices, so they never appear in
+// /billing/invoices — this lists them so they show in the app.
+router.get(
+  "/billing/payments",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({ stripeCustomerId: organizations.stripeCustomerId })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org?.stripeCustomerId) {
+      res.json({ data: [] });
+      return;
+    }
+    const pis = await stripe.paymentIntents.list({ customer: org.stripeCustomerId, limit: 50 });
+    const payments = pis.data
+      .filter((pi: any) => !pi.invoice && pi.status === "succeeded" && pi.amount_received > 0)
+      .map((pi: any) => ({
+        id: pi.id,
+        description: labelForPayment(pi),
+        amount: pi.amount_received,
+        currency: pi.currency,
+        status: pi.status,
+        createdAt: new Date(pi.created * 1000).toISOString(),
+      }));
+    res.json({ data: payments });
+  }),
+);
+
+// ─── GET /billing/payments/:id ──────────────────────────────────────
+// One Stripe payment reshaped to the Leadey invoice-document format so it
+// renders as a branded in-app receipt (no redirect to Stripe).
+router.get(
+  "/billing/payments/:id",
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db
+      .select({
+        stripeCustomerId: organizations.stripeCustomerId,
+        name: organizations.name,
+        billingName: organizations.billingName,
+        billingEmail: organizations.billingEmail,
+        billingAddress: organizations.billingAddress,
+        billingVat: organizations.billingVat,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId));
+    if (!org?.stripeCustomerId) throw new ApiError(404, "Payment not found");
+
+    const pi = await stripe.paymentIntents.retrieve(String(req.params.id));
+    const piCustomer = typeof pi.customer === "string" ? pi.customer : pi.customer?.id;
+    if (!pi || piCustomer !== org.stripeCustomerId) throw new ApiError(404, "Payment not found");
+
+    const label = labelForPayment(pi);
+    res.json({
+      data: {
+        id: pi.id,
+        number: pi.id.replace(/^pi_/, "").slice(0, 12).toUpperCase(),
+        type: "topup",
+        status: pi.status === "succeeded" ? "paid" : "open",
+        period: null,
+        periodLabel: null,
+        currency: pi.currency,
+        lineItems: [{ description: label, quantity: 1, unit: "period", amountMinor: pi.amount_received ?? pi.amount ?? 0 }],
+        subtotalMinor: pi.amount_received ?? pi.amount ?? 0,
+        totalMinor: pi.amount_received ?? pi.amount ?? 0,
+        amountPaidMinor: pi.amount_received ?? 0,
+        paymentUrl: null,
+        issuedAt: new Date(pi.created * 1000).toISOString(),
+        dueAt: null,
+        paidAt: pi.status === "succeeded" ? new Date(pi.created * 1000).toISOString() : null,
+        orgName: org.name,
+        billingName: org.billingName,
+        billingEmail: org.billingEmail,
+        billingAddress: org.billingAddress,
+        billingVat: org.billingVat,
+      },
+    });
+  }),
+);
+
 // ─── POST /billing/cancel-request ────────────────────────────────────
 // Submit a cancellation request (doesn't actually cancel — sends to team)
 router.post(

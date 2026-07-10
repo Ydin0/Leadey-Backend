@@ -19,14 +19,14 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
   const trialDays = input.trialDays ?? 60;
 
   const body = /* html */ `
-    <h1 class="hero-title" style="margin: 0 0 14px; font-size: 26px; line-height: 1.25; font-weight: 600; color: #0a0f1a; letter-spacing: -0.02em;">
+    <h1 class="hero-title" style="margin: 0 0 14px; font-size: 26px; line-height: 1.25; font-weight: 600; color: #FFFFFF; letter-spacing: -0.02em;">
       Welcome to Leadey
     </h1>
-    <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
+    <p style="margin: 0 0 8px; color: #C8CFE6; font-size: 15px; line-height: 1.6;">
       ${input.invitedBy ? escapeHtml(input.invitedBy) + " has set up" : "We've set up"} a workspace for
-      <strong style="color: #0a0f1a;">${escapeHtml(input.organizationName)}</strong> on Leadey, and your account is ready as its first admin.
+      <strong style="color: #FFFFFF;">${escapeHtml(input.organizationName)}</strong> on Leadey, and your account is ready as its first admin.
     </p>
-    <p style="margin: 0 0 8px; color: #334155; font-size: 15px; line-height: 1.6;">
+    <p style="margin: 0 0 8px; color: #C8CFE6; font-size: 15px; line-height: 1.6;">
       Leadey is the outbound platform B2B teams use to find the right buyers, reach them on the
       right channel, and never let a warm signal slip through. You get ${trialDays} days to try it
       with no card on file.
@@ -34,16 +34,16 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
 
     ${renderCtaButton(input.inviteUrl, "Sign in to your workspace")}
 
-    <p style="margin: 0 0 18px; color: #64748b; font-size: 13px; line-height: 1.6;">
+    <p style="margin: 0 0 18px; color: #97A4D6; font-size: 13px; line-height: 1.6;">
       The button signs you in directly — no password required. You can set one
       later from your account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
-      <a href="${escapeHtml(input.inviteUrl)}" style="color: #5B6BC0; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
+      <a href="${escapeHtml(input.inviteUrl)}" style="color: #97A4D6; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
 
-    <div style="height: 1px; background-color: #e2e8f0; margin: 28px 0;"></div>
+    <div style="height: 1px; background-color: #2A3357; margin: 28px 0;"></div>
 
-    <h2 style="margin: 0 0 14px; font-size: 14px; font-weight: 600; color: #0a0f1a; text-transform: uppercase; letter-spacing: 0.04em;">
+    <h2 style="margin: 0 0 14px; font-size: 14px; font-weight: 600; color: #FFFFFF; text-transform: uppercase; letter-spacing: 0.04em;">
       What you'll do first
     </h2>
     <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
@@ -53,7 +53,7 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
       ${featureRow("04", "Watch leads land", "Replies, bookings, and AI summaries flow straight into your pipeline.", true)}
     </table>
 
-    <p style="margin: 28px 0 0; color: #64748b; font-size: 13px; line-height: 1.6;">
+    <p style="margin: 28px 0 0; color: #97A4D6; font-size: 13px; line-height: 1.6;">
       Questions? Just reply to this email — a real person will get back to you.
     </p>
   `;
@@ -67,13 +67,13 @@ function featureRow(num: string, title: string, body: string, last = false): str
   return /* html */ `
     <tr>
       <td style="padding: 10px 0 ${last ? "0" : "10px"}; vertical-align: top; width: 36px;">
-        <div style="width: 28px; height: 28px; background-color: #f1f5f9; border-radius: 8px; text-align: center; line-height: 28px; font-size: 11px; font-weight: 600; color: #475569; letter-spacing: 0.02em;">
+        <div style="width: 28px; height: 28px; background-color: #2E3964; border-radius: 8px; text-align: center; line-height: 28px; font-size: 11px; font-weight: 600; color: #C8CFE6; letter-spacing: 0.02em;">
           ${num}
         </div>
       </td>
       <td style="padding: 10px 0 ${last ? "0" : "10px"}; vertical-align: top; padding-left: 14px;">
-        <div style="font-size: 14px; font-weight: 600; color: #0a0f1a; margin-bottom: 2px;">${escapeHtml(title)}</div>
-        <div style="font-size: 13px; color: #64748b; line-height: 1.55;">${escapeHtml(body)}</div>
+        <div style="font-size: 14px; font-weight: 600; color: #FFFFFF; margin-bottom: 2px;">${escapeHtml(title)}</div>
+        <div style="font-size: 13px; color: #97A4D6; line-height: 1.55;">${escapeHtml(body)}</div>
       </td>
     </tr>
   `;
