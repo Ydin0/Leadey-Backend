@@ -104,7 +104,18 @@ export async function getTelephonyBudgetStatus(
  *  tripped. The "out of calling credit" phrase is matched client-side. */
 export async function assertTelephonyNotBlocked(orgId: string): Promise<void> {
   const status = await getTelephonyBudgetStatus(orgId);
-  if (!status.blocked) return;
+  if (!status.blocked) {
+    // Warn the team as the balance approaches the floor (within ~$15), before
+    // calling is cut off. Deduped to once/day per org inside the notifier.
+    if (status.reason === null && status.liveBalanceMinor <= status.floorMinor + 1500) {
+      void import("./system-emails").then((m) =>
+        m.notifyTelephonyLowBalance({ orgId, balanceMinor: status.liveBalanceMinor, currency: "usd" }),
+      ).catch(() => {});
+    }
+    return;
+  }
+  // Calling is actually blocked right now → alert the whole team (deduped daily).
+  void import("./system-emails").then((m) => m.notifyTelephonyBlocked({ orgId })).catch(() => {});
   throw new ApiError(
     403,
     status.reason === "floor"

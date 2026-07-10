@@ -79,3 +79,5 @@ export {
 export { leadDocuments } from "./lead-documents";
 
 export { paymentReceipts } from "./payment-receipts";
+
+export { emailSends } from "./email-sends";

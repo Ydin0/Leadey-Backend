@@ -1,8 +1,10 @@
 import { eq, and } from "drizzle-orm";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
+import { users } from "../db/schema/organizations";
 import { encryptSecret, decryptSecret } from "../lib/crypto";
 import { createId } from "../lib/helpers";
+import { notifyCalendarDisconnected, clearEmailClaim } from "../lib/system-emails";
 
 type Account = typeof calendarAccounts.$inferSelect;
 
@@ -254,6 +256,8 @@ export async function syncAccount(account: Account): Promise<void> {
   await db.update(calendarAccounts)
     .set({ lastSyncedAt: now, status: "active", lastError: null, updatedAt: now })
     .where(eq(calendarAccounts.id, account.id));
+  // Re-arm the disconnect alert for a future failure.
+  void clearEmailClaim(`calendar_disconnected:${account.id}`);
 }
 
 async function syncAll(): Promise<void> {
@@ -273,6 +277,17 @@ async function syncAll(): Promise<void> {
         .set({ status: "error", lastError: String(err?.message || err), updatedAt: new Date() })
         .where(eq(calendarAccounts.id, account.id))
         .catch(() => {});
+      // Alert the rep to reconnect (deduped per account until it reconnects).
+      try {
+        const [u] = await db.select({ email: users.email }).from(users).where(eq(users.id, account.userId));
+        await notifyCalendarDisconnected({
+          accountId: account.id,
+          userEmail: u?.email ?? null,
+          calendar: account.email,
+          provider: account.provider,
+          lastError: String(err?.message || err),
+        });
+      } catch { /* non-fatal */ }
     }
   }
 }

@@ -1,5 +1,5 @@
 import { renderBaseEmail, renderCtaButton, escapeHtml } from "./base";
-import type { RenderedEmail } from "./org-admin-welcome";
+import type { RenderedEmail } from "./base";
 
 export interface MemberInviteInput {
   organizationName: string;
@@ -33,7 +33,7 @@ export function renderMemberInvite(input: MemberInviteInput): RenderedEmail {
       The button signs you in directly. You can set a password later from your
       account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
-      <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
+      <a href="${escapeHtml(input.inviteUrl)}" style="color: #5B6BC0; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
 
     <p style="margin: 28px 0 0; color: #94a3b8; font-size: 12px; line-height: 1.6;">

@@ -1,4 +1,8 @@
-import { renderBaseEmail, renderCtaButton, escapeHtml } from "./base";
+import { renderBaseEmail, renderCtaButton, escapeHtml, type RenderedEmail } from "./base";
+
+// Re-exported for back-compat: some templates historically imported the type
+// from here. The canonical definition now lives in base.ts.
+export type { RenderedEmail };
 
 export interface OrgAdminWelcomeInput {
   organizationName: string;
@@ -7,12 +11,6 @@ export interface OrgAdminWelcomeInput {
   invitedBy?: string;
   /** Optional override of the trial length copy */
   trialDays?: number;
-}
-
-export interface RenderedEmail {
-  subject: string;
-  html: string;
-  text: string;
 }
 
 export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmail {
@@ -40,7 +38,7 @@ export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmai
       The button signs you in directly — no password required. You can set one
       later from your account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
-      <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
+      <a href="${escapeHtml(input.inviteUrl)}" style="color: #5B6BC0; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
 
     <div style="height: 1px; background-color: #e2e8f0; margin: 28px 0;"></div>

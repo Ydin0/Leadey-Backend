@@ -1027,6 +1027,32 @@ router.post("/calendly/:accountId", async (req: Request, res: Response) => {
             funnelId,
           });
         } catch { /* non-fatal */ }
+
+        // Branded confirmation email to the rep whose calendar this is.
+        if (status !== "canceled" && funnelId) {
+          try {
+            const [rep] = await db
+              .select({ email: users.email, firstName: users.firstName })
+              .from(users)
+              .where(eq(users.id, acct.userId));
+            const [leadRow] = await db
+              .select({ name: leads.name, company: leads.company })
+              .from(leads)
+              .where(eq(leads.id, leadId));
+            const { notifyMeetingBooked } = await import("../lib/system-emails");
+            await notifyMeetingBooked({
+              meetingId: eventUri,
+              userEmail: rep?.email ?? null,
+              repFirstName: rep?.firstName ?? null,
+              leadName: leadRow?.name || inviteeName || "your lead",
+              company: leadRow?.company ?? null,
+              whenMs: startTime ? startTime.getTime() : null,
+              joinUrl,
+              funnelId,
+              leadId,
+            });
+          } catch { /* non-fatal */ }
+        }
       }
     } catch (err) {
       console.error("[Calendly webhook] error:", err);
@@ -1496,7 +1522,7 @@ router.post("/stripe", async (req: Request, res: Response) => {
         const quantity = sub.items?.data?.[0]?.quantity || config.seats;
         // Admin seat grants/restrictions persist across subscription syncs.
         const [orgRow] = await db
-          .select({ adj: organizations.seatAdjustment })
+          .select({ adj: organizations.seatAdjustment, prevPlan: organizations.plan, prevSeats: organizations.seatsIncluded })
           .from(organizations)
           .where(eq(organizations.id, orgId));
         const seats = Math.max(1, quantity + (orgRow?.adj ?? 0));
@@ -1522,6 +1548,27 @@ router.post("/stripe", async (req: Request, res: Response) => {
             updatedAt: new Date(),
           })
           .where(eq(organizations.id, orgId));
+
+        // Email the billing contact only on a REAL plan/seat change (Stripe
+        // fires subscription.updated for many no-op syncs). Deduped by the new
+        // plan+seats so identical repeats don't resend.
+        const planChanged = orgRow && orgRow.prevPlan !== plan;
+        const seatsChanged = orgRow && (orgRow.prevSeats ?? 0) !== seats;
+        if ((planChanged || seatsChanged) && (statusMap[sub.status] || "active") === "active") {
+          const started = !orgRow?.prevPlan || orgRow.prevPlan === "trial" || orgRow.prevPlan === "cancelled";
+          const planName = plan.charAt(0).toUpperCase() + plan.slice(1);
+          const { notifySubscriptionChanged } = await import("../lib/system-emails");
+          await notifySubscriptionChanged({
+            orgId,
+            key: `${orgId}:${plan}:${seats}:${started ? "start" : "upd"}`,
+            planName,
+            seats,
+            priceMinor: sub.items?.data?.[0]?.price?.unit_amount ? sub.items.data[0].price.unit_amount * seats : null,
+            currency: sub.items?.data?.[0]?.price?.currency,
+            renewsAtMs: sub.current_period_end ? sub.current_period_end * 1000 : null,
+            changeType: started ? "started" : "updated",
+          });
+        }
         break;
       }
 
@@ -1541,6 +1588,12 @@ router.post("/stripe", async (req: Request, res: Response) => {
           .where(eq(organizations.id, orgId));
 
         console.log(`[Stripe] Org ${orgId} subscription cancelled`);
+        const { notifySubscriptionCanceled } = await import("../lib/system-emails");
+        await notifySubscriptionCanceled({
+          orgId,
+          key: sub.id || `${orgId}:${sub.canceled_at || Date.now()}`,
+          accessUntilMs: sub.current_period_end ? sub.current_period_end * 1000 : null,
+        });
         break;
       }
 
@@ -1652,6 +1705,14 @@ router.post("/stripe", async (req: Request, res: Response) => {
             .where(eq(organizations.id, org.id));
 
           console.log(`[Stripe] Payment failed for org ${org.id}`);
+          const { notifyPaymentFailed } = await import("../lib/system-emails");
+          await notifyPaymentFailed({
+            orgId: org.id,
+            reference: `${invoice.id}:${invoice.attempt_count ?? 0}`,
+            amountMinor: invoice.amount_due ?? null,
+            currency: invoice.currency ?? "usd",
+            description: "Leadey subscription",
+          });
         }
         break;
       }

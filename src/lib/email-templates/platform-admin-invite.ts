@@ -1,5 +1,5 @@
 import { renderBaseEmail, renderCtaButton, escapeHtml } from "./base";
-import type { RenderedEmail } from "./org-admin-welcome";
+import type { RenderedEmail } from "./base";
 
 export interface PlatformAdminInviteInput {
   inviteUrl: string;
@@ -33,7 +33,7 @@ export function renderPlatformAdminInvite(
       The button signs you in directly. You can set a password later from your
       account settings. Link expires in 7 days.<br /><br />
       Or copy this link into your browser:<br />
-      <a href="${escapeHtml(input.inviteUrl)}" style="color: #2563eb; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
+      <a href="${escapeHtml(input.inviteUrl)}" style="color: #5B6BC0; word-break: break-all;">${escapeHtml(input.inviteUrl)}</a>
     </p>
 
     <div style="height: 1px; background-color: #e2e8f0; margin: 28px 0;"></div>
@@ -79,7 +79,7 @@ export function renderPlatformAdminInvite(
 function bullet(text: string): string {
   return /* html */ `
     <li style="padding: 6px 0; padding-left: 18px; position: relative;">
-      <span style="position: absolute; left: 0; top: 6px; color: #2563eb; font-weight: 600;">·</span>
+      <span style="position: absolute; left: 0; top: 6px; color: #5B6BC0; font-weight: 600;">·</span>
       ${escapeHtml(text)}
     </li>`;
 }

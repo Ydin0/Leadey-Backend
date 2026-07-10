@@ -494,6 +494,16 @@ export async function maybeAutoTopup(
       .set({ telephonyAutoTopupLastError: error, updatedAt: new Date() })
       .where(eq(organizations.id, orgId));
     console.warn(`[TelephonyAutoTopup] org ${orgId}: ${error}`);
+    // Alert the billing contact so they can fix the card (deduped per day).
+    const { notifyPaymentFailed } = await import("./system-emails");
+    void notifyPaymentFailed({
+      orgId,
+      reference: `autotopup:${orgId}:${new Date().toISOString().slice(0, 10)}`,
+      amountMinor,
+      currency: "usd",
+      description: "Calling credit auto top-up",
+      reason: error,
+    });
     return { charged: false, error };
   }
 

@@ -67,6 +67,12 @@ async function resolveUserName(userId: string | null): Promise<string | null> {
   return [u?.firstName, u?.lastName].filter(Boolean).join(" ") || null;
 }
 
+async function resolveUserEmail(userId: string | null): Promise<string | null> {
+  if (!userId) return null;
+  const [u] = await db.select({ email: users.email }).from(users).where(eq(users.id, userId));
+  return u?.email ?? null;
+}
+
 function serializeAccount(a: typeof emailAccounts.$inferSelect) {
   return {
     id: a.id,
@@ -335,8 +341,21 @@ router.post(
     try {
       result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, subject, html, attachments });
     } catch (err: any) {
-      console.error(`[email send] ${account.provider} ${account.email} failed:`, err?.message || err);
-      await db.update(emailAccounts).set({ status: "error", lastError: String(err?.message || err) }).where(eq(emailAccounts.id, account.id));
+      const msg = String(err?.message || err);
+      console.error(`[email send] ${account.provider} ${account.email} failed:`, msg);
+      await db.update(emailAccounts).set({ status: "error", lastError: msg }).where(eq(emailAccounts.id, account.id));
+      // Only alert "reconnect your mailbox" on an AUTH failure — a one-off send
+      // error (bad recipient, rate limit) shouldn't cry disconnect.
+      if (/invalid_grant|unauthor|token|expired|reconnect|401|invalid credentials|permission/i.test(msg)) {
+        const { notifyMailboxDisconnected } = await import("../lib/system-emails");
+        void notifyMailboxDisconnected({
+          accountId: account.id,
+          userEmail: await resolveUserEmail(account.userId),
+          mailbox: account.email,
+          provider: account.provider,
+          lastError: msg,
+        });
+      }
       throw new ApiError(502, `Email send failed: ${err?.message || "provider error"}`);
     }
 
@@ -520,6 +539,9 @@ publicRouter.get(
           .update(emailAccounts)
           .set({ provider: cfg.providerKey, fromName: name || existing[0].fromName, status: "active", encryptedTokens: tokens, lastError: null, updatedAt: new Date() })
           .where(eq(emailAccounts.id, existing[0].id));
+        // Re-arm the disconnect alert for a future auth failure.
+        const { clearEmailClaim } = await import("../lib/system-emails");
+        void clearEmailClaim(`mailbox_disconnected:${existing[0].id}`);
       } else {
         const anyForUser = await db
           .select({ id: emailAccounts.id })
