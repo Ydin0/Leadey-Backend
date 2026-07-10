@@ -51,6 +51,22 @@ function shouldUpgrade(current: string, incoming: string): boolean {
   return (STATUS_RANK[incoming] ?? 0) > (STATUS_RANK[current] ?? 0);
 }
 
+/** Best phone number off a Clerk user payload: our sign-up stashes it in
+ *  unsafe_metadata.phone (E.164), but also honor a real Clerk phone identity
+ *  (primary phone number) if one exists. Returns null when neither is set. */
+function extractClerkPhone(data: any): string | null {
+  const meta = (data?.unsafe_metadata?.phone ?? data?.public_metadata?.phone);
+  if (typeof meta === "string" && meta.trim()) return meta.trim();
+  const nums = data?.phone_numbers;
+  if (Array.isArray(nums) && nums.length) {
+    const primary =
+      nums.find((p: any) => p.id === data?.primary_phone_number_id) || nums[0];
+    const v = primary?.phone_number;
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 // ─── POST /webhooks/smartlead ───────────────────────────────────────────
 
 router.post("/smartlead", async (req: Request, res: Response) => {
@@ -473,6 +489,9 @@ router.post("/clerk", async (req: Request, res: Response) => {
           data.email_addresses?.find(
             (e: any) => e.id === data.primary_email_address_id
           )?.email_address || data.email_addresses?.[0]?.email_address || "";
+        // Phone captured at sign-up lands in unsafe_metadata.phone; also accept
+        // a verified Clerk phone identity if one exists.
+        const phone = extractClerkPhone(data);
 
         // Org membership the user was invited into (carried on the invitation's
         // public_metadata by our invite flow).
@@ -495,6 +514,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
             email: primaryEmail,
             firstName: data.first_name,
             lastName: data.last_name,
+            phone: phone || null,
             imageUrl: data.image_url,
             organizationId: targetOrgId || null,
             role: targetOrgId ? targetRole : null,
@@ -511,6 +531,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
               email: primaryEmail,
               firstName: data.first_name,
               lastName: data.last_name,
+              ...(phone ? { phone } : {}),
               imageUrl: data.image_url,
               ...(targetOrgId ? { organizationId: targetOrgId, role: targetRole } : {}),
               updatedAt: new Date(data.updated_at),
@@ -549,12 +570,14 @@ router.post("/clerk", async (req: Request, res: Response) => {
             (e: any) => e.id === data.primary_email_address_id
           )?.email_address || data.email_addresses?.[0]?.email_address || "";
 
+        const updatedPhone = extractClerkPhone(data);
         await db
           .update(users)
           .set({
             email: primaryEmail,
             firstName: data.first_name,
             lastName: data.last_name,
+            ...(updatedPhone ? { phone: updatedPhone } : {}),
             imageUrl: data.image_url,
             platformRole:
             data.public_metadata?.platform_role ||

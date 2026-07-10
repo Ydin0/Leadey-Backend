@@ -582,6 +582,13 @@
       "when": 1783710060318,
       "tag": "0082_true_shockwave",
       "breakpoints": true
+    },
+    {
+      "idx": 83,
+      "version": "7",
+      "when": 1783711959514,
+      "tag": "0083_closed_ken_ellis",
+      "breakpoints": true
     }
   ]
 }

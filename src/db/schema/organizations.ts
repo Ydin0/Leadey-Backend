@@ -86,6 +86,9 @@ export const users = pgTable("users", {
   email: text("email").notNull(),
   firstName: text("first_name"),
   lastName: text("last_name"),
+  /** E.164 phone captured at sign-up (or edited in profile), synced from the
+   *  Clerk user's unsafe_metadata.phone / primary phone number. */
+  phone: text("phone"),
   imageUrl: text("image_url"),
   role: text("role"),
   platformRole: text("platform_role"),
