@@ -223,13 +223,30 @@ router.post(
 
 // ─── GET /billing/invoices ──────────────────────────────────────────
 // List invoices from Stripe
+/** Short uppercase org code for customer-facing invoice references — the org
+ *  name's first word (e.g. "Hyrra LTD" → "HYRRA", "Octogle Technologies" →
+ *  "OCTOGL"), so the reference reads cleanly. */
+function orgCode(name: string | null | undefined): string {
+  const firstWord = (name || "").trim().split(/\s+/)[0] || "";
+  return firstWord.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 6) || "ORG";
+}
+
+/** A Leadey-branded, org-specific reference for a Stripe subscription invoice,
+ *  shown to the customer instead of Stripe's raw number (e.g. "DE2MFV1G-0001").
+ *  Deterministic: reuses Stripe's per-customer sequence suffix so it's stable.
+ *  → "LEA-HYRRA-0001". */
+function subscriptionRef(orgName: string | null | undefined, stripeNumber: string | null, stripeId: string): string {
+  const seqRaw = (stripeNumber && stripeNumber.match(/(\d+)\s*$/)?.[1]) || stripeId.replace(/[^0-9]/g, "").slice(-4) || "1";
+  return `LEA-${orgCode(orgName)}-${seqRaw.padStart(4, "0")}`;
+}
+
 router.get(
   "/billing/invoices",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
 
     const [org] = await db
-      .select({ stripeCustomerId: organizations.stripeCustomerId })
+      .select({ stripeCustomerId: organizations.stripeCustomerId, name: organizations.name })
       .from(organizations)
       .where(eq(organizations.id, orgId));
 
@@ -256,7 +273,7 @@ router.get(
     res.json({
       data: invoices.data.map((inv) => ({
         id: inv.id,
-        number: inv.number,
+        number: subscriptionRef(org.name, inv.number, inv.id),
         amountDue: inv.amount_due,
         amountPaid: inv.amount_paid,
         currency: inv.currency,
@@ -443,7 +460,7 @@ router.get(
     res.json({
       data: {
         id: inv.id,
-        number: inv.number || inv.id,
+        number: subscriptionRef(org.name, inv.number, inv.id),
         type: "subscription",
         status: inv.status === "paid" ? "paid" : "open",
         period: null,
@@ -539,7 +556,7 @@ router.get(
     res.json({
       data: {
         id: pi.id,
-        number: pi.id.replace(/^pi_/, "").slice(0, 12).toUpperCase(),
+        number: `LEA-${orgCode(org.name)}-${pi.id.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(-5)}`,
         type: "topup",
         status: pi.status === "succeeded" ? "paid" : "open",
         period: null,
