@@ -145,6 +145,48 @@ function humanizeKey(key: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/** Append-only create of a single custom field definition with a chosen type
+ *  and options. Idempotent by key: if a field with the same slug already
+ *  exists it is returned unchanged (never altered or duplicated). Lets the CSV
+ *  mapping step create a field inline without the full replace-all editor or
+ *  the settings.manageOrgConfig permission. */
+export async function createFieldDefinition(
+  orgId: string,
+  input: { label: string; fieldType?: string; options?: unknown; isRequired?: boolean },
+): Promise<CustomFieldDef> {
+  const label = (input.label || "").trim();
+  const key = slugifyFieldKey(label);
+  if (!label || !key) throw new Error("A field name is required");
+
+  const existing = await db.query.leadFieldDefinitions.findFirst({
+    where: and(eq(leadFieldDefinitions.organizationId, orgId), eq(leadFieldDefinitions.key, key)),
+  });
+  if (existing) return toDef(existing);
+
+  const fieldType: CustomFieldType = VALID_TYPES.includes(input.fieldType as CustomFieldType)
+    ? (input.fieldType as CustomFieldType)
+    : "text";
+  const options =
+    fieldType === "select" && Array.isArray(input.options)
+      ? input.options.map((o) => String(o).trim()).filter(Boolean).slice(0, 100)
+      : [];
+  const count = await db.$count(leadFieldDefinitions, eq(leadFieldDefinitions.organizationId, orgId));
+  const row = {
+    id: createId("lfd"),
+    organizationId: orgId,
+    key,
+    label,
+    fieldType,
+    options,
+    isRequired: !!input.isRequired,
+    sortOrder: count,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  await db.insert(leadFieldDefinitions).values(row);
+  return toDef(row as typeof leadFieldDefinitions.$inferSelect);
+}
+
 /** Ensure a custom field definition exists for the org, creating a simple text
  *  field if it doesn't. Idempotent and INSERT-only — never deletes or alters an
  *  existing definition. Used so a webhook can map to a custom field without it
