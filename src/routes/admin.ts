@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, sql, like, or, and, gte, lt, desc } from "drizzle-orm";
+import { eq, sql, like, or, and, gte, lt, desc, ne, gt, isNotNull } from "drizzle-orm";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { regulatoryBundles } from "../db/schema/regulatory-bundles";
@@ -1902,6 +1902,58 @@ const COST_RATES = {
 const GBP_TO_USD = 1.27;
 const COST_STALE_MS = 6 * 60 * 60 * 1000; // auto-sync if data older than 6h
 
+/** Per-org fallback rates for usage whose exact Twilio price hasn't synced yet.
+ *  The flat global constants (voice $0.014/min) badly under-estimate high-rate
+ *  destinations (e.g. UK mobile ≈ $0.069/min), so unsynced usage would be
+ *  under-charged until the price sync lands. Instead we derive each org's own
+ *  blended rate from its recently-synced traffic, so the estimate tracks what
+ *  that org actually pays. Falls back to the global constant when the org has
+ *  too little synced history, and clamps to sane bounds. */
+async function orgFallbackRates(orgId: string): Promise<{ voicePerMin: number; smsPerMsg: number }> {
+  const since = new Date(Date.now() - 45 * 86400000);
+  const clamp = (v: number, lo: number, hi: number, dflt: number) =>
+    Number.isFinite(v) && v >= lo && v <= hi ? v : dflt;
+
+  const [[v], [s]] = await Promise.all([
+    db
+      .select({
+        cost: sql<number>`COALESCE(SUM(${callRecords.twilioPrice}), 0)::float8`,
+        mins: sql<number>`(COALESCE(SUM(${SANE_DURATION}), 0)::float8) / 60.0`,
+        n: sql<number>`COUNT(*)::int`,
+      })
+      .from(callRecords)
+      .where(and(
+        eq(callRecords.organizationId, orgId),
+        eq(callRecords.direction, "outbound"),
+        isNotNull(callRecords.twilioPrice),
+        gt(callRecords.twilioPrice, 0),
+        gte(callRecords.calledAt, since),
+      )),
+    db
+      .select({
+        cost: sql<number>`COALESCE(SUM(${smsMessages.twilioPrice}), 0)::float8`,
+        n: sql<number>`COUNT(*)::int`,
+      })
+      .from(smsMessages)
+      .where(and(
+        eq(smsMessages.organizationId, orgId),
+        ne(smsMessages.direction, "inbound"),
+        isNotNull(smsMessages.twilioPrice),
+        gt(smsMessages.twilioPrice, 0),
+        gte(smsMessages.createdAt, since),
+      )),
+  ]);
+
+  // Require a minimum sample before trusting the org's own average.
+  const voicePerMin = v && v.n >= 20 && v.mins > 0
+    ? clamp(v.cost / v.mins, 0.005, 2, COST_RATES.voicePerMinFallback)
+    : COST_RATES.voicePerMinFallback;
+  const smsPerMsg = s && s.n >= 10
+    ? clamp(s.cost / s.n, 0.002, 0.5, COST_RATES.smsPerMsgFallback)
+    : COST_RATES.smsPerMsgFallback;
+  return { voicePerMin, smsPerMsg };
+}
+
 interface MonthRange {
   start: Date;
   end: Date;
@@ -3184,7 +3236,13 @@ export async function buildTelephonyInvoice(
   roundUp = false,
 ) {
   const range = monthRange(period);
-  const R = COST_RATES;
+
+  // Fallback rates for usage not yet price-synced — derived from THIS org's
+  // own recent real Twilio cost, so a high-rate destination (e.g. UK mobile)
+  // isn't under-estimated by a flat global guess.
+  const rates = await orgFallbackRates(orgId);
+  const voicePerMinFallback = rates.voicePerMin;
+  const smsPerMsgFallback = rates.smsPerMsg;
 
   // Round-up mode: each item's REAL cost is ceiled to the next cent before
   // summing (0.014 → 0.02), for synced prices and per-call/per-msg fallback
@@ -3192,11 +3250,11 @@ export async function buildTelephonyInvoice(
   const callPrice = roundUp
     ? sql`CEIL(${callRecords.twilioPrice} * 100) / 100.0`
     : sql`${callRecords.twilioPrice}`;
-  const callFallback = sql`CEIL((${SANE_DURATION} / 60.0) * ${R.voicePerMinFallback} * 100) / 100.0`;
+  const callFallback = sql`CEIL((${SANE_DURATION} / 60.0) * ${voicePerMinFallback} * 100) / 100.0`;
   const smsPrice = roundUp
     ? sql`CEIL(${smsMessages.twilioPrice} * 100) / 100.0`
     : sql`${smsMessages.twilioPrice}`;
-  const smsFallbackRate = roundUp ? Math.ceil(R.smsPerMsgFallback * 100) / 100 : R.smsPerMsgFallback;
+  const smsFallbackRate = roundUp ? Math.ceil(smsPerMsgFallback * 100) / 100 : smsPerMsgFallback;
 
   const [call] = await db
     .select({
@@ -3256,9 +3314,9 @@ export async function buildTelephonyInvoice(
   // Real Twilio charge per bucket (billed price where synced, per-unit
   // fallback for the not-yet-synced remainder), then × multiplier.
   const voiceOutCost =
-    call.actualOut + (roundUp ? call.unsyncedCeilOut : (call.unsyncedSecondsOut / 60) * R.voicePerMinFallback);
+    call.actualOut + (roundUp ? call.unsyncedCeilOut : (call.unsyncedSecondsOut / 60) * voicePerMinFallback);
   const voiceInCost =
-    call.actualIn + (roundUp ? call.unsyncedCeilIn : (call.unsyncedSecondsIn / 60) * R.voicePerMinFallback);
+    call.actualIn + (roundUp ? call.unsyncedCeilIn : (call.unsyncedSecondsIn / 60) * voicePerMinFallback);
   const smsOutCost = smsAgg.actualOut + smsAgg.unsyncedOut * smsFallbackRate;
   const smsInCost = smsAgg.actualIn + smsAgg.unsyncedIn * smsFallbackRate;
   const rentalCost = rental?.rentals ?? 0;

@@ -268,3 +268,28 @@ export async function runCostSync(opts: {
     syncInProgress = false;
   }
 }
+
+/** Background scheduler: pull exact Twilio prices onto recent usage on a timer,
+ *  so credit deductions/invoices settle to real cost within the interval
+ *  instead of only when a platform admin opens the cost dashboard. Prices on
+ *  Twilio settle within minutes-to-hours, so a rolling recent window is enough. */
+const COST_SYNC_INTERVAL_MS = 30 * 60 * 1000; // every 30 min
+const COST_SYNC_WINDOW_DAYS = 4;
+
+export function startCostSyncScheduler(): void {
+  const tick = async () => {
+    try {
+      const until = new Date();
+      const since = new Date(until.getTime() - COST_SYNC_WINDOW_DAYS * DAY_MS);
+      const r = await runCostSync({ since, until });
+      if (!r.skipped && (r.calls > 0 || r.messages > 0)) {
+        console.log(`[cost-sync] synced ${r.calls} calls, ${r.messages} messages`);
+      }
+    } catch (err) {
+      console.error("[cost-sync] scheduled run failed:", err);
+    }
+  };
+  // Kick once shortly after boot, then on the interval.
+  setTimeout(() => { void tick(); }, 60_000);
+  setInterval(() => { void tick(); }, COST_SYNC_INTERVAL_MS);
+}
