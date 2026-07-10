@@ -12,6 +12,7 @@ import { creditInvoicePayment, reverseInvoiceCredit, adjustTelephonyBalance, get
 import { telephonyCreditTransactions } from "../db/schema/telephony-credits";
 import { creditTransactions } from "../db/schema/credits";
 import { ApiError, createId, normalizeString } from "../lib/helpers";
+import { subscriptionRef, topupRef } from "../lib/invoice-ref";
 import { stripe, getPlanConfig } from "../lib/stripe";
 import { recordAudit, type AuditAction } from "../lib/audit-log";
 import { getBalance, setOrgBalance } from "../lib/credits";
@@ -723,7 +724,7 @@ router.get(
   "/organizations/:id/invoices",
   asyncHandler<OrgParams>(async (req, res) => {
     const [org] = await db
-      .select({ stripeCustomerId: organizations.stripeCustomerId })
+      .select({ stripeCustomerId: organizations.stripeCustomerId, name: organizations.name })
       .from(organizations)
       .where(eq(organizations.id, req.params.id));
 
@@ -754,6 +755,9 @@ router.get(
       .map((pi: any) => ({
         id: pi.id,
         description: labelForPi(pi),
+        // The reference the CUSTOMER sees for this payment (kept in lockstep
+        // with billing.ts via the shared helper), so admin lines up with them.
+        customerRef: topupRef(org.name, pi.id),
         amount: pi.amount_received,
         currency: pi.currency,
         status: pi.status,
@@ -765,6 +769,8 @@ router.get(
         invoices: invoices.data.map((inv: any) => ({
           id: inv.id,
           number: inv.number,
+          // Customer-facing reference (matches the customer billing page).
+          customerRef: subscriptionRef(org.name, inv.number, inv.id),
           amountDue: inv.amount_due,
           amountPaid: inv.amount_paid,
           amountRefunded: inv.amount_refunded || 0,
