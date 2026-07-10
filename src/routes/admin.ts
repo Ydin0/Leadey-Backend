@@ -728,35 +728,61 @@ router.get(
       .where(eq(organizations.id, req.params.id));
 
     if (!org?.stripeCustomerId) {
-      res.json({ data: [] });
+      res.json({ data: { invoices: [], payments: [] } });
       return;
     }
 
-    const invoices = await stripe.invoices.list({
-      customer: org.stripeCustomerId,
-      limit: 24,
-    });
+    // Subscription invoices + standalone payments (telephony top-ups and
+    // one-off charges are Stripe PaymentIntents, NOT invoices, so they'd never
+    // show without listing them separately).
+    const [invoices, paymentIntents] = await Promise.all([
+      stripe.invoices.list({ customer: org.stripeCustomerId, limit: 24 }),
+      stripe.paymentIntents.list({ customer: org.stripeCustomerId, limit: 50 }),
+    ]);
+
+    const labelForPi = (pi: any): string => {
+      const t = pi.metadata?.type;
+      if (t === "telephony_autotopup") return "Calling credit auto top-up";
+      if (t === "telephony_topup" || t === "telephony_topup_checkout") return "Calling credit top-up";
+      return pi.description || "Payment";
+    };
+
+    // Only PIs NOT tied to a subscription invoice (those already appear in the
+    // invoices list), and only ones that actually took money.
+    const payments = paymentIntents.data
+      .filter((pi: any) => !pi.invoice && pi.status === "succeeded" && pi.amount_received > 0)
+      .map((pi: any) => ({
+        id: pi.id,
+        description: labelForPi(pi),
+        amount: pi.amount_received,
+        currency: pi.currency,
+        status: pi.status,
+        createdAt: new Date(pi.created * 1000).toISOString(),
+      }));
 
     res.json({
-      data: invoices.data.map((inv: any) => ({
-        id: inv.id,
-        number: inv.number,
-        amountDue: inv.amount_due,
-        amountPaid: inv.amount_paid,
-        amountRefunded: inv.amount_refunded || 0,
-        currency: inv.currency,
-        status: inv.status,
-        paymentIntent: inv.payment_intent,
-        periodStart: inv.period_start
-          ? new Date(inv.period_start * 1000).toISOString()
-          : null,
-        periodEnd: inv.period_end
-          ? new Date(inv.period_end * 1000).toISOString()
-          : null,
-        invoiceUrl: inv.hosted_invoice_url,
-        invoicePdf: inv.invoice_pdf,
-        createdAt: new Date(inv.created * 1000).toISOString(),
-      })),
+      data: {
+        invoices: invoices.data.map((inv: any) => ({
+          id: inv.id,
+          number: inv.number,
+          amountDue: inv.amount_due,
+          amountPaid: inv.amount_paid,
+          amountRefunded: inv.amount_refunded || 0,
+          currency: inv.currency,
+          status: inv.status,
+          paymentIntent: inv.payment_intent,
+          periodStart: inv.period_start
+            ? new Date(inv.period_start * 1000).toISOString()
+            : null,
+          periodEnd: inv.period_end
+            ? new Date(inv.period_end * 1000).toISOString()
+            : null,
+          invoiceUrl: inv.hosted_invoice_url,
+          invoicePdf: inv.invoice_pdf,
+          createdAt: new Date(inv.created * 1000).toISOString(),
+        })),
+        payments,
+      },
     });
   }),
 );

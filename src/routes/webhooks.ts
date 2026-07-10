@@ -1576,6 +1576,23 @@ router.post("/stripe", async (req: Request, res: Response) => {
               });
             }
           }
+
+          // Branded payment receipt for the subscription charge.
+          const amountPaid = invoice.amount_paid ?? 0;
+          if (amountPaid > 0) {
+            const planLabel = org.plan && org.plan !== "cancelled"
+              ? `Leadey subscription — ${org.plan.charAt(0).toUpperCase()}${org.plan.slice(1)} plan`
+              : "Leadey subscription";
+            const { sendPaymentReceipt } = await import("../lib/payment-receipt");
+            await sendPaymentReceipt({
+              orgId: org.id,
+              reference: invoice.id,
+              amountMinor: amountPaid,
+              currency: invoice.currency || "usd",
+              description: planLabel,
+              paidAtMs: invoice.created ? invoice.created * 1000 : undefined,
+            });
+          }
         }
         break;
       }
@@ -1597,6 +1614,24 @@ router.post("/stripe", async (req: Request, res: Response) => {
           );
           await settleOpenTelephonyInvoices(pi.metadata.orgId);
           console.log(`[Stripe] telephony top-up ${pi.id} ensured for org ${pi.metadata.orgId}`);
+        }
+        // Payment receipt for standalone charges (top-ups, one-off checkouts).
+        // Invoice-linked PIs (subscriptions) get their receipt from
+        // invoice.payment_succeeded, so skip those here to avoid a double send.
+        if (!pi.invoice && pi.metadata?.orgId) {
+          const description =
+            piType === "telephony_autotopup"
+              ? "Calling credit auto top-up"
+              : "Calling credit top-up";
+          const { sendPaymentReceipt } = await import("../lib/payment-receipt");
+          await sendPaymentReceipt({
+            orgId: pi.metadata.orgId,
+            reference: pi.id,
+            amountMinor: pi.amount,
+            currency: pi.currency,
+            description,
+            paidAtMs: pi.created ? pi.created * 1000 : undefined,
+          });
         }
         break;
       }
