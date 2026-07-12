@@ -105,7 +105,7 @@ const OAUTH = {
   google: {
     authorize: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
-    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
     clientId: () => process.env.GOOGLE_CLIENT_ID || "",
     clientSecret: () => process.env.GOOGLE_CLIENT_SECRET || "",
     extraAuth: { access_type: "offline", prompt: "consent" } as Record<string, string>,

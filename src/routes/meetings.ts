@@ -4,12 +4,16 @@ import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { scheduledMeetings } from "../db/schema/scheduled-meetings";
 import { emailAccounts } from "../db/schema/email-accounts";
+import { bookingPages } from "../db/schema/booking-pages";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { accountCanSchedule } from "../lib/email-providers";
+import { getBusyIntervals } from "../lib/availability";
 import { createMeetingEvent, cancelMeetingEvent, type MeetingAttendee } from "../lib/meeting-scheduler";
+
+type Account = typeof emailAccounts.$inferSelect;
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
 
 type AsyncHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;
@@ -33,12 +37,9 @@ router.post(
     const leadId = String(req.params.leadId);
     const b = req.body || {};
 
-    const hostAccountId = String(b.hostAccountId || "");
-    const title = String(b.title || "").trim() || "Meeting";
+    const bookingPageId = b.bookingPageId ? String(b.bookingPageId) : null;
     const description = b.description ? String(b.description) : undefined;
     const startISO = String(b.startISO || "");
-    const durationMin = Math.max(5, Math.min(600, Number(b.durationMin) || 30));
-    const video = b.video !== false;
     const location = b.location ? String(b.location) : undefined;
     const inviteeEmails: string[] = Array.isArray(b.inviteeEmails) ? b.inviteeEmails.map(String) : [];
     const guestEmails: string[] = Array.isArray(b.guestEmails) ? b.guestEmails.map(String) : [];
@@ -52,10 +53,27 @@ router.post(
       .where(and(eq(leads.id, leadId), eq(funnels.organizationId, orgId)));
     if (!lead) throw new ApiError(404, "Lead not found");
 
-    const [account] = await db
-      .select()
-      .from(emailAccounts)
-      .where(and(eq(emailAccounts.id, hostAccountId), eq(emailAccounts.organizationId, orgId)));
+    // Resolve the host account + meeting defaults. A booking page (Calendly
+    // flow) fixes the host = page owner's calendar-capable mailbox + its
+    // duration/video; otherwise an explicit hostAccountId (ad-hoc flow) is used.
+    let account: Account | undefined;
+    let durationMin = Math.max(5, Math.min(600, Number(b.durationMin) || 30));
+    let video = b.video !== false;
+    let title = String(b.title || "").trim() || "Meeting";
+    let page: typeof bookingPages.$inferSelect | undefined;
+    if (bookingPageId) {
+      [page] = await db.select().from(bookingPages).where(and(eq(bookingPages.id, bookingPageId), eq(bookingPages.organizationId, orgId)));
+      if (!page) throw new ApiError(404, "Booking page not found");
+      const accts = await db.select().from(emailAccounts).where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, page.userId)));
+      const capable = accts.filter((a) => a.status === "active" && accountCanSchedule(a));
+      account = capable.find((a) => a.isDefault) || capable[0];
+      durationMin = page.durationMin;
+      video = page.video;
+      if (!title || title === "Meeting") title = page.name;
+    } else {
+      const hostAccountId = String(b.hostAccountId || "");
+      [account] = await db.select().from(emailAccounts).where(and(eq(emailAccounts.id, hostAccountId), eq(emailAccounts.organizationId, orgId)));
+    }
     if (!account) throw new ApiError(400, "Choose a host with a connected mailbox.");
     if (!accountCanSchedule(account)) {
       throw new ApiError(400, "That mailbox can't create meetings yet — reconnect it in Settings → Email Accounts to grant calendar access.");
@@ -75,6 +93,14 @@ router.post(
 
     const start = new Date(startISO);
     const end = new Date(start.getTime() + durationMin * 60_000);
+
+    // The slot may have been taken since availability was fetched — re-check.
+    if (page?.respectCalendar) {
+      const busy = await getBusyIntervals(account, new Date(start.getTime() - 60_000), new Date(end.getTime() + 60_000)).catch(() => []);
+      if (busy.some((bz) => start.getTime() < bz.end.getTime() && end.getTime() > bz.start.getTime())) {
+        throw new ApiError(409, "That time was just taken — pick another slot.");
+      }
+    }
 
     let created;
     try {
