@@ -18,7 +18,7 @@ export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";
 export { linkedinAccounts } from "./linkedin-accounts";
 export { scheduledMeetings } from "./scheduled-meetings";
-export { bookingPages } from "./booking-pages";
+export { bookingPages, bookingPageMembers } from "./booking-pages";
 export { organizations, users } from "./organizations";
 export { orgRoles } from "./org-roles";
 export { organizationMemberships } from "./organization-memberships";

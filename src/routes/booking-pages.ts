@@ -1,14 +1,17 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq, asc } from "drizzle-orm";
+import { and, eq, asc, inArray } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
-import { bookingPages, DEFAULT_AVAILABILITY, type WeeklyAvailability } from "../db/schema/booking-pages";
+import { bookingPages, bookingPageMembers, DEFAULT_AVAILABILITY, type WeeklyAvailability } from "../db/schema/booking-pages";
 import { emailAccounts } from "../db/schema/email-accounts";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, zonedToUtc } from "../lib/availability";
+import { getPerms } from "../lib/permission-service";
+import { hasPerm } from "../lib/permission-catalog";
+import { resolveHostAccount, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug } from "../lib/booking-service";
 
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
@@ -20,24 +23,41 @@ function asyncHandler(handler: AsyncHandler) {
   };
 }
 
-function serialize(p: Page) {
+/** Assigning members + publishing pages is a team-management action. */
+async function canManageTeam(req: Request): Promise<boolean> {
+  const perms = await getPerms(req);
+  return hasPerm(perms.permissions, "settings.manageTeam");
+}
+
+function serialize(p: Page, memberIds: string[] = []) {
   return {
     id: p.id, userId: p.userId, name: p.name, durationMin: p.durationMin, video: p.video,
     timezone: p.timezone, availability: p.availability, respectCalendar: p.respectCalendar,
     roundRobin: p.roundRobin,
+    isPublic: p.isPublic, publicSlug: p.publicSlug,
+    members: memberIds,
     bufferBeforeMin: p.bufferBeforeMin, bufferAfterMin: p.bufferAfterMin,
     minNoticeMin: p.minNoticeMin, maxDaysAhead: p.maxDaysAhead, isActive: p.isActive, isDefault: p.isDefault,
   };
 }
 
-/** The calendar-capable email account that hosts a given user's meetings. */
-async function resolveHostAccount(orgId: string, userId: string): Promise<Account | null> {
-  const accts = await db
-    .select()
-    .from(emailAccounts)
-    .where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, userId)));
-  const capable = accts.filter((a) => a.status === "active" && accountCanSchedule(a));
-  return capable.find((a) => a.isDefault) || capable[0] || null;
+/** Replace a page's assigned member set (owner excluded — always a host). */
+async function syncMembers(pageId: string, ownerId: string, members: unknown): Promise<void> {
+  const desired = new Set(
+    (Array.isArray(members) ? members : [])
+      .map((m) => (typeof m === "string" ? m : (m as { userId?: string })?.userId))
+      .filter((x): x is string => !!x && x !== ownerId),
+  );
+  const existing = await db.select({ userId: bookingPageMembers.userId }).from(bookingPageMembers).where(eq(bookingPageMembers.bookingPageId, pageId));
+  const have = new Set(existing.map((e) => e.userId));
+  const toAdd = [...desired].filter((u) => !have.has(u));
+  const toRemove = [...have].filter((u) => !desired.has(u));
+  if (toRemove.length) {
+    await db.delete(bookingPageMembers).where(and(eq(bookingPageMembers.bookingPageId, pageId), inArray(bookingPageMembers.userId, toRemove)));
+  }
+  if (toAdd.length) {
+    await db.insert(bookingPageMembers).values(toAdd.map((u) => ({ id: createId("bpm"), bookingPageId: pageId, userId: u, createdAt: new Date() }))).onConflictDoNothing();
+  }
 }
 
 const router = Router();
@@ -65,9 +85,19 @@ router.get(
       await db.insert(bookingPages).values(row);
       rows = [row as Page];
     }
-    res.json({ data: rows.map(serialize) });
+    const memberMap = await membersByPage(rows.map((r) => r.id));
+    res.json({ data: rows.map((p) => serialize(p, memberMap.get(p.id) || [])) });
   }),
 );
+
+/** Assigned member ids for a set of pages. */
+async function membersByPage(pageIds: string[]): Promise<Map<string, string[]>> {
+  const map = new Map<string, string[]>();
+  if (pageIds.length === 0) return map;
+  const rows = await db.select().from(bookingPageMembers).where(inArray(bookingPageMembers.bookingPageId, pageIds));
+  for (const r of rows) (map.get(r.bookingPageId) ?? map.set(r.bookingPageId, []).get(r.bookingPageId)!).push(r.userId);
+  return map;
+}
 
 // ─── GET /booking-pages/hosts — org hosts (calendar-capable) + their pages ─
 router.get(
@@ -100,7 +130,7 @@ router.get(
     }
     const hosts = [...byUser.values()].map((h) => ({
       ...h,
-      pages: pages.filter((p) => p.userId === h.userId).map(serialize),
+      pages: pages.filter((p) => p.userId === h.userId).map((p) => serialize(p)),
     }));
     res.json({ data: hosts });
   }),
@@ -128,10 +158,19 @@ router.post(
       bufferAfterMin: clampInt(b.bufferAfterMin, 0, 240, 0),
       minNoticeMin: clampInt(b.minNoticeMin, 0, 20160, 240),
       maxDaysAhead: clampInt(b.maxDaysAhead, 1, 365, 60),
-      isActive: true, isDefault: false, createdAt: now, updatedAt: now,
+      isActive: true, isDefault: false,
+      isPublic: false, publicSlug: null as string | null,
+      createdAt: now, updatedAt: now,
     };
+    // Members + publishing are team-management actions.
+    let members: string[] = [];
+    if ((b.members !== undefined || b.isPublic) && (await canManageTeam(req))) {
+      if (b.isPublic) { row.isPublic = true; row.publicSlug = await mintUniqueSlug(row.name); }
+      members = Array.isArray(b.members) ? b.members.map(String).filter((u: string) => u !== userId) : [];
+    }
     await db.insert(bookingPages).values(row);
-    res.status(201).json({ data: serialize(row as Page) });
+    if (members.length) await syncMembers(row.id, userId, members);
+    res.status(201).json({ data: serialize(row as Page, members) });
   }),
 );
 
@@ -143,7 +182,10 @@ router.patch(
     const userId = getAuth(req)?.userId || "";
     const id = String(req.params.id);
     const [page] = await db.select().from(bookingPages).where(and(eq(bookingPages.id, id), eq(bookingPages.organizationId, orgId)));
-    if (!page || page.userId !== userId) throw new ApiError(404, "Booking page not found");
+    if (!page) throw new ApiError(404, "Booking page not found");
+    const isManager = await canManageTeam(req);
+    // Owner edits their own page; a manager can edit any page.
+    if (page.userId !== userId && !isManager) throw new ApiError(404, "Booking page not found");
     const b = req.body || {};
     const set: Partial<Page> = { updatedAt: new Date() };
     if (b.name !== undefined) set.name = String(b.name).slice(0, 120);
@@ -158,9 +200,15 @@ router.patch(
     if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 20160, page.minNoticeMin);
     if (b.maxDaysAhead !== undefined) set.maxDaysAhead = clampInt(b.maxDaysAhead, 1, 365, page.maxDaysAhead);
     if (b.isActive !== undefined) set.isActive = !!b.isActive;
+    // Publishing + members require team-management permission.
+    if (b.isPublic !== undefined && isManager) {
+      set.isPublic = !!b.isPublic;
+      if (set.isPublic && !page.publicSlug) set.publicSlug = await mintUniqueSlug(set.name ?? page.name);
+    }
     await db.update(bookingPages).set(set).where(eq(bookingPages.id, id));
+    if (b.members !== undefined && isManager) await syncMembers(id, page.userId, b.members);
     const [updated] = await db.select().from(bookingPages).where(eq(bookingPages.id, id));
-    res.json({ data: serialize(updated) });
+    res.json({ data: serialize(updated, await getPageMemberIds(id)) });
   }),
 );
 
@@ -172,7 +220,7 @@ router.delete(
     const userId = getAuth(req)?.userId || "";
     const id = String(req.params.id);
     const [page] = await db.select().from(bookingPages).where(and(eq(bookingPages.id, id), eq(bookingPages.organizationId, orgId)));
-    if (!page || page.userId !== userId) throw new ApiError(404, "Booking page not found");
+    if (!page || (page.userId !== userId && !(await canManageTeam(req)))) throw new ApiError(404, "Booking page not found");
     await db.delete(bookingPages).where(eq(bookingPages.id, id));
     res.json({ data: { deleted: true } });
   }),
@@ -191,18 +239,9 @@ router.get(
     const [page] = await db.select().from(bookingPages).where(and(eq(bookingPages.id, id), eq(bookingPages.organizationId, orgId)));
     if (!page) throw new ApiError(404, "Booking page not found");
 
-    let busy: { start: Date; end: Date }[] = [];
-    if (page.respectCalendar) {
-      const host = await resolveHostAccount(orgId, page.userId);
-      if (host) {
-        const [fy, fm, fd] = from.split("-").map(Number);
-        const [ty, tm, td] = to.split("-").map(Number);
-        const fromUtc = new Date(zonedToUtc(fy, fm, fd, 0, 0, page.timezone).getTime() - 86_400_000);
-        const toUtc = new Date(zonedToUtc(ty, tm, td, 23, 59, page.timezone).getTime() + 86_400_000);
-        busy = await getBusyIntervals(host, fromUtc, toUtc).catch(() => []);
-      }
-    }
-    const days = computeSlots(page as WeeklyPage, from, to, new Date(), busy);
+    // Combined availability across the page's host pool (owner + members).
+    const hosts = await getPageHosts(orgId, page);
+    const days = await computePageAvailability(page, hosts, from, to);
     res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days } });
   }),
 );

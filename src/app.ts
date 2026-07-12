@@ -13,6 +13,7 @@ import unipileRouter from "./routes/unipile";
 import linkedinRouter, { linkedinPublicRouter } from "./routes/linkedin";
 import meetingsRouter from "./routes/meetings";
 import bookingPagesRouter from "./routes/booking-pages";
+import { bookingPublicRouter } from "./routes/booking-public";
 import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
 import phoneLineRouter from "./routes/phone-lines";
 import scraperRouter from "./routes/scrapers";
@@ -115,6 +116,7 @@ app.use(emailPublicRouter);
 app.use(calendlyPublicRouter);
 app.use(calendarPublicRouter);
 app.use(linkedinPublicRouter);
+app.use(bookingPublicRouter);
 
 // Public, versioned API. Authenticated by org-scoped API key (Bearer), NOT Clerk.
 // Distinct /v1 prefix, so ordering vs the /api routers below is irrelevant.

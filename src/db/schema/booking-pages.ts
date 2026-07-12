@@ -1,4 +1,4 @@
-import { pgTable, text, integer, boolean, jsonb, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, jsonb, timestamp, index, uniqueIndex, unique } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 /** A single "HH:MM" 24h time-range within a day. */
@@ -57,6 +57,9 @@ export const bookingPages = pgTable(
     minNoticeMin: integer("min_notice_min").notNull().default(240),
     /** How far ahead slots are offered, in days. */
     maxDaysAhead: integer("max_days_ahead").notNull().default(60),
+    /** Shareable public link: /book/<publicSlug>. Minted on first publish. */
+    isPublic: boolean("is_public").notNull().default(false),
+    publicSlug: text("public_slug"),
     isActive: boolean("is_active").notNull().default(true),
     isDefault: boolean("is_default").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -64,5 +67,24 @@ export const bookingPages = pgTable(
   },
   (t) => [
     index("booking_pages_org_user_idx").on(t.organizationId, t.userId),
+    uniqueIndex("booking_pages_slug_uq").on(t.publicSlug),
+  ],
+);
+
+/** Members assigned as hosts on a booking page — the page's round-robin pool
+ *  (alongside the owner). Bookings auto-assign a free host from this set. */
+export const bookingPageMembers = pgTable(
+  "booking_page_members",
+  {
+    id: text("id").primaryKey(),
+    bookingPageId: text("booking_page_id")
+      .notNull()
+      .references(() => bookingPages.id, { onDelete: "cascade" }),
+    userId: text("user_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    unique("booking_page_members_uq").on(t.bookingPageId, t.userId),
+    index("booking_page_members_page_idx").on(t.bookingPageId),
   ],
 );
