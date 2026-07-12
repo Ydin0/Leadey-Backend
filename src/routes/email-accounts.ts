@@ -3,6 +3,7 @@ import { getAuth } from "@clerk/express";
 import { eq, and, asc, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/schema/email-accounts";
+import { emailSignatures } from "../db/schema/email-signatures";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
@@ -80,6 +81,7 @@ function serializeAccount(a: typeof emailAccounts.$inferSelect) {
     email: a.email,
     fromName: a.fromName,
     signature: a.signature ?? null,
+    signatureId: a.signatureId ?? null,
     status: a.status,
     isDefault: a.isDefault,
     createdAt: a.createdAt.toISOString(),
@@ -164,14 +166,21 @@ router.patch(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
-    const body = req.body as { fromName?: string; signature?: string | null };
+    const body = req.body as { fromName?: string; signature?: string | null; signatureId?: string | null };
 
-    const patch: Partial<{ fromName: string; signature: string | null; updatedAt: Date }> = { updatedAt: new Date() };
+    const patch: Partial<{ fromName: string; signature: string | null; signatureId: string | null; updatedAt: Date }> = { updatedAt: new Date() };
     if (body.fromName !== undefined) patch.fromName = String(body.fromName).slice(0, 120);
+    // A shared signature and a raw custom one are mutually exclusive — setting
+    // one clears the other.
+    if (body.signatureId !== undefined) {
+      patch.signatureId = body.signatureId || null;
+      if (patch.signatureId) patch.signature = null;
+    }
     if (body.signature !== undefined) {
       const sig = body.signature == null ? null : String(body.signature);
-      if (sig && sig.length > 10_000) throw new ApiError(400, "Signature is too long (max 10,000 characters)");
+      if (sig && sig.length > 20_000) throw new ApiError(400, "Signature is too long (max 20,000 characters)");
       patch.signature = sig && sig.trim() ? sig : null;
+      if (patch.signature) patch.signatureId = null;
     }
 
     const [updated] = await db
@@ -331,8 +340,11 @@ router.post(
     if (!account) throw new ApiError(400, "No connected email account. Connect one in Settings → Email Accounts.");
 
     const messageId = createId("emsg");
-    // Signature first, then the open-tracking pixel (best-effort).
-    const htmlWithSig = withSignature(bodyHtml, account.signature);
+    // Signature first, then the open-tracking pixel (best-effort). A shared
+    // signature is resolved with this rep's {{sender_*}} details.
+    const { resolveAccountSignature } = await import("../lib/signature");
+    const resolvedSig = await resolveAccountSignature(account);
+    const htmlWithSig = withSignature(bodyHtml, resolvedSig);
     const pixel = `<img src="${backendBase()}/track/email/${messageId}/open.gif" width="1" height="1" alt="" style="display:none" />`;
     const html = `${htmlWithSig}${pixel}`;
     const { files: attachments, refs: attachmentRefs } = await loadAttachments(orgId, req.body?.attachmentIds);
@@ -469,6 +481,130 @@ router.get(
     );
     res.setHeader("Content-Length", String(buffer.length));
     res.end(buffer);
+  }),
+);
+
+// ── Shared email signatures (org-wide, variable-driven) ─────────────
+
+function serializeSignature(s: typeof emailSignatures.$inferSelect) {
+  return {
+    id: s.id,
+    name: s.name,
+    contentHtml: s.contentHtml,
+    createdBy: s.createdBy,
+    createdAt: s.createdAt.toISOString(),
+    updatedAt: s.updatedAt.toISOString(),
+  };
+}
+
+// GET /api/email/signatures — the org's shared signatures.
+router.get(
+  "/email/signatures",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const rows = await db
+      .select()
+      .from(emailSignatures)
+      .where(eq(emailSignatures.organizationId, orgId))
+      .orderBy(asc(emailSignatures.name));
+    res.json({ data: rows.map(serializeSignature) });
+  }),
+);
+
+// POST /api/email/signatures — create a shared signature (any member).
+router.post(
+  "/email/signatures",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    const name = String(req.body?.name || "").trim();
+    const contentHtml = String(req.body?.contentHtml || "");
+    if (!name) throw new ApiError(400, "A name is required");
+    if (contentHtml.length > 50_000) throw new ApiError(400, "Signature is too long (max 50,000 characters)");
+    const [row] = await db
+      .insert(emailSignatures)
+      .values({ id: createId("esig"), organizationId: orgId, name: name.slice(0, 120), contentHtml, createdBy: userId })
+      .returning();
+    res.status(201).json({ data: serializeSignature(row) });
+  }),
+);
+
+// PATCH /api/email/signatures/:id
+router.patch(
+  "/email/signatures/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const patch: Partial<{ name: string; contentHtml: string; updatedAt: Date }> = { updatedAt: new Date() };
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name).trim();
+      if (!name) throw new ApiError(400, "A name is required");
+      patch.name = name.slice(0, 120);
+    }
+    if (req.body?.contentHtml !== undefined) {
+      const html = String(req.body.contentHtml);
+      if (html.length > 50_000) throw new ApiError(400, "Signature is too long (max 50,000 characters)");
+      patch.contentHtml = html;
+    }
+    const [row] = await db
+      .update(emailSignatures)
+      .set(patch)
+      .where(and(eq(emailSignatures.id, String(req.params.id)), eq(emailSignatures.organizationId, orgId)))
+      .returning();
+    if (!row) throw new ApiError(404, "Signature not found");
+    res.json({ data: serializeSignature(row) });
+  }),
+);
+
+// DELETE /api/email/signatures/:id — also unlinks it from any mailbox using it.
+router.delete(
+  "/email/signatures/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const id = String(req.params.id);
+    await db.update(emailAccounts).set({ signatureId: null, updatedAt: new Date() })
+      .where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.signatureId, id)));
+    await db.delete(emailSignatures).where(and(eq(emailSignatures.id, id), eq(emailSignatures.organizationId, orgId)));
+    res.json({ data: { ok: true } });
+  }),
+);
+
+// ── Sender signature details (job title + custom fields) ────────────
+// GET /api/me/signature-details
+router.get(
+  "/me/signature-details",
+  asyncHandler(async (req, res) => {
+    const userId = getAuth(req)?.userId || "";
+    const [u] = await db
+      .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title, signatureFields: users.signatureFields })
+      .from(users)
+      .where(eq(users.id, userId));
+    res.json({
+      data: {
+        firstName: u?.firstName ?? "", lastName: u?.lastName ?? "", email: u?.email ?? "",
+        phone: u?.phone ?? "", title: u?.title ?? "", signatureFields: u?.signatureFields ?? {},
+      },
+    });
+  }),
+);
+
+// PATCH /api/me/signature-details — { title?, signatureFields? }
+router.patch(
+  "/me/signature-details",
+  asyncHandler(async (req, res) => {
+    const userId = getAuth(req)?.userId || "";
+    if (!userId) throw new ApiError(401, "Not authenticated");
+    const patch: Partial<{ title: string | null; signatureFields: Record<string, string>; updatedAt: Date }> = { updatedAt: new Date() };
+    if (req.body?.title !== undefined) patch.title = String(req.body.title || "").slice(0, 160) || null;
+    if (req.body?.signatureFields !== undefined && req.body.signatureFields && typeof req.body.signatureFields === "object") {
+      const clean: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.body.signatureFields as Record<string, unknown>)) {
+        const key = k.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().slice(0, 40);
+        if (key) clean[key] = String(v ?? "").slice(0, 500);
+      }
+      patch.signatureFields = clean;
+    }
+    await db.update(users).set(patch).where(eq(users.id, userId));
+    res.json({ data: { ok: true } });
   }),
 );
 

@@ -184,7 +184,9 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       }
       try {
         if (account) {
-          const htmlWithSig = withSignature(html, account.signature);
+          const { resolveAccountSignature } = await import("../lib/signature");
+          const resolvedSig = await resolveAccountSignature(account);
+          const htmlWithSig = withSignature(html, resolvedSig);
           const res = await sendEmailVia(account, { to: lead.email, subject, html: htmlWithSig, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,

@@ -89,6 +89,11 @@ export const users = pgTable("users", {
   /** E.164 phone captured at sign-up (or edited in profile), synced from the
    *  Clerk user's unsafe_metadata.phone / primary phone number. */
   phone: text("phone"),
+  /** Job title — used for the {{sender_title}} signature variable. */
+  title: text("title"),
+  /** Free-form extra fields for signature variables (e.g. booking_link,
+   *  pronouns) → resolved as {{sender_<key>}} at send time. */
+  signatureFields: jsonb("signature_fields").$type<Record<string, string>>(),
   imageUrl: text("image_url"),
   role: text("role"),
   platformRole: text("platform_role"),

@@ -26,10 +26,13 @@ export const emailAccounts = pgTable(
     provider: text("provider").notNull(), // "gmail" | "outlook" | "smtp"
     email: text("email").notNull(),
     fromName: text("from_name").notNull().default(""),
-  /** Per-account signature appended to one-off + workflow emails (HTML, or
-   *  plain text converted to <br> at send time). Sequences (Smartlead) are
-   *  unaffected. */
+  /** Custom per-account signature (raw HTML/text). Fallback when no shared
+   *  signature is chosen. Appended to one-off + workflow emails. */
   signature: text("signature"),
+  /** Chosen shared signature (email_signatures.id) — resolved with this
+   *  account owner's {{sender_*}} details at send time. Takes precedence over
+   *  the raw `signature` when set. */
+  signatureId: text("signature_id"),
     status: text("status").notNull().default("active"), // active | error | disconnected
     isDefault: boolean("is_default").notNull().default(false),
     // OAuth (gmail/outlook): encrypted JSON { access, refresh, expiresAt, scope }
