@@ -131,7 +131,7 @@ Return ONLY a JSON object with this exact shape:
 Rules:
 - The sales rep / agent works for the company making the call; the other person is the prospect/lead. Use the provided rep and contact names to label speakers; fall back to first names heard in the transcript, else "Speaker A"/"Speaker B".
 - Summary must be specific and useful (names, numbers, commitments, objections). 3-6 tldr bullets; 2-5 sections; include nextSteps only if a next step was agreed.
-- "outcome": classify the call as EXACTLY one of the outcome labels provided in the user message (verbatim). If the call had no real conversation (voicemail, no answer, noise), pick the label that means "no clear outcome"/"conversation incomplete" if present, else null.
+- "outcome": classify the call as EXACTLY one of the outcome labels provided in the user message (verbatim). If the call reached an answering machine / voicemail (an automated greeting, "please leave a message after the tone", or the rep leaves a one-sided message with no live prospect replying), pick the label that means "voicemail" if one is present. Otherwise, if there was no real conversation (no answer, noise), pick the label meaning "no clear outcome"/"conversation incomplete" if present, else null.
 - If the transcript is empty or just noise, return tldr: ["No meaningful conversation captured."], sections: [], and omit nextSteps.
 - Output JSON only, no markdown.`;
 

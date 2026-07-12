@@ -17,6 +17,9 @@ export const DEFAULT_CALL_OUTCOMES: CallOutcomeDef[] = [
   { key: "booked_meeting", label: "Booked Meeting", color: "green" },
   { key: "disqualified", label: "Disqualified", color: "red" },
   { key: "conversation_incomplete", label: "Conversation Incomplete", color: "amber" },
+  // The AI reaches an answering machine / leaves a message — counted by the
+  // Team analytics "Voicemails" card (matches outcome key ilike '%voicemail%').
+  { key: "voicemail", label: "Voicemail", color: "violet" },
   { key: "no_clear_outcome", label: "No Clear Outcome", color: "slate" },
 ];
 
