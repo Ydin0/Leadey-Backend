@@ -9,6 +9,7 @@ import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { masterContacts } from "../db/schema/master";
 import { calendlyMeetings } from "../db/schema/calendly";
+import { dismissedPotentialContacts } from "../db/schema/dismissed-potential-contacts";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { unreadEmailThreadCount } from "./email-threads";
@@ -169,6 +170,15 @@ router.get(
 
 /** Distinct unknown inbound numbers (calls + SMS with no matched lead), last
  *  60 days, enriched with any master-contact name we already have. */
+/** Stable dismissal/aggregation key for a potential contact — the normalized
+ *  phone for callers/texters, or "email:<lowercased>" for Calendly invitees.
+ *  Mirrors how potentialContacts() keys its map. */
+function potentialContactKey(phone: string | null | undefined, email: string | null | undefined): string | null {
+  if (phone) return norm(phone) || phone;
+  if (email) return `email:${email.trim().toLowerCase()}`;
+  return null;
+}
+
 async function potentialContacts(orgId: string) {
   const since = new Date(Date.now() - 60 * DAY);
   const [callRows, smsRows] = await Promise.all([
@@ -254,6 +264,19 @@ async function potentialContacts(orgId: string) {
         ? !(pc.email && leadEmails.has(pc.email.toLowerCase()))
         : !(norm(pc.phone) && leadPhoneKeys.has(norm(pc.phone))),
     );
+  }
+
+  // Exclude handles a rep has explicitly dismissed.
+  const dismissed = await db
+    .select({ handleKey: dismissedPotentialContacts.handleKey })
+    .from(dismissedPotentialContacts)
+    .where(eq(dismissedPotentialContacts.organizationId, orgId));
+  if (dismissed.length) {
+    const dismissedKeys = new Set(dismissed.map((d) => d.handleKey));
+    list = list.filter((pc) => {
+      const k = potentialContactKey(pc.phone, pc.email);
+      return !(k && dismissedKeys.has(k));
+    });
   }
 
   // Enrich names from master_contacts by last-10-digit phone match.
@@ -370,6 +393,26 @@ router.post(
     }
 
     res.status(201).json({ data: { leadId: id, funnelId } });
+  }),
+);
+
+// ─── POST /inbox/potential-contacts/dismiss ─────────────────────────
+// Hide an unknown caller/texter (or Calendly invitee) from the Potential
+// Contacts list — persisted so it doesn't reappear.
+router.post(
+  "/inbox/potential-contacts/dismiss",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    const { phone, email } = req.body as { phone?: string; email?: string };
+    const handleKey = potentialContactKey(phone, email);
+    if (!handleKey) throw new ApiError(400, "phone or email required");
+
+    await db
+      .insert(dismissedPotentialContacts)
+      .values({ id: createId("dpc"), organizationId: orgId, handleKey, dismissedBy: userId })
+      .onConflictDoNothing();
+    res.json({ data: { ok: true } });
   }),
 );
 
