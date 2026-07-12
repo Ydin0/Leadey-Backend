@@ -77,6 +77,7 @@ import {
 } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
 import { getPerms, requirePerm } from "../lib/permission-service";
+import { getUserDepartment } from "../lib/user-department";
 import { scopeOf } from "../lib/permission-catalog";
 import { getBalance, deductCredits, InsufficientCreditsError, CREDIT_COSTS } from "../lib/credits";
 import {
@@ -421,11 +422,17 @@ router.get(
     const myFunnelIds = new Set(
       memberRows.filter((m) => m.userId === auth?.userId).map((m) => m.funnelId),
     );
+    // Live department access: campaigns whose config.departmentAccess includes
+    // the caller's current department are visible too (dynamic membership).
+    const myPod = access === "assigned" ? await getUserDepartment(orgId, auth?.userId) : null;
+    const inMyDept = (f: (typeof data)[number]) =>
+      !!myPod && Array.isArray((f.config as Record<string, unknown> | undefined)?.departmentAccess) &&
+      ((f.config as Record<string, unknown>).departmentAccess as unknown[]).includes(myPod);
     const visible = access === "all"
       ? data
       : access === "none"
         ? []
-        : data.filter((f) => f.visibility === "public" || myFunnelIds.has(f.id));
+        : data.filter((f) => f.visibility === "public" || myFunnelIds.has(f.id) || inMyDept(f));
 
     res.json({ data: visible });
   }),
@@ -609,6 +616,14 @@ router.get(
           .limit(1);
         if (sess) canView = true;
       }
+      // Live department access — the caller's current department is granted.
+      if (!canView) {
+        const deptAccess = (funnel.config as Record<string, unknown> | undefined)?.departmentAccess;
+        if (Array.isArray(deptAccess) && deptAccess.length) {
+          const myPod = await getUserDepartment(orgId, auth?.userId);
+          if (myPod && (deptAccess as unknown[]).includes(myPod)) canView = true;
+        }
+      }
     }
     if (!canView) {
       throw new ApiError(403, "You do not have access to this campaign");
@@ -691,7 +706,7 @@ router.post(
   requirePerm("campaigns.create"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
-    const { name, description, status, steps, sourceTypes, visibility, audience, exit, emailAutomation, members } = req.body || {};
+    const { name, description, status, steps, sourceTypes, visibility, audience, exit, emailAutomation, members, departments } = req.body || {};
 
     if (!normalizeString(name)) {
       throw new ApiError(400, "Funnel name is required");
@@ -753,6 +768,10 @@ router.post(
     if (audience && typeof audience === "object") config.audience = audience;
     if (exit && typeof exit === "object") config.exit = exit;
     if (emailAutomation && typeof emailAutomation === "object") config.emailAutomation = emailAutomation;
+    // Department names granted live access to this campaign (dynamic membership).
+    if (Array.isArray(departments)) {
+      config.departmentAccess = (departments as unknown[]).filter((d): d is string => typeof d === "string");
+    }
 
     const funnelId = createId("funnel");
     const now = new Date();
@@ -926,7 +945,8 @@ router.patch(
       body.exit !== undefined ||
       body.emailAutomation !== undefined ||
       body.leadFilters !== undefined ||
-      body.columnPrefs !== undefined;
+      body.columnPrefs !== undefined ||
+      body.departments !== undefined;
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
@@ -970,6 +990,13 @@ router.patch(
       // Shared per-campaign column layout ("save for everyone") — the order +
       // hidden set every rep sees on this campaign unless they've set their own.
       if (body.columnPrefs !== undefined) cfg.columnPrefs = body.columnPrefs;
+      // Department names with live access — anyone whose team department matches
+      // can view/work the campaign (resolved dynamically at access-check time).
+      if (body.departments !== undefined) {
+        cfg.departmentAccess = Array.isArray(body.departments)
+          ? (body.departments as unknown[]).filter((d): d is string => typeof d === "string")
+          : [];
+      }
       funnelUpdates.config = cfg;
     }
 
