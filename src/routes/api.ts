@@ -925,7 +925,8 @@ router.patch(
       body.audience !== undefined ||
       body.exit !== undefined ||
       body.emailAutomation !== undefined ||
-      body.leadFilters !== undefined;
+      body.leadFilters !== undefined ||
+      body.columnPrefs !== undefined;
 
     const funnel = getFunnelOrThrow(
       await loadFunnel(orgId, req.params.funnelId),
@@ -966,6 +967,9 @@ router.patch(
       // Shared per-campaign lead filters — persisted so the filtered view is the
       // same for every rep and survives a page refresh.
       if (body.leadFilters !== undefined) cfg.leadFilters = body.leadFilters;
+      // Shared per-campaign column layout ("save for everyone") — the order +
+      // hidden set every rep sees on this campaign unless they've set their own.
+      if (body.columnPrefs !== undefined) cfg.columnPrefs = body.columnPrefs;
       funnelUpdates.config = cfg;
     }
 
