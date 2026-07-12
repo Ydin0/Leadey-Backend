@@ -71,3 +71,19 @@ export async function resolveAccountSignature(account: {
   }
   return account.signature ?? null;
 }
+
+/** Resolve the signature HTML for a single send, honoring an explicit per-send
+ *  choice made in the composer / workflow node:
+ *   - undefined | "default" → the mailbox's own configured signature (default)
+ *   - "none"                → no signature at all
+ *   - <signatureId>         → that shared signature, rendered with the sender's
+ *                             own {{sender_*}} details (so one signature serves
+ *                             many reps). A stale/deleted id yields no signature. */
+export async function resolveSignatureChoice(
+  account: { signatureId?: string | null; signature?: string | null; userId: string; organizationId: string },
+  choice: string | null | undefined,
+): Promise<string | null> {
+  if (choice == null || choice === "default") return resolveAccountSignature(account);
+  if (choice === "none") return null;
+  return resolveAccountSignature({ ...account, signatureId: choice, signature: null });
+}

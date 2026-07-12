@@ -342,8 +342,9 @@ router.post(
     const messageId = createId("emsg");
     // Signature first, then the open-tracking pixel (best-effort). A shared
     // signature is resolved with this rep's {{sender_*}} details.
-    const { resolveAccountSignature } = await import("../lib/signature");
-    const resolvedSig = await resolveAccountSignature(account);
+    const { resolveSignatureChoice } = await import("../lib/signature");
+    const sigChoice = req.body?.signatureId != null ? String(req.body.signatureId) : undefined;
+    const resolvedSig = await resolveSignatureChoice(account, sigChoice);
     const htmlWithSig = withSignature(bodyHtml, resolvedSig);
     const pixel = `<img src="${backendBase()}/track/email/${messageId}/open.gif" width="1" height="1" alt="" style="display:none" />`;
     const html = `${htmlWithSig}${pixel}`;
