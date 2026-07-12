@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq, asc, inArray } from "drizzle-orm";
+import { and, eq, asc, inArray, or } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { bookingPages, bookingPageMembers, DEFAULT_AVAILABILITY, type WeeklyAvailability } from "../db/schema/booking-pages";
@@ -29,13 +29,15 @@ async function canManageTeam(req: Request): Promise<boolean> {
   return hasPerm(perms.permissions, "settings.manageTeam");
 }
 
-function serialize(p: Page, memberIds: string[] = []) {
+function serialize(p: Page, memberIds: string[] = [], owned = true, ownerName = "") {
   return {
     id: p.id, userId: p.userId, name: p.name, durationMin: p.durationMin, video: p.video,
     timezone: p.timezone, availability: p.availability, respectCalendar: p.respectCalendar,
     roundRobin: p.roundRobin,
     isPublic: p.isPublic, publicSlug: p.publicSlug,
     members: memberIds,
+    /** Is the requesting user the owner of this page? (member-visible pages are read-only unless they can manage the team) */
+    owned, ownerName,
     bufferBeforeMin: p.bufferBeforeMin, bufferAfterMin: p.bufferAfterMin,
     minNoticeMin: p.minNoticeMin, maxDaysAhead: p.maxDaysAhead, isActive: p.isActive, isDefault: p.isDefault,
   };
@@ -68,12 +70,13 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
-    let rows = await db
+    // Pages the user owns (auto-seed a default the first time they have none).
+    let owned = await db
       .select()
       .from(bookingPages)
       .where(and(eq(bookingPages.organizationId, orgId), eq(bookingPages.userId, userId)))
       .orderBy(asc(bookingPages.createdAt));
-    if (rows.length === 0 && userId) {
+    if (owned.length === 0 && userId) {
       const now = new Date();
       const row = {
         id: createId("bpage"), organizationId: orgId, userId,
@@ -83,10 +86,25 @@ router.get(
         isActive: true, isDefault: true, createdAt: now, updatedAt: now,
       };
       await db.insert(bookingPages).values(row);
-      rows = [row as Page];
+      owned = [row as Page];
     }
+    // Pages this user is assigned to as a host (round-robin) — visible on their side too.
+    const ownedIds = new Set(owned.map((p) => p.id));
+    const memberPageIds = (
+      await db.select({ pageId: bookingPageMembers.bookingPageId }).from(bookingPageMembers).where(eq(bookingPageMembers.userId, userId))
+    ).map((r) => r.pageId).filter((id) => !ownedIds.has(id));
+    let memberPages: Page[] = [];
+    if (memberPageIds.length) {
+      memberPages = await db
+        .select()
+        .from(bookingPages)
+        .where(and(eq(bookingPages.organizationId, orgId), eq(bookingPages.isActive, true), inArray(bookingPages.id, memberPageIds)))
+        .orderBy(asc(bookingPages.createdAt));
+    }
+    const rows = [...owned, ...memberPages];
     const memberMap = await membersByPage(rows.map((r) => r.id));
-    res.json({ data: rows.map((p) => serialize(p, memberMap.get(p.id) || [])) });
+    const ownerNames = new Map((await hostNames(rows.map((p) => p.userId))).map((o) => [o.userId, o.name]));
+    res.json({ data: rows.map((p) => serialize(p, memberMap.get(p.id) || [], p.userId === userId, ownerNames.get(p.userId) || "")) });
   }),
 );
 
