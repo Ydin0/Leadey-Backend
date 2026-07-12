@@ -4,6 +4,8 @@ import { clerkClient } from "@clerk/express";
 import { db } from "../db/index";
 import { organizations, users } from "../db/schema/organizations";
 import { callRecords } from "../db/schema/call-records";
+import { emailMessages } from "../db/schema/email-accounts";
+import { smsMessages } from "../db/schema/sms";
 import { opportunities } from "../db/schema/opportunities";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
@@ -31,6 +33,7 @@ import {
 
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
+const ANALYTICS_CARDS_KEY = "team_analytics_cards";
 
 // Seeded for orgs that haven't customised yet — mirrors the legacy "pods" so
 // existing member assignments keep resolving.
@@ -787,6 +790,41 @@ router.delete(
   }),
 );
 
+// ─── GET /team/analytics-cards ──────────────────────────────────────
+// Ordered list of stat-card ids shown on the Team analytics page. Org-wide
+// (one layout for the whole team), stored in org settings. Empty/absent → the
+// client falls back to its DEFAULT_CARD_IDS.
+router.get(
+  "/team/analytics-cards",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const raw = await getSetting(orgId, ANALYTICS_CARDS_KEY);
+    let cards: string[] = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) cards = parsed.filter((x): x is string => typeof x === "string");
+      } catch { /* ignore malformed */ }
+    }
+    res.json({ data: { cards } });
+  }),
+);
+
+// ─── PUT /team/analytics-cards ──────────────────────────────────────
+// Replace the org-wide card layout (managers/admins only).
+router.put(
+  "/team/analytics-cards",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const body = req.body || {};
+    if (!Array.isArray(body.cards)) throw new ApiError(400, "cards must be an array");
+    const cards = (body.cards as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 40);
+    await upsertSetting(orgId, ANALYTICS_CARDS_KEY, JSON.stringify(cards));
+    res.json({ data: { cards } });
+  }),
+);
+
 // ─── GET /team/analytics ────────────────────────────────────────────
 // Real 90-day daily activity series per org member. Calls come from
 // call_records (per rep), meetings from opportunities created (per owner).
@@ -826,6 +864,11 @@ router.get(
         // (AI-classified or set by the rep on the call card).
         voicemail: sql<number>`coalesce(count(*) filter (where ${callRecords.disposition} = 'voicemail' or ${callRecords.outcome} ilike '%voicemail%'), 0)`,
         talk: sql<number>`coalesce(sum(${callRecords.duration}), 0)`,
+        // Direction splits — outbound vs inbound calls + talk time.
+        outC: sql<number>`coalesce(count(*) filter (where ${callRecords.direction} = 'outbound'), 0)`,
+        inC: sql<number>`coalesce(count(*) filter (where ${callRecords.direction} = 'inbound'), 0)`,
+        talkOut: sql<number>`coalesce(sum(${callRecords.duration}) filter (where ${callRecords.direction} = 'outbound'), 0)`,
+        talkIn: sql<number>`coalesce(sum(${callRecords.duration}) filter (where ${callRecords.direction} = 'inbound'), 0)`,
       })
       .from(callRecords)
       .where(and(eq(callRecords.organizationId, orgId), gte(callRecords.calledAt, startUtc)))
@@ -842,26 +885,75 @@ router.get(
       .where(and(eq(opportunities.organizationId, orgId), gte(opportunities.createdAt, startUtc)))
       .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
 
-    const callMap = new Map<string, Map<string, number>>();
-    const connectedMap = new Map<string, Map<string, number>>();
-    const voicemailMap = new Map<string, Map<string, number>>();
-    const talkMap = new Map<string, Map<string, number>>();
+    // Per-rep emails (sent + received) by UTC day, split by direction.
+    const emailRows = await db
+      .select({
+        userId: emailMessages.userId,
+        day: sql<string>`to_char(date_trunc('day', ${emailMessages.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        c: count(),
+        outC: sql<number>`coalesce(count(*) filter (where ${emailMessages.direction} = 'outbound'), 0)`,
+        inC: sql<number>`coalesce(count(*) filter (where ${emailMessages.direction} = 'inbound'), 0)`,
+      })
+      .from(emailMessages)
+      .where(and(eq(emailMessages.organizationId, orgId), gte(emailMessages.createdAt, startUtc)))
+      .groupBy(emailMessages.userId, sql`date_trunc('day', ${emailMessages.createdAt} AT TIME ZONE 'UTC')`);
+
+    // Per-rep SMS (sent + received) by UTC day, split by direction. WhatsApp
+    // shares this table (channel='whatsapp') but is excluded from the SMS card.
+    const smsRows = await db
+      .select({
+        userId: smsMessages.userId,
+        day: sql<string>`to_char(date_trunc('day', ${smsMessages.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        c: count(),
+        outC: sql<number>`coalesce(count(*) filter (where ${smsMessages.direction} = 'outbound'), 0)`,
+        inC: sql<number>`coalesce(count(*) filter (where ${smsMessages.direction} = 'inbound'), 0)`,
+      })
+      .from(smsMessages)
+      .where(and(eq(smsMessages.organizationId, orgId), eq(smsMessages.channel, "sms"), gte(smsMessages.createdAt, startUtc)))
+      .groupBy(smsMessages.userId, sql`date_trunc('day', ${smsMessages.createdAt} AT TIME ZONE 'UTC')`);
+
+    // Consolidate every source into one userId → day → metrics bucket.
+    type DayAgg = {
+      calls: number; callsInbound: number; callsOutbound: number;
+      connectedCalls: number; voicemailCalls: number;
+      talkTime: number; talkTimeInbound: number; talkTimeOutbound: number;
+      emails: number; emailsInbound: number; emailsOutbound: number;
+      sms: number; smsInbound: number; smsOutbound: number;
+      meetings: number;
+    };
+    const zero = (): DayAgg => ({
+      calls: 0, callsInbound: 0, callsOutbound: 0, connectedCalls: 0, voicemailCalls: 0,
+      talkTime: 0, talkTimeInbound: 0, talkTimeOutbound: 0,
+      emails: 0, emailsInbound: 0, emailsOutbound: 0, sms: 0, smsInbound: 0, smsOutbound: 0, meetings: 0,
+    });
+    const agg = new Map<string, Map<string, DayAgg>>();
+    const bucket = (userId: string, day: string): DayAgg => {
+      let u = agg.get(userId);
+      if (!u) { u = new Map(); agg.set(userId, u); }
+      let d = u.get(day);
+      if (!d) { d = zero(); u.set(day, d); }
+      return d;
+    };
     for (const r of callRows) {
       if (!r.userId) continue;
-      if (!callMap.has(r.userId)) callMap.set(r.userId, new Map());
-      callMap.get(r.userId)!.set(r.day, Number(r.c));
-      if (!connectedMap.has(r.userId)) connectedMap.set(r.userId, new Map());
-      connectedMap.get(r.userId)!.set(r.day, Number(r.connected));
-      if (!voicemailMap.has(r.userId)) voicemailMap.set(r.userId, new Map());
-      voicemailMap.get(r.userId)!.set(r.day, Number(r.voicemail));
-      if (!talkMap.has(r.userId)) talkMap.set(r.userId, new Map());
-      talkMap.get(r.userId)!.set(r.day, Number(r.talk));
+      const d = bucket(r.userId, r.day);
+      d.calls = Number(r.c); d.callsInbound = Number(r.inC); d.callsOutbound = Number(r.outC);
+      d.connectedCalls = Number(r.connected); d.voicemailCalls = Number(r.voicemail);
+      d.talkTime = Number(r.talk); d.talkTimeInbound = Number(r.talkIn); d.talkTimeOutbound = Number(r.talkOut);
     }
-    const meetMap = new Map<string, Map<string, number>>();
+    for (const r of emailRows) {
+      if (!r.userId) continue;
+      const d = bucket(r.userId, r.day);
+      d.emails = Number(r.c); d.emailsInbound = Number(r.inC); d.emailsOutbound = Number(r.outC);
+    }
+    for (const r of smsRows) {
+      if (!r.userId) continue;
+      const d = bucket(r.userId, r.day);
+      d.sms = Number(r.c); d.smsInbound = Number(r.inC); d.smsOutbound = Number(r.outC);
+    }
     for (const r of meetingRows) {
       if (!r.ownerId) continue;
-      if (!meetMap.has(r.ownerId)) meetMap.set(r.ownerId, new Map());
-      meetMap.get(r.ownerId)!.set(r.day, Number(r.c));
+      bucket(r.ownerId, r.day).meetings = Number(r.c);
     }
 
     // Dense list of UTC day strings for the window.
@@ -873,25 +965,32 @@ router.get(
     }
 
     const members = memberRows.map((m) => {
-      const calls = callMap.get(m.id);
-      const connected = connectedMap.get(m.id);
-      const voicemail = voicemailMap.get(m.id);
-      const talk = talkMap.get(m.id);
-      const meets = meetMap.get(m.id);
+      const u = agg.get(m.id);
       return {
         id: m.id,
-        series: days.map((day) => ({
-          date: `${day}T00:00:00.000Z`,
-          calls: calls?.get(day) ?? 0,
-          connectedCalls: connected?.get(day) ?? 0,
-          voicemailCalls: voicemail?.get(day) ?? 0,
-          talkTime: talk?.get(day) ?? 0,
-          emails: 0,
-          sms: 0,
-          linkedin: 0,
-          meetings: meets?.get(day) ?? 0,
-          replies: 0,
-        })),
+        series: days.map((day) => {
+          const d = u?.get(day);
+          return {
+            date: `${day}T00:00:00.000Z`,
+            calls: d?.calls ?? 0,
+            callsInbound: d?.callsInbound ?? 0,
+            callsOutbound: d?.callsOutbound ?? 0,
+            connectedCalls: d?.connectedCalls ?? 0,
+            voicemailCalls: d?.voicemailCalls ?? 0,
+            talkTime: d?.talkTime ?? 0,
+            talkTimeInbound: d?.talkTimeInbound ?? 0,
+            talkTimeOutbound: d?.talkTimeOutbound ?? 0,
+            emails: d?.emails ?? 0,
+            emailsInbound: d?.emailsInbound ?? 0,
+            emailsOutbound: d?.emailsOutbound ?? 0,
+            sms: d?.sms ?? 0,
+            smsInbound: d?.smsInbound ?? 0,
+            smsOutbound: d?.smsOutbound ?? 0,
+            linkedin: 0,
+            meetings: d?.meetings ?? 0,
+            replies: (d?.emailsInbound ?? 0) + (d?.smsInbound ?? 0),
+          };
+        }),
       };
     });
 
