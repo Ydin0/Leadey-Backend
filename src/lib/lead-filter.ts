@@ -181,6 +181,25 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return null;
   }
 
+  // Call date — a lead matches when it was called in the given window. Calls
+  // attach by lead id, with the phone fallback for ad-hoc dials. "between" is
+  // inclusive of the whole end day (called_at carries a time-of-day) so a
+  // "Mon–Fri" range captures every call placed on Friday.
+  if (field === "callDate") {
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    if (op === "is_set") return sql`exists (select 1 from call_records cr where ${callMatch})`;
+    if (op === "is_empty") return sql`not exists (select 1 from call_records cr where ${callMatch})`;
+    if (!hasVal(c.value)) return null;
+    if (op === "before") return sql`exists (select 1 from call_records cr where ${callMatch} and cr.called_at < ${new Date(String(c.value))})`;
+    if (op === "after") return sql`exists (select 1 from call_records cr where ${callMatch} and cr.called_at > ${new Date(String(c.value))})`;
+    if (op === "between" && Array.isArray(c.value)) {
+      const end = new Date(String(c.value[1]));
+      end.setUTCDate(end.getUTCDate() + 1);
+      return sql`exists (select 1 from call_records cr where ${callMatch} and cr.called_at >= ${new Date(String(c.value[0]))} and cr.called_at < ${end})`;
+    }
+    return null;
+  }
+
   // Campaign membership (org all-leads page). A lead belongs to exactly one
   // funnel; "is any of" matches per enrollment. Ids are org-scoped upstream.
   if (field === "funnelId") {

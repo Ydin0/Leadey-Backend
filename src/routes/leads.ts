@@ -464,7 +464,7 @@ router.get(
       funnelId ? eq(leads.funnelId, funnelId) : undefined,
     );
 
-    const [stageRows, outcomeRows] = await Promise.all([
+    const [stageRows, outcomeRows, callDateRows] = await Promise.all([
       db
         .select({ leadId: leads.id, stage: sql<string>`ps.label` })
         .from(leads)
@@ -481,15 +481,29 @@ router.get(
           sql`cr.organization_id = ${orgId} and cr.outcome is not null and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`,
         )
         .where(leadScope),
+      // Distinct day each lead was called — day-granular keeps the payload small
+      // (a lead called 20 times over 3 days yields 3 strings) and matches the
+      // day-level "called between X and Y" filter.
+      db
+        .select({ leadId: leads.id, day: sql<string>`to_char(date_trunc('day', cr.called_at), 'YYYY-MM-DD')` })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .innerJoin(
+          sql`call_records cr`,
+          sql`cr.organization_id = ${orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`,
+        )
+        .where(leadScope)
+        .groupBy(leads.id, sql`date_trunc('day', cr.called_at)`),
     ]);
 
-    const insights: Record<string, { oppStage: string | null; callOutcomes: string[] }> = {};
-    const entry = (id: string) => (insights[id] ??= { oppStage: null, callOutcomes: [] });
+    const insights: Record<string, { oppStage: string | null; callOutcomes: string[]; callDates: string[] }> = {};
+    const entry = (id: string) => (insights[id] ??= { oppStage: null, callOutcomes: [], callDates: [] });
     for (const r of stageRows) entry(r.leadId).oppStage = r.stage;
     for (const r of outcomeRows) {
       const e = entry(r.leadId);
       if (!e.callOutcomes.includes(r.outcome)) e.callOutcomes.push(r.outcome);
     }
+    for (const r of callDateRows) entry(r.leadId).callDates.push(r.day);
     res.json({ data: { insights } });
   }),
 );
