@@ -16,6 +16,7 @@ export { calendlyAccounts, calendlyMeetings } from "./calendly";
 export { calendarAccounts, calendarEvents } from "./calendar";
 export { settings } from "./settings";
 export { linkedinRateLimits } from "./linkedin-rate-limits";
+export { linkedinAccounts } from "./linkedin-accounts";
 export { organizations, users } from "./organizations";
 export { orgRoles } from "./org-roles";
 export { organizationMemberships } from "./organization-memberships";

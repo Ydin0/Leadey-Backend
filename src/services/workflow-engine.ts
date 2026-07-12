@@ -9,6 +9,9 @@ import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/sch
 import { smsMessages } from "../db/schema/sms";
 import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
+import { linkedinAccounts } from "../db/schema/linkedin-accounts";
+import { UnipileClient } from "../lib/unipile-client";
+import { canExecute, recordExecution, type LinkedInAction } from "../lib/linkedin-rate-limiter";
 import { sendEmail } from "../lib/email";
 import { sendEmailVia, type EmailAttachment } from "../lib/email-providers";
 import { withSignature } from "../routes/email-accounts";
@@ -151,7 +154,7 @@ async function loadWorkflowAttachments(
 }
 
 // ─── Action executors (reuse existing senders / patterns) ────────────────
-async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promise<void> {
+async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promise<void | { retryAfterMs: number }> {
   const d = (node.data || {}) as Record<string, unknown>;
   const orgId = enr.organizationId;
 
@@ -355,15 +358,81 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       }
       return;
     }
-    case "call":
-    case "linkedin": {
+    case "call": {
       await db.insert(leadTasks).values({
         id: createId("ltask"), organizationId: orgId, funnelId: lead.funnelId, leadId: lead.id,
-        label: String(d.title || (node.type === "call" ? "Call lead" : "LinkedIn outreach")),
-        category: node.type === "call" ? "call" : "linkedin",
+        label: String(d.title || "Call lead"),
+        category: "call",
         dueAt: new Date(), assigneeId: lead.ownerId || null, createdBy: null,
       });
       await logRun(enr, node, "done", {});
+      return;
+    }
+    case "linkedin": {
+      // action: connection (invite + optional note) | message (to a connection) | visit (profile view)
+      const action = String(d.action || "connection");
+
+      // Resolve the sending account: the rep who triggered the workflow uses
+      // their own connected LinkedIn; else a fixed account chosen on the node;
+      // else the org's first connected account. (Mirrors the email actor rule.)
+      const accts = await db
+        .select()
+        .from(linkedinAccounts)
+        .where(and(eq(linkedinAccounts.organizationId, orgId), eq(linkedinAccounts.status, "connected")));
+      const account =
+        (d.senderMode === "actor" && enr.triggeredBy ? accts.find((a) => a.userId === enr.triggeredBy) : undefined) ||
+        (d.accountId ? accts.find((a) => a.id === String(d.accountId)) : undefined) ||
+        accts[0];
+      if (!account) { await logRun(enr, node, "skipped", { reason: "no LinkedIn account connected" }); return; }
+      if (!lead.linkedinUrl) { await logRun(enr, node, "skipped", { reason: "lead has no LinkedIn URL" }); return; }
+
+      const dsn = process.env.UNIPILE_DSN, apiKey = process.env.UNIPILE_API_KEY;
+      if (!dsn || !apiKey) { await logRun(enr, node, "skipped", { reason: "Unipile not configured" }); return; }
+      const client = new UnipileClient(dsn, apiKey);
+      const uaId = account.unipileAccountId;
+
+      // Rate limit — reschedule the step ~4h out rather than silently dropping.
+      const rlAction: LinkedInAction = action === "visit" ? "profile_view" : action === "message" ? "message" : "invitation";
+      const check = await canExecute(uaId, rlAction);
+      if (!check.allowed) {
+        await logRun(enr, node, "rescheduled", { reason: check.reason });
+        return { retryAfterMs: 4 * 60 * 60 * 1000 };
+      }
+
+      try {
+        // Resolve + cache the LinkedIn provider id from the lead's profile URL.
+        let providerId = lead.unipileProviderId || null;
+        if (!providerId) {
+          const profile = await client.resolveProfile(uaId, lead.linkedinUrl);
+          providerId = profile.provider_id;
+          await db.update(leads).set({ unipileProviderId: providerId, updatedAt: new Date() }).where(eq(leads.id, lead.id));
+        }
+        if (!providerId) { await logRun(enr, node, "skipped", { reason: "could not resolve LinkedIn profile" }); return; }
+
+        const tokens = await leadTokens(lead, orgId);
+        const message = renderTokens(String(d.message || ""), tokens);
+
+        if (action === "visit") {
+          await client.resolveProfile(uaId, lead.linkedinUrl);
+        } else if (action === "message") {
+          await client.sendMessage(uaId, providerId, message || `Hi ${lead.name.split(" ")[0]}`);
+        } else {
+          await client.sendInvitation(uaId, providerId, message || undefined);
+        }
+        await recordExecution(uaId, rlAction);
+        if (account.status === "error") {
+          await db.update(linkedinAccounts).set({ status: "connected", lastError: null, updatedAt: new Date() }).where(eq(linkedinAccounts.id, account.id));
+        }
+        await db.insert(leadEvents).values({
+          id: createId("event"), leadId: lead.id, type: "linkedin_action", outcome: "sent",
+          stepIndex: 0, meta: { channel: "linkedin", action, direction: "outbound", body: message, source: "workflow" }, timestamp: new Date(),
+        });
+        await logRun(enr, node, "done", { action });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        await db.update(linkedinAccounts).set({ status: "error", lastError: msg.slice(0, 500), updatedAt: new Date() }).where(eq(linkedinAccounts.id, account.id));
+        await logRun(enr, node, "failed", { error: msg });
+      }
       return;
     }
     default:
@@ -472,7 +541,15 @@ async function runEnrollment(enr: Enrollment): Promise<void> {
       continue;
     }
     // action node (email/sms/status/tag/field/assign/webhook/call/linkedin)
-    await runAction(enr, node, lead);
+    const actionResult = await runAction(enr, node, lead);
+    // A node can ask to be retried later (e.g. LinkedIn rate limit) — park the
+    // enrollment on the SAME node and re-run after the delay, without advancing.
+    if (actionResult && typeof actionResult.retryAfterMs === "number") {
+      await db.update(workflowEnrollments)
+        .set({ nextRunAt: new Date(Date.now() + actionResult.retryAfterMs) })
+        .where(eq(workflowEnrollments.id, enr.id));
+      return;
+    }
     nodeId = nextNodeId(g, node.id, "out");
     // Persist progress AFTER each side-effectful step so a crash/lease-replay
     // resumes at the NEXT node and never re-sends an email/SMS already sent.

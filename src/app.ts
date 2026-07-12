@@ -10,6 +10,7 @@ import settingsRouter from "./routes/settings";
 import dashboardRouter from "./routes/dashboard";
 import webhooksRouter from "./routes/webhooks";
 import unipileRouter from "./routes/unipile";
+import linkedinRouter, { linkedinPublicRouter } from "./routes/linkedin";
 import { twilioAuthRouter, twilioWebhookRouter } from "./routes/twilio";
 import phoneLineRouter from "./routes/phone-lines";
 import scraperRouter from "./routes/scrapers";
@@ -111,6 +112,7 @@ app.use("/api/admin", requireAdmin, adminRouter);
 app.use(emailPublicRouter);
 app.use(calendlyPublicRouter);
 app.use(calendarPublicRouter);
+app.use(linkedinPublicRouter);
 
 // Public, versioned API. Authenticated by org-scoped API key (Bearer), NOT Clerk.
 // Distinct /v1 prefix, so ordering vs the /api routers below is irrelevant.
@@ -128,6 +130,7 @@ app.use("/api", leadsRouter);
 app.use("/api", apiRouter);
 app.use("/api", settingsRouter);
 app.use("/api", unipileRouter);
+app.use("/api", linkedinRouter);
 app.use("/api", twilioAuthRouter);
 app.use("/api", phoneLineRouter);
 app.use("/api", scraperRouter);
