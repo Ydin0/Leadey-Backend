@@ -80,7 +80,12 @@ async function refreshGoogle(refresh: string): Promise<{ access_token: string; e
   return data;
 }
 
-async function refreshMicrosoft(refresh: string): Promise<{ access_token: string; expires_in: number; refresh_token?: string }> {
+async function refreshMicrosoft(refresh: string, grantedScope?: string): Promise<{ access_token: string; expires_in: number; refresh_token?: string }> {
+  // Refresh against the scopes the account actually granted so calendar access
+  // (Calendars.ReadWrite, for meeting hosts) survives the refresh — while
+  // mail-only accounts keep refreshing exactly as before.
+  const base = grantedScope && grantedScope.trim() ? grantedScope.trim() : "Mail.Send Mail.Read User.Read";
+  const scope = /offline_access/.test(base) ? base : `offline_access ${base}`;
   const res = await fetch(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT || "common"}/oauth2/v2.0/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -89,7 +94,7 @@ async function refreshMicrosoft(refresh: string): Promise<{ access_token: string
       client_secret: process.env.MICROSOFT_CLIENT_SECRET || "",
       refresh_token: refresh,
       grant_type: "refresh_token",
-      scope: "offline_access Mail.Send Mail.Read User.Read",
+      scope,
     }),
   });
   const data = await res.json();
@@ -97,11 +102,31 @@ async function refreshMicrosoft(refresh: string): Promise<{ access_token: string
   return data;
 }
 
+/** The OAuth scope string an account was granted (empty for SMTP / on error). */
+export function accountTokenScope(account: Account): string {
+  try {
+    return readTokens(account).scope || "";
+  } catch {
+    return "";
+  }
+}
+
+/** Whether this account can create calendar events (host meetings). Requires a
+ *  Gmail account with calendar.events scope or an Outlook account with
+ *  Calendars.ReadWrite — SMTP and un-upgraded (send-only) accounts can't. */
+export function accountCanSchedule(account: Account): boolean {
+  if (account.provider === "smtp") return false;
+  const scope = accountTokenScope(account).toLowerCase();
+  if (account.provider === "gmail") return scope.includes("auth/calendar");
+  if (account.provider === "outlook") return scope.includes("calendars.readwrite");
+  return false;
+}
+
 /** Return a valid access token, refreshing + persisting rotated tokens. */
-async function getAccessToken(account: Account): Promise<string> {
+export async function getAccessToken(account: Account): Promise<string> {
   const t = readTokens(account);
   if (t.access && t.expiresAt > Date.now() + 60_000) return t.access;
-  const refreshed = account.provider === "gmail" ? await refreshGoogle(t.refresh) : await refreshMicrosoft(t.refresh);
+  const refreshed = account.provider === "gmail" ? await refreshGoogle(t.refresh) : await refreshMicrosoft(t.refresh, t.scope);
   const next: OAuthTokens = {
     access: refreshed.access_token,
     refresh: refreshed.refresh_token || t.refresh,

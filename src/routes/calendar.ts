@@ -4,6 +4,7 @@ import { getAuth } from "@clerk/express";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
+import { scheduledMeetings } from "../db/schema/scheduled-meetings";
 import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
@@ -159,13 +160,27 @@ router.get(
 
     const now = new Date();
     type Meeting = {
-      id: string; source: "google" | "outlook" | "calendly";
+      id: string; source: "google" | "outlook" | "calendly" | "leadey";
       title: string; startTime: string | null; endTime: string | null;
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
     };
     const meetings: Meeting[] = [];
     const leadEmail = (lead.email || "").trim().toLowerCase();
+
+    // Meetings booked from inside Leadey for this lead — shown instantly (before
+    // the 5-min calendar sync pulls the same event). Their providerEventIds also
+    // suppress the synced copy below so a meeting never appears twice.
+    const booked = await db
+      .select()
+      .from(scheduledMeetings)
+      .where(and(
+        eq(scheduledMeetings.organizationId, orgId),
+        eq(scheduledMeetings.leadId, lead.id),
+        eq(scheduledMeetings.status, "confirmed"),
+        gte(scheduledMeetings.startTime, now),
+      ));
+    const bookedEventIds = new Set(booked.map((m) => m.providerEventId));
 
     if (candidates.size > 0) {
       const rows = await db
@@ -179,6 +194,8 @@ router.get(
         ));
       const seenEvent = new Set<string>();
       for (const { ev, provider } of rows) {
+        // Skip the synced copy of a meeting we already show from scheduled_meetings.
+        if (ev.providerEventId && bookedEventIds.has(ev.providerEventId)) continue;
         const attendees = ev.attendeeEmails || [];
         if (!attendees.some((e) => candidates.has(e))) continue;
         // De-dupe the same meeting synced from two reps' calendars (by title+start).
@@ -229,7 +246,24 @@ router.get(
       });
     }
 
+    // Leadey-booked meetings for this lead.
+    for (const m of booked) {
+      meetings.push({
+        id: m.id,
+        source: "leadey",
+        title: m.title || "Meeting",
+        startTime: m.startTime ? m.startTime.toISOString() : null,
+        endTime: m.endTime ? m.endTime.toISOString() : null,
+        joinUrl: m.joinUrl,
+        location: m.location,
+        organizerEmail: m.hostEmail,
+        responseStatus: null,
+      });
+    }
+
     meetings.sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
+    // A Leadey-connected email account can also host — so the section shouldn't
+    // nag about "connect a calendar" when the org can already book meetings.
     res.json({ data: { meetings, calendarConnected: calCount > 0 } });
   }),
 );

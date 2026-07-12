@@ -610,6 +610,13 @@
       "when": 1783880700655,
       "tag": "0086_rare_cerise",
       "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1783888273750,
+      "tag": "0087_majestic_the_spike",
+      "breakpoints": true
     }
   ]
 }

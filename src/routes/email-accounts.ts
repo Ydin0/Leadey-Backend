@@ -13,7 +13,7 @@ import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
 import { ApiError, createId } from "../lib/helpers";
 import { signState, verifyState, encryptSecret } from "../lib/crypto";
-import { sendEmailVia, verifySmtp, packTokens, type EmailAttachment } from "../lib/email-providers";
+import { sendEmailVia, verifySmtp, packTokens, accountCanSchedule, type EmailAttachment } from "../lib/email-providers";
 import { readAttachmentFile } from "../lib/template-attachment-storage";
 
 const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024; // providers cap ~25MB total incl. encoding
@@ -84,6 +84,9 @@ function serializeAccount(a: typeof emailAccounts.$inferSelect) {
     signatureId: a.signatureId ?? null,
     status: a.status,
     isDefault: a.isDefault,
+    /** True when this account's token can create calendar events (host a
+     *  meeting). Older send-only connections are false until reconnected. */
+    canSchedule: accountCanSchedule(a),
     createdAt: a.createdAt.toISOString(),
   };
 }
@@ -102,7 +105,7 @@ const OAUTH = {
   google: {
     authorize: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
-    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
     clientId: () => process.env.GOOGLE_CLIENT_ID || "",
     clientSecret: () => process.env.GOOGLE_CLIENT_SECRET || "",
     extraAuth: { access_type: "offline", prompt: "consent" } as Record<string, string>,
@@ -111,7 +114,7 @@ const OAUTH = {
   microsoft: {
     authorize: `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT || "common"}/oauth2/v2.0/authorize`,
     token: `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT || "common"}/oauth2/v2.0/token`,
-    scope: "offline_access Mail.Send Mail.Read User.Read",
+    scope: "offline_access Mail.Send Mail.Read Calendars.ReadWrite User.Read",
     clientId: () => process.env.MICROSOFT_CLIENT_ID || "",
     clientSecret: () => process.env.MICROSOFT_CLIENT_SECRET || "",
     extraAuth: { response_mode: "query" } as Record<string, string>,
