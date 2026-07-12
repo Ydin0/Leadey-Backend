@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, count } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
 import { scheduledMeetings } from "../db/schema/scheduled-meetings";
@@ -10,7 +10,8 @@ import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { accountCanSchedule } from "../lib/email-providers";
-import { getBusyIntervals } from "../lib/availability";
+import { getBusyIntervals, computeSlots, localDateInTz } from "../lib/availability";
+import { getRoundRobinPool } from "./booking-pages";
 import { createMeetingEvent, cancelMeetingEvent, type MeetingAttendee } from "../lib/meeting-scheduler";
 
 type Account = typeof emailAccounts.$inferSelect;
@@ -61,7 +62,42 @@ router.post(
     let video = b.video !== false;
     let title = String(b.title || "").trim() || "Meeting";
     let page: typeof bookingPages.$inferSelect | undefined;
-    if (bookingPageId) {
+    const roundRobin = b.roundRobin === true;
+    if (roundRobin) {
+      // Team round-robin: find every rep who genuinely offers this slot (in
+      // their hours AND free), then auto-assign the least-loaded one.
+      const pool = await getRoundRobinPool(orgId);
+      if (pool.length === 0) throw new ApiError(400, "No reps are set up for round-robin booking.");
+      const start = new Date(startISO);
+      const nowD = new Date();
+      const candidates: typeof pool = [];
+      for (const entry of pool) {
+        const { page: pp, account: acc } = entry;
+        const localDate = localDateInTz(startISO, pp.timezone);
+        const busy = pp.respectCalendar
+          ? await getBusyIntervals(acc, new Date(start.getTime() - 60_000), new Date(start.getTime() + pp.durationMin * 60_000 + 60_000)).catch(() => [])
+          : [];
+        const days = computeSlots(pp, localDate, localDate, nowD, busy);
+        if (days[0]?.slots.includes(start.toISOString())) candidates.push(entry);
+      }
+      if (candidates.length === 0) throw new ApiError(409, "That time was just taken — pick another slot.");
+      // Fair assignment: fewest meetings hosted so far, ties broken at random.
+      const userIds = candidates.map((c) => c.account.userId);
+      const counts = await db
+        .select({ uid: scheduledMeetings.hostUserId, c: count() })
+        .from(scheduledMeetings)
+        .where(and(eq(scheduledMeetings.organizationId, orgId), eq(scheduledMeetings.status, "confirmed"), inArray(scheduledMeetings.hostUserId, userIds)))
+        .groupBy(scheduledMeetings.hostUserId);
+      const countBy = new Map(counts.map((r) => [r.uid, Number(r.c)]));
+      const minCount = Math.min(...candidates.map((c) => countBy.get(c.account.userId) ?? 0));
+      const least = candidates.filter((c) => (countBy.get(c.account.userId) ?? 0) === minCount);
+      const picked = least[Math.floor(Math.random() * least.length)];
+      account = picked.account;
+      page = picked.page;
+      durationMin = page.durationMin;
+      video = page.video;
+      if (!title || title === "Meeting") title = page.name;
+    } else if (bookingPageId) {
       [page] = await db.select().from(bookingPages).where(and(eq(bookingPages.id, bookingPageId), eq(bookingPages.organizationId, orgId)));
       if (!page) throw new ApiError(404, "Booking page not found");
       const accts = await db.select().from(emailAccounts).where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, page.userId)));

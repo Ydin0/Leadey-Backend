@@ -1,0 +1,1 @@
+ALTER TABLE "booking_pages" ADD COLUMN "round_robin" boolean DEFAULT true NOT NULL;

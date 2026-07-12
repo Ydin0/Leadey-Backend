@@ -40,6 +40,11 @@ export function zonedToUtc(y: number, m: number, d: number, hh: number, mm: numb
   return new Date(guess - off2);
 }
 
+/** The calendar date (YYYY-MM-DD) a UTC instant falls on in a timezone. */
+export function localDateInTz(iso: string, tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(iso));
+}
+
 const WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
 type WeekdayKey = (typeof WEEKDAY_KEYS)[number];
 

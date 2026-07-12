@@ -48,6 +48,9 @@ export const bookingPages = pgTable(
     availability: jsonb("availability").$type<WeeklyAvailability>().notNull().default(DEFAULT_AVAILABILITY),
     /** When true, subtract the host's live calendar busy times from availability. */
     respectCalendar: boolean("respect_calendar").notNull().default(true),
+    /** Participate in the team "All" round-robin pool (combined availability;
+     *  bookings are auto-assigned to a free rep). On by default. */
+    roundRobin: boolean("round_robin").notNull().default(true),
     bufferBeforeMin: integer("buffer_before_min").notNull().default(0),
     bufferAfterMin: integer("buffer_after_min").notNull().default(0),
     /** Earliest a slot can be booked, minutes from now. */

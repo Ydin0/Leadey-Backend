@@ -24,6 +24,7 @@ function serialize(p: Page) {
   return {
     id: p.id, userId: p.userId, name: p.name, durationMin: p.durationMin, video: p.video,
     timezone: p.timezone, availability: p.availability, respectCalendar: p.respectCalendar,
+    roundRobin: p.roundRobin,
     bufferBeforeMin: p.bufferBeforeMin, bufferAfterMin: p.bufferAfterMin,
     minNoticeMin: p.minNoticeMin, maxDaysAhead: p.maxDaysAhead, isActive: p.isActive, isDefault: p.isDefault,
   };
@@ -122,6 +123,7 @@ router.post(
       timezone: typeof b.timezone === "string" && b.timezone ? b.timezone : "UTC",
       availability: sanitizeAvailability(b.availability),
       respectCalendar: b.respectCalendar !== false,
+      roundRobin: b.roundRobin !== false,
       bufferBeforeMin: clampInt(b.bufferBeforeMin, 0, 240, 0),
       bufferAfterMin: clampInt(b.bufferAfterMin, 0, 240, 0),
       minNoticeMin: clampInt(b.minNoticeMin, 0, 20160, 240),
@@ -150,6 +152,7 @@ router.patch(
     if (b.timezone !== undefined) set.timezone = String(b.timezone) || "UTC";
     if (b.availability !== undefined) set.availability = sanitizeAvailability(b.availability);
     if (b.respectCalendar !== undefined) set.respectCalendar = !!b.respectCalendar;
+    if (b.roundRobin !== undefined) set.roundRobin = !!b.roundRobin;
     if (b.bufferBeforeMin !== undefined) set.bufferBeforeMin = clampInt(b.bufferBeforeMin, 0, 240, page.bufferBeforeMin);
     if (b.bufferAfterMin !== undefined) set.bufferAfterMin = clampInt(b.bufferAfterMin, 0, 240, page.bufferAfterMin);
     if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 20160, page.minNoticeMin);
@@ -203,6 +206,65 @@ router.get(
     res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days } });
   }),
 );
+
+// ─── GET /booking-pages/availability/round-robin?from&to — combined pool ──
+// Union of availability across every rep's round-robin booking page (one page
+// per rep). A slot is offered if ANY rep is free — booking then auto-assigns.
+router.get(
+  "/booking-pages/availability/round-robin",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const from = String(req.query.from || "");
+    const to = String(req.query.to || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new ApiError(400, "from/to (YYYY-MM-DD) required");
+
+    const pool = await getRoundRobinPool(orgId);
+    if (pool.length === 0) {
+      res.json({ data: { timezone: "UTC", durationMin: 30, video: true, days: [] } });
+      return;
+    }
+    const now = new Date();
+    const all = new Set<string>();
+    for (const { page, account } of pool) {
+      let busy: { start: Date; end: Date }[] = [];
+      if (page.respectCalendar) {
+        const w = windowUtc(from, to, page.timezone);
+        busy = await getBusyIntervals(account, w.fromUtc, w.toUtc).catch(() => []);
+      }
+      for (const day of computeSlots(page as WeeklyPage, from, to, now, busy)) {
+        for (const s of day.slots) all.add(s);
+      }
+    }
+    const slots = [...all].sort();
+    res.json({ data: { timezone: pool[0].page.timezone, durationMin: pool[0].page.durationMin, video: pool[0].page.video, days: [{ date: "pool", slots }] } });
+  }),
+);
+
+/** One round-robin booking page per rep (with a calendar-capable mailbox). */
+export async function getRoundRobinPool(orgId: string): Promise<{ page: Page; account: Account }[]> {
+  const pages = await db
+    .select()
+    .from(bookingPages)
+    .where(and(eq(bookingPages.organizationId, orgId), eq(bookingPages.isActive, true), eq(bookingPages.roundRobin, true)))
+    .orderBy(asc(bookingPages.createdAt));
+  const byUser = new Map<string, Page>();
+  for (const p of pages) if (!byUser.has(p.userId)) byUser.set(p.userId, p);
+  const pool: { page: Page; account: Account }[] = [];
+  for (const [userId, page] of byUser) {
+    const account = await resolveHostAccount(orgId, userId);
+    if (account) pool.push({ page, account });
+  }
+  return pool;
+}
+
+function windowUtc(from: string, to: string, tz: string): { fromUtc: Date; toUtc: Date } {
+  const [fy, fm, fd] = from.split("-").map(Number);
+  const [ty, tm, td] = to.split("-").map(Number);
+  return {
+    fromUtc: new Date(zonedToUtc(fy, fm, fd, 0, 0, tz).getTime() - 86_400_000),
+    toUtc: new Date(zonedToUtc(ty, tm, td, 23, 59, tz).getTime() + 86_400_000),
+  };
+}
 
 type WeeklyPage = Page & { availability: WeeklyAvailability };
 
