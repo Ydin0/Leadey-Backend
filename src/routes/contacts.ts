@@ -665,6 +665,64 @@ router.post(
   }),
 );
 
+// ─── POST /contacts/dedupe ───────────────────────────────────────────
+// Remove duplicate discovered contacts within an assignment, keeping one row
+// per LinkedIn profile. Prefers the enriched copy (has an email/phone), then
+// the earliest-discovered. Contacts without a LinkedIn URL are left untouched
+// (nothing reliable to dedupe them on). Safe to run repeatedly.
+router.post(
+  "/contacts/dedupe",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const assignmentId = typeof req.body?.assignmentId === "string" ? req.body.assignmentId : null;
+    if (!assignmentId) throw new ApiError(400, "assignmentId is required");
+
+    const rows = await db
+      .select({
+        id: scraperContacts.id,
+        linkedinUrl: scraperContacts.linkedinUrl,
+        email: scraperContacts.email,
+        phone: scraperContacts.phone,
+        createdAt: scraperContacts.createdAt,
+      })
+      .from(scraperContacts)
+      .where(and(eq(scraperContacts.organizationId, orgId), eq(scraperContacts.assignmentId, assignmentId)));
+
+    // Keep the best row per normalized LinkedIn URL; collect the rest to delete.
+    const best = new Map<string, { id: string; score: number; createdAt: Date }>();
+    const losers: string[] = [];
+    for (const r of rows) {
+      const url = (r.linkedinUrl || "").trim().toLowerCase();
+      if (!url) continue; // can't dedupe without a stable key
+      const score = r.email || r.phone ? 1 : 0; // prefer an enriched copy
+      const createdAt = r.createdAt ?? new Date(0);
+      const cur = best.get(url);
+      if (!cur) {
+        best.set(url, { id: r.id, score, createdAt });
+        continue;
+      }
+      const isBetter = score > cur.score || (score === cur.score && createdAt < cur.createdAt);
+      if (isBetter) {
+        losers.push(cur.id);
+        best.set(url, { id: r.id, score, createdAt });
+      } else {
+        losers.push(r.id);
+      }
+    }
+
+    let removed = 0;
+    for (let i = 0; i < losers.length; i += 500) {
+      const chunk = losers.slice(i, i + 500);
+      await db
+        .delete(scraperContacts)
+        .where(and(eq(scraperContacts.organizationId, orgId), inArray(scraperContacts.id, chunk)));
+      removed += chunk.length;
+    }
+
+    res.json({ data: { removed, kept: best.size } });
+  }),
+);
+
 // ─── GET /contacts/company-counts ────────────────────────────────────
 // Per-company contact counts. Scoped to an assignment when assignmentId is
 // provided, otherwise org-wide (used by the org Leads page).
