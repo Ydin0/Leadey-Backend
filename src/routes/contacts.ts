@@ -450,6 +450,25 @@ router.post(
       return void res.json({ data: updated });
     }
 
+    // ── Claim the run before ingesting (idempotency guard) ──────────────────
+    // The frontend polls this endpoint on an 8s interval, but ingesting
+    // thousands of contacts takes far longer, so multiple poll requests overlap.
+    // Without a claim, each overlapping poll re-ran the ENTIRE ingestion — and
+    // since the dedup set is seeded from the DB at the start of each request,
+    // concurrent runs never saw each other's inserts, so every contact was
+    // duplicated once per overlapping poll. Atomically flip running→ingesting so
+    // exactly one request ingests; the losers return the in-progress state.
+    const claimed = await db
+      .update(discoveryRuns)
+      .set({ status: "ingesting" })
+      .where(and(eq(discoveryRuns.id, runId), eq(discoveryRuns.status, "running")))
+      .returning({ id: discoveryRuns.id });
+    if (claimed.length === 0) {
+      const [current] = await db.select().from(discoveryRuns).where(eq(discoveryRuns.id, runId));
+      const done = current?.status === "succeeded" || current?.status === "failed";
+      return void res.json({ data: done ? current : { ...current, apifyStatus: "RUNNING" } });
+    }
+
     // At least some succeeded — collect dataset IDs from succeeded runs
     const datasetIds: string[] = [];
     for (let i = 0; i < statuses.length; i++) {
