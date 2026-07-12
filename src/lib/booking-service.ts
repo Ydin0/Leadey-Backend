@@ -1,6 +1,7 @@
 import { and, eq, inArray, count } from "drizzle-orm";
 import { db } from "../db/index";
 import { emailAccounts } from "../db/schema/email-accounts";
+import { users } from "../db/schema/organizations";
 import { scheduledMeetings } from "../db/schema/scheduled-meetings";
 import { bookingPages, bookingPageMembers } from "../db/schema/booking-pages";
 import { accountCanSchedule } from "./email-providers";
@@ -47,25 +48,42 @@ function windowUtc(from: string, to: string, tz: string): { fromUtc: Date; toUtc
   };
 }
 
+export interface PoolAvailability {
+  days: DaySlots[];
+  /** Which host userIds are free at each slot (UTC ISO → userIds). */
+  hostsBySlot: Record<string, string[]>;
+}
+
 /** Combined availability across a page's hosts (a slot is offered if ANY host
- *  is free), using the page's shared config. */
-export async function computePageAvailability(page: Page, hosts: PageHost[], from: string, to: string): Promise<DaySlots[]> {
+ *  is free), using the page's shared config, plus which hosts are free per slot. */
+export async function computePageAvailability(page: Page, hosts: PageHost[], from: string, to: string): Promise<PoolAvailability> {
   const now = new Date();
-  const all = new Set<string>();
-  for (const { account } of hosts) {
+  const hostsBySlot: Record<string, string[]> = {};
+  for (const { userId, account } of hosts) {
     let busy: { start: Date; end: Date }[] = [];
     if (page.respectCalendar) {
       const w = windowUtc(from, to, page.timezone);
       busy = await getBusyIntervals(account, w.fromUtc, w.toUtc).catch(() => []);
     }
-    for (const day of computeSlots(page, from, to, now, busy)) for (const s of day.slots) all.add(s);
+    for (const day of computeSlots(page, from, to, now, busy)) {
+      for (const s of day.slots) (hostsBySlot[s] ??= []).push(userId);
+    }
   }
   const byDate = new Map<string, string[]>();
-  for (const iso of all) {
+  for (const iso of Object.keys(hostsBySlot)) {
     const k = localDateInTz(iso, page.timezone);
     (byDate.get(k) ?? byDate.set(k, []).get(k)!).push(iso);
   }
-  return [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, slots]) => ({ date, slots: slots.sort() }));
+  const days = [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, slots]) => ({ date, slots: slots.sort() }));
+  return { days, hostsBySlot };
+}
+
+/** userId → display name for a set of hosts (for slot avatars). */
+export async function hostNames(userIds: string[]): Promise<{ userId: string; name: string }[]> {
+  const ids = [...new Set(userIds)];
+  if (ids.length === 0) return [];
+  const rows = await db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email }).from(users).where(inArray(users.id, ids));
+  return rows.map((r) => ({ userId: r.id, name: [r.firstName, r.lastName].filter(Boolean).join(" ") || r.email || "" }));
 }
 
 /** Among a page's hosts, those who genuinely offer `startISO` (in-hours + free). */

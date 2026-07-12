@@ -11,7 +11,7 @@ import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, zonedToUtc } from "../lib/availability";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
-import { resolveHostAccount, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug } from "../lib/booking-service";
+import { resolveHostAccount, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
 
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
@@ -136,6 +136,29 @@ router.get(
   }),
 );
 
+// ─── GET /booking-pages/all — every active org page (for the modal selector) ─
+router.get(
+  "/booking-pages/all",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const pages = await db
+      .select()
+      .from(bookingPages)
+      .where(and(eq(bookingPages.organizationId, orgId), eq(bookingPages.isActive, true)))
+      .orderBy(asc(bookingPages.createdAt));
+    const memberMap = await membersByPage(pages.map((p) => p.id));
+    const owners = await hostNames(pages.map((p) => p.userId));
+    const ownerName = new Map(owners.map((o) => [o.userId, o.name]));
+    res.json({
+      data: pages.map((p) => ({
+        id: p.id, name: p.name, durationMin: p.durationMin, video: p.video,
+        ownerName: ownerName.get(p.userId) || "",
+        memberCount: (memberMap.get(p.id) || []).length,
+      })),
+    });
+  }),
+);
+
 // ─── POST /booking-pages ──────────────────────────────────────────────────
 router.post(
   "/booking-pages",
@@ -241,8 +264,8 @@ router.get(
 
     // Combined availability across the page's host pool (owner + members).
     const hosts = await getPageHosts(orgId, page);
-    const days = await computePageAvailability(page, hosts, from, to);
-    res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days } });
+    const { days, hostsBySlot } = await computePageAvailability(page, hosts, from, to);
+    res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days, hostsBySlot, hosts: await hostNames(hosts.map((h) => h.userId)) } });
   }),
 );
 
@@ -263,7 +286,7 @@ router.get(
       return;
     }
     const now = new Date();
-    const all = new Set<string>();
+    const hostsBySlot: Record<string, string[]> = {};
     for (const { page, account } of pool) {
       let busy: { start: Date; end: Date }[] = [];
       if (page.respectCalendar) {
@@ -271,11 +294,16 @@ router.get(
         busy = await getBusyIntervals(account, w.fromUtc, w.toUtc).catch(() => []);
       }
       for (const day of computeSlots(page as WeeklyPage, from, to, now, busy)) {
-        for (const s of day.slots) all.add(s);
+        for (const s of day.slots) (hostsBySlot[s] ??= []).push(account.userId);
       }
     }
-    const slots = [...all].sort();
-    res.json({ data: { timezone: pool[0].page.timezone, durationMin: pool[0].page.durationMin, video: pool[0].page.video, days: [{ date: "pool", slots }] } });
+    const slots = Object.keys(hostsBySlot).sort();
+    res.json({
+      data: {
+        timezone: pool[0].page.timezone, durationMin: pool[0].page.durationMin, video: pool[0].page.video,
+        days: [{ date: "pool", slots }], hostsBySlot, hosts: await hostNames(pool.map((p) => p.account.userId)),
+      },
+    });
   }),
 );
 

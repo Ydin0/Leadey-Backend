@@ -65,7 +65,8 @@ bookingPublicRouter.get(
     const to = String(req.query.to || "");
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) { res.status(400).json({ error: { message: "from/to required" } }); return; }
     const hosts = await getPageHosts(page.organizationId, page);
-    const days = await computePageAvailability(page, hosts, from, to);
+    // Public page doesn't expose which internal rep is free (privacy) — days only.
+    const { days } = await computePageAvailability(page, hosts, from, to);
     res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days } });
   }),
 );
