@@ -850,6 +850,25 @@ router.get(
     const startUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     startUtc.setUTCDate(startUtc.getUTCDate() - (ANALYTICS_DAYS - 1));
 
+    // Resolve which stored outcome KEYS mean "voicemail" for this org. A call's
+    // outcome column holds the outcome KEY, and a renamed outcome keeps its
+    // original key — so an outcome relabelled "Voicemail" may have a key like
+    // "no_answer" that never contains the substring "voicemail". Match against
+    // the org's actual catalog (by key OR label) instead of a fragile substring.
+    const { getCallOutcomes } = await import("../lib/call-outcomes");
+    const orgOutcomes = await getCallOutcomes(orgId);
+    const vmKeys = orgOutcomes
+      .filter((o) => o.key.toLowerCase().includes("voicemail") || o.label.toLowerCase().includes("voicemail"))
+      .map((o) => o.key.toLowerCase());
+    const vmKeyMatch = vmKeys.length
+      ? sql`lower(${callRecords.outcome}) in (${sql.join(vmKeys.map((k) => sql`${k}`), sql`, `)})`
+      : sql`false`;
+    // A call reached voicemail when the telephony disposition says so, or its
+    // outcome resolves to a "voicemail" outcome, or the raw value mentions it.
+    // coalesce → a proper boolean even when outcome/disposition is NULL, so the
+    // `not vmCond` used by the connect-rate filter never goes NULL.
+    const vmCond = sql`coalesce(${callRecords.disposition} = 'voicemail' or ${vmKeyMatch} or ${callRecords.outcome} ilike '%voicemail%', false)`;
+
     // Per-rep calls + talk time (sum of call duration, seconds) by UTC day.
     const callRows = await db
       .select({
@@ -858,11 +877,9 @@ router.get(
         c: count(),
         // Connected = a PERSON picked up: talk time > 0 (ringing excluded) and
         // not a voicemail/machine. Drives the connect-rate stat.
-        connected: sql<number>`coalesce(count(*) filter (where ${callRecords.duration} > 0 and ${callRecords.disposition} <> 'voicemail' and coalesce(${callRecords.outcome}, '') not ilike '%voicemail%'), 0)`,
-        // Calls that reached voicemail: the telephony disposition (VM drop /
-        // dialer voicemail disposition) OR a voicemail sales outcome
-        // (AI-classified or set by the rep on the call card).
-        voicemail: sql<number>`coalesce(count(*) filter (where ${callRecords.disposition} = 'voicemail' or ${callRecords.outcome} ilike '%voicemail%'), 0)`,
+        connected: sql<number>`coalesce(count(*) filter (where ${callRecords.duration} > 0 and not ${vmCond}), 0)`,
+        // Calls that reached voicemail (disposition or a voicemail outcome).
+        voicemail: sql<number>`coalesce(count(*) filter (where ${vmCond}), 0)`,
         talk: sql<number>`coalesce(sum(${callRecords.duration}), 0)`,
         // Direction splits — outbound vs inbound calls + talk time.
         outC: sql<number>`coalesce(count(*) filter (where ${callRecords.direction} = 'outbound'), 0)`,
