@@ -1,11 +1,13 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, gte, lte, sql } from "drizzle-orm";
+import { eq, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
 import { calendlyAccounts, calendlyMeetings } from "../db/schema/calendly";
 import { scheduledMeetings } from "../db/schema/scheduled-meetings";
-import { leads } from "../db/schema/leads";
+import { emailAccounts } from "../db/schema/email-accounts";
+import { getEventStatus } from "../lib/meeting-scheduler";
+import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
@@ -171,7 +173,7 @@ router.get(
     // Meetings booked from inside Leadey for this lead — shown instantly (before
     // the 5-min calendar sync pulls the same event). Their providerEventIds also
     // suppress the synced copy below so a meeting never appears twice.
-    const booked = await db
+    let booked = await db
       .select()
       .from(scheduledMeetings)
       .where(and(
@@ -180,6 +182,36 @@ router.get(
         eq(scheduledMeetings.status, "confirmed"),
         gte(scheduledMeetings.startTime, now),
       ));
+
+    // Reconcile against the host calendar so a meeting the host cancelled
+    // directly in Google/Outlook disappears here too. Only definitive
+    // cancelled/missing states drop it; API errors keep it (fail-open).
+    if (booked.length) {
+      const acctIds = [...new Set(booked.map((m) => m.hostAccountId).filter((x): x is string => !!x))];
+      const accts = acctIds.length
+        ? await db.select().from(emailAccounts).where(inArray(emailAccounts.id, acctIds))
+        : [];
+      const acctById = new Map(accts.map((a) => [a.id, a]));
+      const keep = await Promise.all(booked.map(async (m) => {
+        const acc = m.hostAccountId ? acctById.get(m.hostAccountId) : null;
+        if (!acc) return true;
+        try {
+          const st = await getEventStatus(acc, m.provider as "google" | "microsoft", m.providerEventId);
+          if (st === "cancelled" || st === "missing") {
+            await db.update(scheduledMeetings).set({ status: "cancelled", updatedAt: new Date() }).where(eq(scheduledMeetings.id, m.id));
+            if (m.leadId) {
+              await db.insert(leadEvents).values({
+                id: createId("event"), leadId: m.leadId, type: "meeting_canceled", outcome: "canceled", stepIndex: 0,
+                meta: { channel: "leadey", title: m.title, reason: "cancelled_externally" }, timestamp: new Date(),
+              });
+            }
+            return false;
+          }
+        } catch { /* keep on transient error */ }
+        return true;
+      }));
+      booked = booked.filter((_, i) => keep[i]);
+    }
     const bookedEventIds = new Set(booked.map((m) => m.providerEventId));
 
     if (candidates.size > 0) {

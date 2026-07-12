@@ -87,6 +87,33 @@ async function createOutlookEvent(token: string, input: CreateMeetingInput): Pro
   return { provider: "microsoft", providerEventId: String(data.id), joinUrl: data.onlineMeeting?.joinUrl || null };
 }
 
+/** Current status of a previously-created event on the host calendar, so we can
+ *  reflect a cancellation the host made directly in Google/Outlook. */
+export async function getEventStatus(
+  account: Account,
+  provider: "google" | "microsoft",
+  providerEventId: string,
+): Promise<"confirmed" | "cancelled" | "missing"> {
+  const token = await getAccessToken(account);
+  if (provider === "google") {
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(providerEventId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (res.status === 404 || res.status === 410) return "missing";
+    if (!res.ok) throw new Error(`Google event status failed: ${res.status}`);
+    const data = await res.json().catch(() => ({}));
+    return data?.status === "cancelled" ? "cancelled" : "confirmed";
+  }
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/events/${encodeURIComponent(providerEventId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return "missing";
+  if (!res.ok) throw new Error(`Microsoft event status failed: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  return data?.isCancelled ? "cancelled" : "confirmed";
+}
+
 /** Cancel a previously-created event and notify attendees. Best-effort: a
  *  already-deleted event (404/410) is treated as success. */
 export async function cancelMeetingEvent(
