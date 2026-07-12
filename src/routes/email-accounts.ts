@@ -100,7 +100,7 @@ const OAUTH = {
   google: {
     authorize: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
-    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email",
+    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
     clientId: () => process.env.GOOGLE_CLIENT_ID || "",
     clientSecret: () => process.env.GOOGLE_CLIENT_SECRET || "",
     extraAuth: { access_type: "offline", prompt: "consent" } as Record<string, string>,
@@ -521,6 +521,13 @@ publicRouter.get(
         name = me.displayName || "";
       }
       if (!email) return fail("Could not read mailbox address");
+
+      // Fallback so the sender NAME is never left empty (otherwise the provider
+      // sends with the email address AS the display name). Prefer the OAuth
+      // profile name; else the Leadey user's own name.
+      if (!name.trim()) {
+        name = (await resolveUserName(claims.userId)) || "";
+      }
 
       const tokens = packTokens({
         access: tok.access_token,
