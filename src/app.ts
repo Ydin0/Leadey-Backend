@@ -49,6 +49,7 @@ import emailAccountsRouter, { emailPublicRouter } from "./routes/email-accounts"
 import emailThreadsRouter from "./routes/email-threads";
 import calendlyRouter, { calendlyPublicRouter } from "./routes/calendly";
 import calendarRouter, { calendarPublicRouter } from "./routes/calendar";
+import meetingTranscriptsRouter from "./routes/meeting-transcripts";
 import assistantRouter from "./routes/assistant";
 import callsRouter from "./routes/calls";
 import callOutcomesRouter from "./routes/call-outcomes";
@@ -136,6 +137,7 @@ app.use("/api", settingsRouter);
 app.use("/api", unipileRouter);
 app.use("/api", linkedinRouter);
 app.use("/api", meetingsRouter);
+app.use("/api", meetingTranscriptsRouter);
 app.use("/api", bookingPagesRouter);
 app.use("/api", twilioAuthRouter);
 app.use("/api", phoneLineRouter);

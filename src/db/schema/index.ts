@@ -24,6 +24,7 @@ export { orgRoles } from "./org-roles";
 export { organizationMemberships } from "./organization-memberships";
 export { phoneLines } from "./phone-lines";
 export { phoneLookups } from "./phone-lookups";
+export { meetingTranscripts } from "./meeting-transcripts";
 export { regulatoryBundles, bundleDocuments } from "./regulatory-bundles";
 export { callRecords } from "./call-records";
 export { scraperAssignments, scraperRuns, scraperSignals } from "./scrapers";
