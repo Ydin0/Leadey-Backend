@@ -1,4 +1,4 @@
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
 import { users } from "../db/schema/organizations";
@@ -30,6 +30,45 @@ function readTokens(enc: string | null): CalTokens | null {
 
 const norm = (e: string | null | undefined) => (e || "").trim().toLowerCase();
 
+/** A sync error that carries the upstream HTTP status so the runner can tell a
+ *  transient blip (5xx / 429 / timeout) apart from a real auth failure. */
+class CalendarSyncError extends Error {
+  status?: number;
+  auth: boolean;
+  constructor(message: string, opts: { status?: number; auth?: boolean } = {}) {
+    super(message);
+    this.name = "CalendarSyncError";
+    this.status = opts.status;
+    this.auth = !!opts.auth;
+  }
+}
+
+/** How many CONSECUTIVE transient failures before we give up and ask the rep to
+ *  reconnect. At a 5-minute cadence this is ~30 min of continuous failure. */
+const TRANSIENT_ESCALATE_AFTER = 6;
+
+/** Is this a permanent problem the rep must fix (revoked/expired token, mailbox
+ *  gone) versus a transient one we should just retry next tick? */
+function isAuthFailure(err: unknown): boolean {
+  if (err instanceof CalendarSyncError) {
+    if (err.auth) return true;
+    if (err.status === 401 || err.status === 403 || err.status === 404) return true;
+    if (err.status && err.status >= 500) return false; // 5xx = transient
+    if (err.status === 429 || err.status === 408) return false; // rate limit / timeout
+  }
+  // Fall back to message sniffing for errors without a status (e.g. token refresh).
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (/invalid_grant|invalid_client|unauthorized|invalidauthenticationtoken|token (has )?expired|access.?denied|forbidden/.test(msg)) {
+    return true;
+  }
+  // Network / timeout / gateway errors are transient.
+  if (/\b(429|500|502|503|504)\b|timeout|etimedout|econnreset|enotfound|socket hang up|fetch failed|network/.test(msg)) {
+    return false;
+  }
+  // Unknown → treat as transient so a one-off never fires a false reconnect email.
+  return false;
+}
+
 async function refreshGoogle(refresh: string) {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -42,7 +81,13 @@ async function refreshGoogle(refresh: string) {
     }),
   });
   const data = await res.json().catch(() => null);
-  if (!res.ok || !data?.access_token) throw new Error(`Google token refresh failed: ${data?.error_description || data?.error || res.status}`);
+  if (!res.ok || !data?.access_token) {
+    const code = data?.error || "";
+    // invalid_grant = revoked/expired refresh token → real auth failure; a 5xx
+    // from Google's token endpoint is transient.
+    const auth = code === "invalid_grant" || code === "invalid_client" || res.status === 400 || res.status === 401;
+    throw new CalendarSyncError(`Google token refresh failed: ${data?.error_description || code || res.status}`, { status: res.status, auth });
+  }
   return data as { access_token: string; expires_in: number; refresh_token?: string };
 }
 
@@ -59,7 +104,11 @@ async function refreshMicrosoft(refresh: string) {
     }),
   });
   const data = await res.json().catch(() => null);
-  if (!res.ok || !data?.access_token) throw new Error(`Microsoft token refresh failed: ${data?.error_description || data?.error || res.status}`);
+  if (!res.ok || !data?.access_token) {
+    const code = data?.error || "";
+    const auth = code === "invalid_grant" || code === "invalid_client" || res.status === 400 || res.status === 401;
+    throw new CalendarSyncError(`Microsoft token refresh failed: ${data?.error_description || code || res.status}`, { status: res.status, auth });
+  }
   return data as { access_token: string; expires_in: number; refresh_token?: string };
 }
 
@@ -126,7 +175,7 @@ async function fetchGoogleEvents(token: string): Promise<NormalizedEvent[]> {
       headers: { Authorization: `Bearer ${token}` },
     });
     const data = await res.json().catch(() => null);
-    if (!res.ok) throw new Error(`Google calendar fetch failed: ${data?.error?.message || res.status}`);
+    if (!res.ok) throw new CalendarSyncError(`Google calendar fetch failed: ${data?.error?.message || res.status}`, { status: res.status });
     for (const ev of data.items || []) {
       const responses: Record<string, RsvpStatus> = {};
       for (const a of ev.attendees || []) {
@@ -168,7 +217,7 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
       headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.timezone="UTC"' },
     });
     const data: any = await res.json().catch(() => null);
-    if (!res.ok) throw new Error(`Microsoft calendar fetch failed: ${data?.error?.message || res.status}`);
+    if (!res.ok) throw new CalendarSyncError(`Microsoft calendar fetch failed: ${data?.error?.message || res.status}`, { status: res.status });
     for (const ev of data.value || []) {
       const responses: Record<string, RsvpStatus> = {};
       for (const a of ev.attendees || []) {
@@ -254,7 +303,7 @@ export async function syncAccount(account: Account): Promise<void> {
   }
 
   await db.update(calendarAccounts)
-    .set({ lastSyncedAt: now, status: "active", lastError: null, updatedAt: now })
+    .set({ lastSyncedAt: now, status: "active", lastError: null, syncFailures: 0, updatedAt: now })
     .where(eq(calendarAccounts.id, account.id));
   // Re-arm the disconnect alert for a future failure.
   void clearEmailClaim(`calendar_disconnected:${account.id}`);
@@ -263,7 +312,11 @@ export async function syncAccount(account: Account): Promise<void> {
 async function syncAll(): Promise<void> {
   let accounts: Account[] = [];
   try {
-    accounts = await db.select().from(calendarAccounts).where(eq(calendarAccounts.status, "active"));
+    // Include "error" accounts too: a transient blip may have flipped one, and
+    // retrying lets it self-heal (a successful sync flips it back to active).
+    // Genuinely-broken (auth) accounts just fail again — cheap, and the
+    // reconnect email stays deduped until they actually reconnect.
+    accounts = await db.select().from(calendarAccounts).where(inArray(calendarAccounts.status, ["active", "error"]));
   } catch (err) {
     console.error("[calendar-sync] could not load accounts:", err);
     return;
@@ -272,9 +325,29 @@ async function syncAll(): Promise<void> {
     try {
       await syncAccount(account);
     } catch (err: any) {
-      console.error(`[calendar-sync] account ${account.email} failed:`, err?.message || err);
+      const msg = String(err?.message || err);
+      const auth = isAuthFailure(err);
+      // A transient blip (504/429/timeout/network) must NOT disconnect the
+      // account or spam a reconnect email — just count it and retry next tick.
+      // Only a real auth failure (or a long run of transient ones) escalates.
+      const failures = auth ? TRANSIENT_ESCALATE_AFTER : (account.syncFailures || 0) + 1;
+      const escalate = auth || failures >= TRANSIENT_ESCALATE_AFTER;
+      console.error(
+        `[calendar-sync] account ${account.email} failed (${auth ? "auth" : `transient ${failures}/${TRANSIENT_ESCALATE_AFTER}`}):`,
+        msg,
+      );
+
+      if (!escalate) {
+        // Keep the account ACTIVE so it's retried; just record the failure.
+        await db.update(calendarAccounts)
+          .set({ syncFailures: failures, lastError: msg, updatedAt: new Date() })
+          .where(eq(calendarAccounts.id, account.id))
+          .catch(() => {});
+        continue;
+      }
+
       await db.update(calendarAccounts)
-        .set({ status: "error", lastError: String(err?.message || err), updatedAt: new Date() })
+        .set({ status: "error", lastError: msg, syncFailures: failures, updatedAt: new Date() })
         .where(eq(calendarAccounts.id, account.id))
         .catch(() => {});
       // Alert the rep to reconnect (deduped per account until it reconnects).
@@ -285,7 +358,7 @@ async function syncAll(): Promise<void> {
           userEmail: u?.email ?? null,
           calendar: account.email,
           provider: account.provider,
-          lastError: String(err?.message || err),
+          lastError: msg,
         });
       } catch { /* non-fatal */ }
     }

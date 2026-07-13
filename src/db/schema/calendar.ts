@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, index, unique, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, index, unique, jsonb, integer } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 /** A rep's connected calendar (Google Calendar / Outlook via Microsoft Graph),
@@ -20,6 +20,11 @@ export const calendarAccounts = pgTable(
     encryptedTokens: text("encrypted_tokens"),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
     lastError: text("last_error"),
+    /** Consecutive TRANSIENT sync failures (5xx / timeout / network). Reset to 0
+     *  on any success. Auth failures skip this and disconnect immediately; a run
+     *  of transient failures only escalates to "error" once this crosses the
+     *  threshold, so a one-off 504 never triggers a reconnect email. */
+    syncFailures: integer("sync_failures").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

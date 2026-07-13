@@ -1,0 +1,1 @@
+ALTER TABLE "calendar_accounts" ADD COLUMN "sync_failures" integer DEFAULT 0 NOT NULL;
