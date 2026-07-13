@@ -11,7 +11,7 @@ import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, zonedToUtc } from "../lib/availability";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
-import { resolveHostAccount, resolveHostAccounts, busyForHost, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
+import { resolveHostAccount, resolveHostAccounts, busyForHost, getPageHosts, getPageHostIssues, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
 
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
@@ -306,7 +306,10 @@ router.get(
     // Combined availability across the page's host pool (owner + members).
     const hosts = await getPageHosts(orgId, page);
     const { days, hostsBySlot } = await computePageAvailability(page, hosts, from, to);
-    res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days, hostsBySlot, hosts: await hostNames(hosts.map((h) => h.userId)) } });
+    // Which pool hosts can't host (no mailbox / no calendar grant) — lets the UI
+    // explain an empty calendar instead of showing dead, unselectable dates.
+    const hostIssues = await getPageHostIssues(orgId, page, hosts);
+    res.json({ data: { timezone: page.timezone, durationMin: page.durationMin, video: page.video, days, hostsBySlot, hosts: await hostNames(hosts.map((h) => h.userId)), hostIssues } });
   }),
 );
 

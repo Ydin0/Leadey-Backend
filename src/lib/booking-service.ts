@@ -97,6 +97,35 @@ export async function getPageHosts(orgId: string, page: Page): Promise<PageHost[
   return hosts;
 }
 
+export interface HostIssue {
+  userId: string;
+  name: string;
+  /** "no-account" = never connected a mailbox; "no-calendar" = connected but
+   *  the OAuth grant is missing Calendar access (must reconnect to fix). */
+  reason: "no-account" | "no-calendar";
+}
+
+/** For a page's pool, which hosts CAN'T host meetings and why — so the booking
+ *  UI can tell the user exactly who needs to (re)connect a calendar instead of
+ *  silently showing a dead calendar with no selectable dates. */
+export async function getPageHostIssues(orgId: string, page: Page, hosts: PageHost[]): Promise<HostIssue[]> {
+  const capable = new Set(hosts.map((h) => h.userId));
+  const userIds = [...new Set([page.userId, ...(await getPageMemberIds(page.id))])];
+  const missing = userIds.filter((u) => !capable.has(u));
+  if (missing.length === 0) return [];
+  const accts = await db
+    .select({ userId: emailAccounts.userId })
+    .from(emailAccounts)
+    .where(and(eq(emailAccounts.organizationId, orgId), inArray(emailAccounts.userId, missing)));
+  const hasAnyAccount = new Set(accts.map((a) => a.userId));
+  const names = new Map((await hostNames(missing)).map((h) => [h.userId, h.name]));
+  return missing.map((userId) => ({
+    userId,
+    name: names.get(userId) || "A host",
+    reason: hasAnyAccount.has(userId) ? ("no-calendar" as const) : ("no-account" as const),
+  }));
+}
+
 function windowUtc(from: string, to: string, tz: string): { fromUtc: Date; toUtc: Date } {
   const [fy, fm, fd] = from.split("-").map(Number);
   const [ty, tm, td] = to.split("-").map(Number);
