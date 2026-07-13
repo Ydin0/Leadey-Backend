@@ -1,12 +1,14 @@
 import { Request, Response, NextFunction } from "express";
 import { getAuth, clerkClient } from "@clerk/express";
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { users } from "../db/schema/organizations";
 import { funnels, funnelMembers } from "../db/schema/funnels";
 import { organizationMemberships } from "../db/schema/organization-memberships";
 import { leads } from "../db/schema/leads";
 import { leadTasks } from "../db/schema/lead-tasks";
+import { opportunities } from "../db/schema/opportunities";
+import { phoneLines } from "../db/schema/phone-lines";
 import { ApiError, createId } from "./helpers";
 
 /**
@@ -27,8 +29,72 @@ export async function cleanupUserOrgAssignments(orgId: string, userId: string): 
     }
     // Open tasks assigned to them become unassigned.
     await db.update(leadTasks).set({ assigneeId: null, updatedAt: new Date() }).where(and(eq(leadTasks.assigneeId, userId), eq(leadTasks.organizationId, orgId)));
+    // Opportunities they owned become unassigned (never leave a ghost owner).
+    await db.update(opportunities).set({ ownerId: null, updatedAt: new Date() }).where(and(eq(opportunities.organizationId, orgId), eq(opportunities.ownerId, userId)));
   } catch (e) {
     console.error("[cleanupUserOrgAssignments] failed:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** Categories of a leaving member's active work that can be reassigned. */
+export interface ReassignTargets {
+  tasks?: string | null;
+  opportunities?: string | null;
+  leads?: string | null;
+  phoneNumbers?: string | null;
+}
+
+const N = sql<number>`count(*)::int`;
+
+/** Counts of a member's *active* work in one org — powers the Remove-User
+ *  modal so an admin can see what needs reassigning before removing them. */
+export async function getUserOrgWorkSummary(orgId: string, userId: string): Promise<{ tasks: number; opportunities: number; leads: number; phoneNumbers: number }> {
+  const orgFunnels = await db.select({ id: funnels.id }).from(funnels).where(eq(funnels.organizationId, orgId));
+  const fids = orgFunnels.map((f) => f.id);
+  const [[tasks], [opps], [phones]] = await Promise.all([
+    db.select({ n: N }).from(leadTasks).where(and(eq(leadTasks.organizationId, orgId), eq(leadTasks.assigneeId, userId), eq(leadTasks.done, false))),
+    db.select({ n: N }).from(opportunities).where(and(eq(opportunities.organizationId, orgId), eq(opportunities.ownerId, userId), isNull(opportunities.closedAt))),
+    db.select({ n: N }).from(phoneLines).where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.assignedTo, userId))),
+  ]);
+  let leadCount = 0;
+  if (fids.length) {
+    const [l] = await db.select({ n: N }).from(leads).where(and(eq(leads.ownerId, userId), inArray(leads.funnelId, fids)));
+    leadCount = l?.n ?? 0;
+  }
+  return { tasks: tasks?.n ?? 0, opportunities: opps?.n ?? 0, leads: leadCount, phoneNumbers: phones?.n ?? 0 };
+}
+
+/** Move a leaving member's active work to teammates BEFORE removal. Only the
+ *  categories given a (non-empty, non-self) target are moved; the rest are left
+ *  for cleanupUserOrgAssignments to detach. Best-effort — never throws. */
+export async function reassignUserOrgWork(orgId: string, fromUserId: string, targets: ReassignTargets): Promise<void> {
+  try {
+    const now = new Date();
+    const valid = (t?: string | null): t is string => !!t && t !== fromUserId;
+    if (valid(targets.tasks)) {
+      await db.update(leadTasks).set({ assigneeId: targets.tasks, updatedAt: now })
+        .where(and(eq(leadTasks.organizationId, orgId), eq(leadTasks.assigneeId, fromUserId), eq(leadTasks.done, false)));
+    }
+    if (valid(targets.opportunities)) {
+      await db.update(opportunities).set({ ownerId: targets.opportunities, updatedAt: now })
+        .where(and(eq(opportunities.organizationId, orgId), eq(opportunities.ownerId, fromUserId), isNull(opportunities.closedAt)));
+    }
+    if (valid(targets.leads)) {
+      const orgFunnels = await db.select({ id: funnels.id }).from(funnels).where(eq(funnels.organizationId, orgId));
+      const fids = orgFunnels.map((f) => f.id);
+      if (fids.length) {
+        await db.update(leads).set({ ownerId: targets.leads, updatedAt: now })
+          .where(and(eq(leads.ownerId, fromUserId), inArray(leads.funnelId, fids)));
+      }
+    }
+    if (valid(targets.phoneNumbers)) {
+      const [t] = await db.select({ firstName: users.firstName, lastName: users.lastName, email: users.email }).from(users).where(eq(users.id, targets.phoneNumbers));
+      const name = t ? ([t.firstName, t.lastName].filter(Boolean).join(" ") || t.email || null) : null;
+      await db.update(phoneLines).set({ assignedTo: targets.phoneNumbers, assignedToName: name, updatedAt: now })
+        .where(and(eq(phoneLines.organizationId, orgId), eq(phoneLines.assignedTo, fromUserId)));
+    }
+  } catch (e) {
+    console.error("[reassignUserOrgWork] failed:", e instanceof Error ? e.message : e);
   }
 }
 

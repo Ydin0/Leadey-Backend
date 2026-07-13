@@ -13,7 +13,7 @@ import { getAuth } from "@clerk/express";
 import { getPlanConfig } from "../lib/stripe";
 import { getSetting, upsertSetting } from "../lib/settings-service";
 import { inviteEmailToOrganization, ensureOrgMembershipCap } from "../lib/invitations";
-import { syncUserPrimaryOrg, cleanupUserOrgAssignments, isOrgMember, upsertMembership } from "../lib/org-membership";
+import { syncUserPrimaryOrg, cleanupUserOrgAssignments, isOrgMember, upsertMembership, getUserOrgWorkSummary, reassignUserOrgWork } from "../lib/org-membership";
 import { orgRoles } from "../db/schema/org-roles";
 import { organizationMemberships } from "../db/schema/organization-memberships";
 import {
@@ -746,10 +746,26 @@ router.patch(
   }),
 );
 
+// ─── GET /team/:userId/removal-summary ──────────────────────────────
+// Counts of the member's active work (tasks / opportunities / leads / phone
+// numbers) so the Remove-User modal can offer reassignment before removal.
+router.get(
+  "/team/:userId/removal-summary",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const summary = await getUserOrgWorkSummary(orgId, req.params.userId);
+    res.json({ data: summary });
+  }),
+);
+
 // ─── DELETE /team/:userId ───────────────────────────────────────────
-// Remove a member from the organization
+// Remove a member from the organization. Accepts an optional body
+// { reassign: { tasks?, opportunities?, leads?, phoneNumbers? } } of target
+// userIds to hand each category of active work to before the member is detached.
 router.delete(
   "/team/:userId",
+  requirePerm("settings.manageTeam"),
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const auth = getAuth(req);
@@ -758,6 +774,11 @@ router.delete(
     if (userId === auth?.userId) {
       throw new ApiError(400, "You cannot remove yourself from the organization");
     }
+
+    // Hand the leaving member's active work to teammates BEFORE detaching them,
+    // so the categories the admin chose to reassign aren't nulled by cleanup.
+    const reassign = req.body && typeof req.body.reassign === "object" && req.body.reassign ? req.body.reassign : null;
+    if (reassign) await reassignUserOrgWork(orgId, userId, reassign);
 
     // Remove the Clerk org membership. Treat "not found" as success — the
     // member may already be gone in Clerk (or was never a live membership),
