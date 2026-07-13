@@ -12,7 +12,7 @@ import { ApiError, createId } from "../lib/helpers";
 import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, localDateInTz } from "../lib/availability";
 import { getRoundRobinPool } from "./booking-pages";
-import { getPageHosts, offeringHosts, fairPick } from "../lib/booking-service";
+import { getPageHosts, offeringHosts, fairPick, resolveHostAccounts, busyAcrossAccounts } from "../lib/booking-service";
 import { createMeetingEvent, cancelMeetingEvent, type MeetingAttendee } from "../lib/meeting-scheduler";
 
 type Account = typeof emailAccounts.$inferSelect;
@@ -75,8 +75,9 @@ router.post(
       for (const entry of pool) {
         const { page: pp, account: acc } = entry;
         const localDate = localDateInTz(startISO, pp.timezone);
+        const accts = await resolveHostAccounts(orgId, acc.userId);
         const busy = pp.respectCalendar
-          ? await getBusyIntervals(acc, new Date(start.getTime() - 60_000), new Date(start.getTime() + pp.durationMin * 60_000 + 60_000)).catch(() => [])
+          ? await busyAcrossAccounts(accts.length ? accts : [acc], new Date(start.getTime() - 60_000), new Date(start.getTime() + pp.durationMin * 60_000 + 60_000))
           : [];
         const days = computeSlots(pp, localDate, localDate, nowD, busy);
         if (days[0]?.slots.includes(start.toISOString())) candidates.push(entry);

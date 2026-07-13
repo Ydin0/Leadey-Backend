@@ -11,7 +11,7 @@ import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, zonedToUtc } from "../lib/availability";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
-import { resolveHostAccount, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
+import { resolveHostAccount, resolveHostAccounts, busyAcrossAccounts, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
 
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
@@ -211,7 +211,7 @@ router.post(
       roundRobin: b.roundRobin !== false,
       bufferBeforeMin: clampInt(b.bufferBeforeMin, 0, 240, 0),
       bufferAfterMin: clampInt(b.bufferAfterMin, 0, 240, 0),
-      minNoticeMin: clampInt(b.minNoticeMin, 0, 20160, 240),
+      minNoticeMin: clampInt(b.minNoticeMin, 0, 525600, 240),
       maxDaysAhead: clampInt(b.maxDaysAhead, 1, 365, 60),
       isActive: true, isDefault: false,
       isPublic: false, publicSlug: null as string | null,
@@ -253,7 +253,7 @@ router.patch(
     if (b.roundRobin !== undefined) set.roundRobin = !!b.roundRobin;
     if (b.bufferBeforeMin !== undefined) set.bufferBeforeMin = clampInt(b.bufferBeforeMin, 0, 240, page.bufferBeforeMin);
     if (b.bufferAfterMin !== undefined) set.bufferAfterMin = clampInt(b.bufferAfterMin, 0, 240, page.bufferAfterMin);
-    if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 20160, page.minNoticeMin);
+    if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 525600, page.minNoticeMin);
     if (b.maxDaysAhead !== undefined) set.maxDaysAhead = clampInt(b.maxDaysAhead, 1, 365, page.maxDaysAhead);
     if (b.isActive !== undefined) set.isActive = !!b.isActive;
     // Owner's own round-robin priority (owner can set on their own page).
@@ -328,7 +328,8 @@ router.get(
       let busy: { start: Date; end: Date }[] = [];
       if (page.respectCalendar) {
         const w = windowUtc(from, to, page.timezone);
-        busy = await getBusyIntervals(account, w.fromUtc, w.toUtc).catch(() => []);
+        const accts = await resolveHostAccounts(orgId, account.userId);
+        busy = await busyAcrossAccounts(accts.length ? accts : [account], w.fromUtc, w.toUtc);
       }
       for (const day of computeSlots(page as WeeklyPage, from, to, now, busy)) {
         for (const s of day.slots) (hostsBySlot[s] ??= []).push(account.userId);

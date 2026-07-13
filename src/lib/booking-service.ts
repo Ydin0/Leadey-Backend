@@ -10,16 +10,38 @@ import { getBusyIntervals, computeSlots, zonedToUtc, localDateInTz, type DaySlot
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
 
-export interface PageHost { userId: string; account: Account; priority: number }
+export interface PageHost {
+  userId: string;
+  /** The account that CREATES the event (default mailbox). */
+  account: Account;
+  /** ALL the rep's connected calendars — busy-checked as a union. */
+  accounts: Account[];
+  priority: number;
+}
 
-/** The calendar-capable email account that hosts a given user's meetings. */
-export async function resolveHostAccount(orgId: string, userId: string): Promise<Account | null> {
+/** All of a user's calendar-capable accounts (default first). A rep can connect
+ *  several mailboxes/calendars — availability must respect ALL of them. */
+export async function resolveHostAccounts(orgId: string, userId: string): Promise<Account[]> {
   const accts = await db
     .select()
     .from(emailAccounts)
     .where(and(eq(emailAccounts.organizationId, orgId), eq(emailAccounts.userId, userId)));
   const capable = accts.filter((a) => a.status === "active" && accountCanSchedule(a));
-  return capable.find((a) => a.isDefault) || capable[0] || null;
+  capable.sort((a, b) => (a.isDefault === b.isDefault ? 0 : a.isDefault ? -1 : 1));
+  return capable;
+}
+
+/** The single account that hosts (creates) a user's meetings — the default. */
+export async function resolveHostAccount(orgId: string, userId: string): Promise<Account | null> {
+  return (await resolveHostAccounts(orgId, userId))[0] || null;
+}
+
+/** Busy intervals across ALL of a host's connected calendars, unioned (a slot
+ *  is busy if the rep is busy in ANY of their calendars). Per-account errors are
+ *  skipped so one flaky calendar never blanks availability. */
+export async function busyAcrossAccounts(accounts: Account[], fromUtc: Date, toUtc: Date): Promise<{ start: Date; end: Date }[]> {
+  const all = await Promise.all(accounts.map((a) => getBusyIntervals(a, fromUtc, toUtc).catch(() => [])));
+  return all.flat();
 }
 
 export async function getPageMemberIds(pageId: string): Promise<string[]> {
@@ -42,8 +64,8 @@ export async function getPageHosts(orgId: string, page: Page): Promise<PageHost[
   const userIds = [...new Set([page.userId, ...(await getPageMemberIds(page.id))])];
   const hosts: PageHost[] = [];
   for (const uid of userIds) {
-    const account = await resolveHostAccount(orgId, uid);
-    if (account) hosts.push({ userId: uid, account, priority: priorities.get(uid) ?? 3 });
+    const accounts = await resolveHostAccounts(orgId, uid);
+    if (accounts.length) hosts.push({ userId: uid, account: accounts[0], accounts, priority: priorities.get(uid) ?? 3 });
   }
   return hosts;
 }
@@ -68,11 +90,11 @@ export interface PoolAvailability {
 export async function computePageAvailability(page: Page, hosts: PageHost[], from: string, to: string): Promise<PoolAvailability> {
   const now = new Date();
   const hostsBySlot: Record<string, string[]> = {};
-  for (const { userId, account } of hosts) {
+  for (const { userId, accounts } of hosts) {
     let busy: { start: Date; end: Date }[] = [];
     if (page.respectCalendar) {
       const w = windowUtc(from, to, page.timezone);
-      busy = await getBusyIntervals(account, w.fromUtc, w.toUtc).catch(() => []);
+      busy = await busyAcrossAccounts(accounts, w.fromUtc, w.toUtc);
     }
     for (const day of computeSlots(page, from, to, now, busy)) {
       for (const s of day.slots) (hostsBySlot[s] ??= []).push(userId);
@@ -103,7 +125,7 @@ export async function offeringHosts(page: Page, hosts: PageHost[], startISO: str
   for (const h of hosts) {
     const localDate = localDateInTz(startISO, page.timezone);
     const busy = page.respectCalendar
-      ? await getBusyIntervals(h.account, new Date(start.getTime() - 60_000), new Date(start.getTime() + page.durationMin * 60_000 + 60_000)).catch(() => [])
+      ? await busyAcrossAccounts(h.accounts, new Date(start.getTime() - 60_000), new Date(start.getTime() + page.durationMin * 60_000 + 60_000))
       : [];
     const days = computeSlots(page, localDate, localDate, now, busy);
     if (days[0]?.slots.includes(start.toISOString())) out.push(h);
