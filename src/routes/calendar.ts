@@ -134,23 +134,25 @@ router.get(
     const orgId = getOrgId(req);
     const leadId = String(req.params.leadId);
     const [lead] = await db
-      .select({ id: leads.id, email: leads.email, company: leads.company })
+      .select({ id: leads.id, email: leads.email, company: leads.company, extraEmails: leads.extraEmails })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(and(eq(leads.id, leadId), eq(funnels.organizationId, orgId)));
     if (!lead) throw new ApiError(404, "Lead not found");
 
-    // Candidate emails = the lead + every contact at the same company in this org.
+    // Candidate emails = the lead (incl. its extra contact emails) + every
+    // contact at the same company in this org (incl. their extra emails).
     const candidates = new Set<string>();
     const add = (e: string | null | undefined) => { const n = (e || "").trim().toLowerCase(); if (n) candidates.add(n); };
     add(lead.email);
+    for (const x of lead.extraEmails || []) add(x.value);
     if (lead.company && lead.company.trim()) {
       const contacts = await db
-        .select({ email: leads.email })
+        .select({ email: leads.email, extraEmails: leads.extraEmails })
         .from(leads)
         .innerJoin(funnels, eq(leads.funnelId, funnels.id))
         .where(and(eq(funnels.organizationId, orgId), sql`lower(${leads.company}) = lower(${lead.company})`));
-      for (const c of contacts) add(c.email);
+      for (const c of contacts) { add(c.email); for (const x of c.extraEmails || []) add(x.value); }
     }
 
     // Whether the caller has any connected calendar (drives the empty-state hint).
@@ -330,19 +332,24 @@ router.get(
 
     // Org leads for email→lead resolution + calendly enrichment (one pass).
     const orgLeads = await db
-      .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company, email: leads.email })
+      .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name, company: leads.company, email: leads.email, extraEmails: leads.extraEmails })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(eq(funnels.organizationId, orgId));
+    // Index by the lead's primary AND extra contact emails, so a meeting whose
+    // attendee is any contact on a lead profile still resolves to that lead.
     const leadByEmail = new Map<string, (typeof orgLeads)[number]>();
     for (const l of orgLeads) {
-      const e = (l.email || "").trim().toLowerCase();
-      if (e && !leadByEmail.has(e)) leadByEmail.set(e, l);
+      const emails = [l.email, ...(l.extraEmails || []).map((x) => x.value)];
+      for (const raw of emails) {
+        const e = (raw || "").trim().toLowerCase();
+        if (e && !leadByEmail.has(e)) leadByEmail.set(e, l);
+      }
     }
     const leadById = new Map(orgLeads.map((l) => [l.id, l]));
 
     type OrgMeeting = {
-      id: string; source: "google" | "outlook" | "calendly";
+      id: string; source: "google" | "outlook" | "calendly" | "leadey";
       title: string; startTime: string | null; endTime: string | null;
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
@@ -392,6 +399,55 @@ router.get(
       });
     }
 
+    // 1.5) Meetings booked inside Leadey (the "Book meeting" scheduler). These
+    // live in scheduled_meetings and are NOT guaranteed to be re-synced as a
+    // calendarEvents row (the host usually books from an email account, not a
+    // separately-connected calendar). Surface them directly, lead-matched by the
+    // stored leadId or an attendee email, so they show on the rep's calendar and
+    // Cockpit the moment they're booked.
+    const schedRows = await db
+      .select()
+      .from(scheduledMeetings)
+      .where(and(
+        eq(scheduledMeetings.organizationId, orgId),
+        eq(scheduledMeetings.status, "confirmed"),
+        gte(scheduledMeetings.startTime, from),
+        lte(scheduledMeetings.startTime, to),
+        ...(scope === "mine" ? [eq(scheduledMeetings.hostUserId, userId)] : []),
+      ));
+    for (const m of schedRows) {
+      let lead = m.leadId ? leadById.get(m.leadId) : undefined;
+      if (!lead) {
+        for (const a of m.attendees || []) {
+          const e = (a?.email || "").trim().toLowerCase();
+          if (e && leadByEmail.has(e)) { lead = leadByEmail.get(e); break; }
+        }
+      }
+      if (!lead) continue; // not linked to a lead → excluded
+      const startIso = m.startTime ? m.startTime.toISOString() : null;
+      const dedupeKey = `${m.title || "Meeting"}|${startIso || ""}`;
+      if (seen.has(dedupeKey) || (m.joinUrl && seen.has(`url:${m.joinUrl}`))) continue;
+      seen.add(dedupeKey);
+      if (m.joinUrl) seen.add(`url:${m.joinUrl}`);
+      if (m.providerEventId) seen.add(`evid:${m.providerEventId}`);
+      meetings.push({
+        id: m.id,
+        source: "leadey",
+        title: m.title || "Meeting",
+        startTime: startIso,
+        endTime: m.endTime ? m.endTime.toISOString() : null,
+        joinUrl: m.joinUrl,
+        location: m.location,
+        organizerEmail: m.hostEmail,
+        responseStatus: null,
+        leadId: lead.id,
+        funnelId: lead.funnelId,
+        leadName: lead.name,
+        company: lead.company,
+        userId: m.hostUserId ?? null,
+      });
+    }
+
     // 2) Connected-calendar events (Google/Outlook), lead-matched by attendees.
     const evRows = await db
       .select({ ev: calendarEvents, provider: calendarAccounts.provider, acctUserId: calendarAccounts.userId, acctEmail: calendarAccounts.email })
@@ -405,6 +461,8 @@ router.get(
         ...(scope === "mine" ? [eq(calendarAccounts.userId, userId)] : []),
       ));
     for (const { ev, provider, acctUserId } of evRows) {
+      // Skip the synced copy of a meeting we already show from scheduled_meetings.
+      if (ev.providerEventId && seen.has(`evid:${ev.providerEventId}`)) continue;
       const attendees = ev.attendeeEmails || [];
       const matchedEmail = attendees.find((e) => leadByEmail.has(e));
       const lead = matchedEmail ? leadByEmail.get(matchedEmail) : undefined;
