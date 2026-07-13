@@ -11,7 +11,7 @@ import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, zonedToUtc } from "../lib/availability";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
-import { resolveHostAccount, resolveHostAccounts, busyAcrossAccounts, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
+import { resolveHostAccount, resolveHostAccounts, busyForHost, getPageHosts, computePageAvailability, getPageMemberIds, mintUniqueSlug, hostNames } from "../lib/booking-service";
 
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
@@ -333,7 +333,7 @@ router.get(
       if (page.respectCalendar) {
         const w = windowUtc(from, to, page.timezone);
         const accts = await resolveHostAccounts(orgId, account.userId);
-        busy = await busyAcrossAccounts(accts.length ? accts : [account], w.fromUtc, w.toUtc);
+        busy = await busyForHost(account, accts, w.fromUtc, w.toUtc);
       }
       for (const day of computeSlots(page as WeeklyPage, from, to, now, busy)) {
         for (const s of day.slots) (hostsBySlot[s] ??= []).push(account.userId);

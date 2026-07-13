@@ -47,6 +47,10 @@ export const calendarEvents = pgTable(
      *  rep's connected mailbox calendar). Not FK-constrained since it spans two
      *  tables; cleaned up manually when either account is disconnected. */
     accountId: text("account_id").notNull(),
+    /** Owner rep + provider, denormalised onto the event so queries don't need
+     *  to join back to whichever account table the event came from. */
+    userId: text("user_id"),
+    provider: text("provider"), // "google" | "microsoft"
     providerEventId: text("provider_event_id").notNull(),
     title: text("title").notNull().default(""),
     startTime: timestamp("start_time", { withTimezone: true }),

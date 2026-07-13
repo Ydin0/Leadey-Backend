@@ -264,7 +264,7 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
 /** Pull a calendar's upcoming events into calendar_events (upsert + prune). */
 /** Upsert a fetched event set into calendar_events for one account (calendar OR
  *  email account), pruning within-window events the provider no longer returns. */
-async function writeEvents(accountId: string, orgId: string, events: NormalizedEvent[]): Promise<void> {
+async function writeEvents(accountId: string, orgId: string, ownerUserId: string, provider: string, events: NormalizedEvent[]): Promise<void> {
   const now = new Date();
   const seen = new Set<string>();
   for (const ev of events) {
@@ -274,6 +274,8 @@ async function writeEvents(accountId: string, orgId: string, events: NormalizedE
       .from(calendarEvents)
       .where(and(eq(calendarEvents.accountId, accountId), eq(calendarEvents.providerEventId, ev.providerEventId)));
     const values = {
+      userId: ownerUserId,
+      provider,
       title: ev.title,
       startTime: ev.startTime,
       endTime: ev.endTime,
@@ -310,7 +312,7 @@ export async function syncAccount(account: Account): Promise<void> {
   const token = await getCalendarAccessToken(account);
   const events = account.provider === "google" ? await fetchGoogleEvents(token) : await fetchMicrosoftEvents(token);
   const now = new Date();
-  await writeEvents(account.id, account.organizationId, events);
+  await writeEvents(account.id, account.organizationId, account.userId, account.provider, events);
 
   await db.update(calendarAccounts)
     .set({ lastSyncedAt: now, status: "active", lastError: null, syncFailures: 0, updatedAt: now })
@@ -336,7 +338,7 @@ async function syncEmailCalendars(): Promise<void> {
     try {
       const token = await getEmailAccessToken(acc);
       const events = acc.provider === "gmail" ? await fetchGoogleEvents(token) : await fetchMicrosoftEvents(token);
-      await writeEvents(acc.id, acc.organizationId, events);
+      await writeEvents(acc.id, acc.organizationId, acc.userId, acc.provider === "gmail" ? "google" : "microsoft", events);
     } catch (err) {
       // Email accounts have their OWN disconnect flow — never email/disconnect
       // from here; a throttle or blip just skips this cycle.
@@ -346,7 +348,6 @@ async function syncEmailCalendars(): Promise<void> {
 }
 
 async function syncAll(): Promise<void> {
-  await syncEmailCalendars();
   let accounts: Account[] = [];
   try {
     // Include "error" accounts too: a transient blip may have flipped one, and
@@ -412,10 +413,17 @@ async function syncAll(): Promise<void> {
       } catch { /* non-fatal */ }
     }
   }
+  // Email-account calendars run AFTER the primary calendar sync and fully
+  // isolated, so a slow/failing mailbox can never delay or break the connected
+  // "Calendars" from syncing.
+  try { await syncEmailCalendars(); } catch (err) { console.error("[calendar-sync] email calendars failed:", err); }
 }
 
 /** Start the background calendar sync. Safe no-op until accounts exist. */
 export function startCalendarSync(): void {
+  // Run once shortly after boot so meetings populate without waiting a full
+  // interval (deferred a few seconds so startup migrations/connections settle).
+  setTimeout(() => { void syncAll(); }, 8000);
   setInterval(() => { void syncAll(); }, SYNC_INTERVAL_MS);
   console.log("[calendar-sync] started (every 5m)");
 }

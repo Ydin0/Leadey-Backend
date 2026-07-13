@@ -220,16 +220,16 @@ router.get(
 
     if (candidates.size > 0) {
       const rows = await db
-        .select({ ev: calendarEvents, provider: calendarAccounts.provider })
+        .select()
         .from(calendarEvents)
-        .innerJoin(calendarAccounts, eq(calendarEvents.accountId, calendarAccounts.id))
         .where(and(
           eq(calendarEvents.organizationId, orgId),
           eq(calendarEvents.status, "confirmed"),
           gte(calendarEvents.startTime, now),
         ));
       const seenEvent = new Set<string>();
-      for (const { ev, provider } of rows) {
+      for (const ev of rows) {
+        const provider = ev.provider;
         // Skip the synced copy of a meeting we already show from scheduled_meetings.
         if (ev.providerEventId && bookedEventIds.has(ev.providerEventId)) continue;
         const attendees = ev.attendeeEmails || [];
@@ -452,17 +452,18 @@ router.get(
 
     // 2) Connected-calendar events (Google/Outlook), lead-matched by attendees.
     const evRows = await db
-      .select({ ev: calendarEvents, provider: calendarAccounts.provider, acctUserId: calendarAccounts.userId, acctEmail: calendarAccounts.email })
+      .select()
       .from(calendarEvents)
-      .innerJoin(calendarAccounts, eq(calendarEvents.accountId, calendarAccounts.id))
       .where(and(
         eq(calendarEvents.organizationId, orgId),
         eq(calendarEvents.status, "confirmed"),
         gte(calendarEvents.startTime, from),
         lte(calendarEvents.startTime, to),
-        ...(scope === "mine" ? [eq(calendarAccounts.userId, userId)] : []),
+        ...(scope === "mine" ? [eq(calendarEvents.userId, userId)] : []),
       ));
-    for (const { ev, provider, acctUserId } of evRows) {
+    for (const ev of evRows) {
+      const provider = ev.provider;
+      const acctUserId = ev.userId;
       // Skip the synced copy of a meeting we already show from scheduled_meetings.
       if (ev.providerEventId && seen.has(`evid:${ev.providerEventId}`)) continue;
       const attendees = ev.attendeeEmails || [];

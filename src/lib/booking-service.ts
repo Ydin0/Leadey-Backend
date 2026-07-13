@@ -44,6 +44,33 @@ export async function busyAcrossAccounts(accounts: Account[], fromUtc: Date, toU
   return all.flat();
 }
 
+/** How much of [from,to] a busy set covers (0–1) — used to spot a calendar
+ *  that's "busy" nearly all the time (a personal / always-busy one). */
+function coverageFraction(busy: { start: Date; end: Date }[], fromUtc: Date, toUtc: Date): number {
+  const windowMs = toUtc.getTime() - fromUtc.getTime();
+  if (windowMs <= 0) return 0;
+  const covered = busy.reduce((s, b) =>
+    s + Math.max(0, Math.min(b.end.getTime(), toUtc.getTime()) - Math.max(b.start.getTime(), fromUtc.getTime())), 0);
+  return covered / windowMs;
+}
+
+/** Busy for a host: the PRIMARY (event-creating) calendar always counts; each
+ *  ADDITIONAL connected calendar is unioned in to avoid double-booking — UNLESS
+ *  it reports busy across ~the whole window (a personal/always-busy calendar),
+ *  which would otherwise wipe the booking page's availability entirely. */
+export async function busyForHost(primary: Account, accounts: Account[], fromUtc: Date, toUtc: Date): Promise<{ start: Date; end: Date }[]> {
+  const list = accounts.length ? accounts : [primary];
+  const perAccount = await Promise.all(list.map((a) => getBusyIntervals(a, fromUtc, toUtc).catch(() => [])));
+  const out: { start: Date; end: Date }[] = [];
+  list.forEach((a, i) => {
+    const busy = perAccount[i];
+    // A secondary calendar that's busy ≥90% of the window is treated as noise.
+    if (a.id !== primary.id && coverageFraction(busy, fromUtc, toUtc) >= 0.9) return;
+    out.push(...busy);
+  });
+  return out;
+}
+
 export async function getPageMemberIds(pageId: string): Promise<string[]> {
   const rows = await db.select({ userId: bookingPageMembers.userId }).from(bookingPageMembers).where(eq(bookingPageMembers.bookingPageId, pageId));
   return rows.map((r) => r.userId);
@@ -90,11 +117,11 @@ export interface PoolAvailability {
 export async function computePageAvailability(page: Page, hosts: PageHost[], from: string, to: string): Promise<PoolAvailability> {
   const now = new Date();
   const hostsBySlot: Record<string, string[]> = {};
-  for (const { userId, accounts } of hosts) {
+  for (const { userId, account, accounts } of hosts) {
     let busy: { start: Date; end: Date }[] = [];
     if (page.respectCalendar) {
       const w = windowUtc(from, to, page.timezone);
-      busy = await busyAcrossAccounts(accounts, w.fromUtc, w.toUtc);
+      busy = await busyForHost(account, accounts, w.fromUtc, w.toUtc);
     }
     for (const day of computeSlots(page, from, to, now, busy)) {
       for (const s of day.slots) (hostsBySlot[s] ??= []).push(userId);
@@ -125,7 +152,7 @@ export async function offeringHosts(page: Page, hosts: PageHost[], startISO: str
   for (const h of hosts) {
     const localDate = localDateInTz(startISO, page.timezone);
     const busy = page.respectCalendar
-      ? await busyAcrossAccounts(h.accounts, new Date(start.getTime() - 60_000), new Date(start.getTime() + page.durationMin * 60_000 + 60_000))
+      ? await busyForHost(h.account, h.accounts, new Date(start.getTime() - 60_000), new Date(start.getTime() + page.durationMin * 60_000 + 60_000))
       : [];
     const days = computeSlots(page, localDate, localDate, now, busy);
     if (days[0]?.slots.includes(start.toISOString())) out.push(h);
