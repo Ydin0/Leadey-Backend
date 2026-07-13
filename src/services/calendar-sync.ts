@@ -69,6 +69,17 @@ function isAuthFailure(err: unknown): boolean {
   return false;
 }
 
+/** A rate-limit / per-mailbox concurrency throttle (Microsoft "Command
+ *  Concurrency Limit Reached", 429, "ApplicationThrottled", quota). ALWAYS
+ *  temporary and never fixed by reconnecting — so it must never disconnect the
+ *  account or fire a reconnect email, however long it persists; we just back
+ *  off and retry next cycle. */
+function isThrottle(err: unknown): boolean {
+  if (err instanceof CalendarSyncError && err.status === 429) return true;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return /concurrency|throttl|too many requests|rate.?limit|over its|quota|applicationthrottled/.test(msg);
+}
+
 async function refreshGoogle(refresh: string) {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -326,10 +337,22 @@ async function syncAll(): Promise<void> {
       await syncAccount(account);
     } catch (err: any) {
       const msg = String(err?.message || err);
+      // A rate-limit / concurrency throttle is ALWAYS temporary and can't be
+      // fixed by reconnecting — never disconnect or email, just back off. Don't
+      // even count it toward escalation, or a persistently-busy mailbox would
+      // eventually get falsely flagged.
+      if (isThrottle(err)) {
+        console.warn(`[calendar-sync] account ${account.email} throttled (backing off):`, msg);
+        await db.update(calendarAccounts)
+          .set({ lastError: msg, updatedAt: new Date() })
+          .where(eq(calendarAccounts.id, account.id))
+          .catch(() => {});
+        continue;
+      }
       const auth = isAuthFailure(err);
-      // A transient blip (504/429/timeout/network) must NOT disconnect the
-      // account or spam a reconnect email — just count it and retry next tick.
-      // Only a real auth failure (or a long run of transient ones) escalates.
+      // A transient blip (504/timeout/network) must NOT disconnect the account
+      // or spam a reconnect email — just count it and retry next tick. Only a
+      // real auth failure (or a long run of transient ones) escalates.
       const failures = auth ? TRANSIENT_ESCALATE_AFTER : (account.syncFailures || 0) + 1;
       const escalate = auth || failures >= TRANSIENT_ESCALATE_AFTER;
       console.error(
