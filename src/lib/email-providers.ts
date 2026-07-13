@@ -20,6 +20,8 @@ export interface SendInput {
   toName?: string | null;
   /** Optional comma-separated Cc recipients. */
   cc?: string;
+  /** Optional comma-separated Bcc recipients. */
+  bcc?: string;
   subject: string;
   html: string;
   attachments?: EmailAttachment[];
@@ -149,6 +151,7 @@ async function buildMime(account: Account, input: SendInput): Promise<{ raw: Buf
     from: { name: account.fromName || account.email, address: account.email },
     to: input.toName ? { name: input.toName, address: input.to } : input.to,
     ...(input.cc ? { cc: input.cc } : {}),
+    ...(input.bcc ? { bcc: input.bcc } : {}),
     subject: input.subject,
     html: input.html,
     ...(input.attachments?.length ? { attachments: input.attachments } : {}),
@@ -173,6 +176,7 @@ async function sendSmtp(account: Account, input: SendInput): Promise<SendResult>
     from: { name: account.fromName || account.email, address: account.email },
     to: input.toName ? `"${input.toName}" <${input.to}>` : input.to,
     ...(input.cc ? { cc: input.cc } : {}),
+    ...(input.bcc ? { bcc: input.bcc } : {}),
     subject: input.subject,
     html: input.html,
     ...(input.attachments?.length ? { attachments: input.attachments } : {}),
@@ -210,6 +214,11 @@ async function sendOutlook(account: Account, input: SendInput): Promise<SendResu
         body: { contentType: "HTML", content: input.html },
         toRecipients: [{ emailAddress: { address: input.to, name: input.toName || undefined } }],
         ccRecipients: (input.cc || "")
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean)
+          .map((address) => ({ emailAddress: { address } })),
+        bccRecipients: (input.bcc || "")
           .split(",")
           .map((a) => a.trim())
           .filter(Boolean)

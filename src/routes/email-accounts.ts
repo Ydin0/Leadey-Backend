@@ -319,6 +319,7 @@ router.post(
     const bodyHtml = String(req.body?.bodyHtml || "");
     const fromAccountId = req.body?.fromAccountId ? String(req.body.fromAccountId) : null;
     const cc = String(req.body?.cc || "").trim();
+    const bcc = String(req.body?.bcc || "").trim();
     if (!subject && !bodyHtml) throw new ApiError(400, "Subject or body is required");
 
     const [lead] = await db
@@ -358,7 +359,7 @@ router.post(
 
     let result;
     try {
-      result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, subject, html, attachments });
+      result = await sendEmailVia(account, { to: toEmail, toName, cc: cc || undefined, bcc: bcc || undefined, subject, html, attachments });
     } catch (err: any) {
       const msg = String(err?.message || err);
       console.error(`[email send] ${account.provider} ${account.email} failed:`, msg);
@@ -406,7 +407,7 @@ router.post(
       type: "step_outcome",
       outcome: "sent",
       stepIndex: Math.max(0, (lead.currentStep || 1) - 1),
-      meta: { channel: "email", direction: "outbound", subject, body: htmlWithSig, fromEmail: account.email, fromName: account.fromName, toEmail, cc: cc || undefined, userId, userName },
+      meta: { channel: "email", direction: "outbound", subject, body: htmlWithSig, fromEmail: account.email, fromName: account.fromName, toEmail, cc: cc || undefined, bcc: bcc || undefined, userId, userName },
       timestamp: now,
     });
 
