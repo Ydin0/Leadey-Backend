@@ -1488,6 +1488,7 @@ router.get(
       .select({
         id: users.id,
         email: users.email,
+        phone: users.phone,
         firstName: users.firstName,
         lastName: users.lastName,
         imageUrl: users.imageUrl,
