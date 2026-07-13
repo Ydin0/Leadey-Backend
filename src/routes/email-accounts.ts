@@ -4,6 +4,7 @@ import { eq, and, asc, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/schema/email-accounts";
 import { emailSignatures } from "../db/schema/email-signatures";
+import { calendarEvents } from "../db/schema/calendar";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users } from "../db/schema/organizations";
@@ -300,6 +301,8 @@ router.delete(
     const userId = getAuth(req)?.userId || "";
     const id = String(req.params.id);
     await db.delete(emailAccounts).where(and(eq(emailAccounts.id, id), eq(emailAccounts.userId, userId)));
+    // This mailbox's calendar may have been synced into the calendar view — clean up.
+    await db.delete(calendarEvents).where(eq(calendarEvents.accountId, id));
     res.json({ data: { ok: true } });
   }),
 );

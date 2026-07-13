@@ -1,6 +1,8 @@
 import { eq, and, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
+import { emailAccounts } from "../db/schema/email-accounts";
+import { getAccessToken as getEmailAccessToken, accountCanSchedule } from "../lib/email-providers";
 import { users } from "../db/schema/organizations";
 import { encryptSecret, decryptSecret } from "../lib/crypto";
 import { createId } from "../lib/helpers";
@@ -260,18 +262,17 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
 }
 
 /** Pull a calendar's upcoming events into calendar_events (upsert + prune). */
-export async function syncAccount(account: Account): Promise<void> {
-  const token = await getCalendarAccessToken(account);
-  const events = account.provider === "google" ? await fetchGoogleEvents(token) : await fetchMicrosoftEvents(token);
+/** Upsert a fetched event set into calendar_events for one account (calendar OR
+ *  email account), pruning within-window events the provider no longer returns. */
+async function writeEvents(accountId: string, orgId: string, events: NormalizedEvent[]): Promise<void> {
   const now = new Date();
-
   const seen = new Set<string>();
   for (const ev of events) {
     seen.add(ev.providerEventId);
     const existing = await db
       .select({ id: calendarEvents.id })
       .from(calendarEvents)
-      .where(and(eq(calendarEvents.accountId, account.id), eq(calendarEvents.providerEventId, ev.providerEventId)));
+      .where(and(eq(calendarEvents.accountId, accountId), eq(calendarEvents.providerEventId, ev.providerEventId)));
     const values = {
       title: ev.title,
       startTime: ev.startTime,
@@ -288,30 +289,28 @@ export async function syncAccount(account: Account): Promise<void> {
       await db.update(calendarEvents).set(values).where(eq(calendarEvents.id, existing[0].id));
     } else {
       await db.insert(calendarEvents).values({
-        id: createId("cev"),
-        organizationId: account.organizationId,
-        accountId: account.id,
-        providerEventId: ev.providerEventId,
-        ...values,
+        id: createId("cev"), organizationId: orgId, accountId, providerEventId: ev.providerEventId, ...values,
       });
     }
   }
-
-  // Prune events the provider no longer returns (cancelled/declined/removed) —
-  // but ONLY within the fetch window. Events older than the lookback were not
-  // fetched this pass, so absence from `seen` says nothing about them; they are
-  // history and must never be deleted.
+  // Prune events the provider no longer returns — but ONLY within the fetch
+  // window (older events are history and were never fetched this pass).
   const pruneFrom = lookbackStart();
   const stored = await db
     .select({ id: calendarEvents.id, providerEventId: calendarEvents.providerEventId, startTime: calendarEvents.startTime })
     .from(calendarEvents)
-    .where(eq(calendarEvents.accountId, account.id));
+    .where(eq(calendarEvents.accountId, accountId));
   for (const row of stored) {
-    if (row.startTime && row.startTime < pruneFrom) continue; // keep history
-    if (!seen.has(row.providerEventId)) {
-      await db.delete(calendarEvents).where(eq(calendarEvents.id, row.id));
-    }
+    if (row.startTime && row.startTime < pruneFrom) continue;
+    if (!seen.has(row.providerEventId)) await db.delete(calendarEvents).where(eq(calendarEvents.id, row.id));
   }
+}
+
+export async function syncAccount(account: Account): Promise<void> {
+  const token = await getCalendarAccessToken(account);
+  const events = account.provider === "google" ? await fetchGoogleEvents(token) : await fetchMicrosoftEvents(token);
+  const now = new Date();
+  await writeEvents(account.id, account.organizationId, events);
 
   await db.update(calendarAccounts)
     .set({ lastSyncedAt: now, status: "active", lastError: null, syncFailures: 0, updatedAt: now })
@@ -320,7 +319,34 @@ export async function syncAccount(account: Account): Promise<void> {
   void clearEmailClaim(`calendar_disconnected:${account.id}`);
 }
 
+/** Also sync the calendars of connected EMAIL accounts (Gmail/Outlook mailboxes
+ *  linked for sending + booking). These grant calendar scope, so a rep's real
+ *  meetings live here even if they never separately connected under "Calendars".
+ *  Their events feed the Cockpit / calendar page / lead-profile meetings too. */
+async function syncEmailCalendars(): Promise<void> {
+  let accts: (typeof emailAccounts.$inferSelect)[] = [];
+  try {
+    accts = await db.select().from(emailAccounts).where(eq(emailAccounts.status, "active"));
+  } catch (err) {
+    console.error("[calendar-sync] could not load email accounts:", err);
+    return;
+  }
+  for (const acc of accts) {
+    if (!accountCanSchedule(acc)) continue; // no calendar scope → nothing to read
+    try {
+      const token = await getEmailAccessToken(acc);
+      const events = acc.provider === "gmail" ? await fetchGoogleEvents(token) : await fetchMicrosoftEvents(token);
+      await writeEvents(acc.id, acc.organizationId, events);
+    } catch (err) {
+      // Email accounts have their OWN disconnect flow — never email/disconnect
+      // from here; a throttle or blip just skips this cycle.
+      console.warn(`[calendar-sync] email calendar ${acc.email} sync skipped:`, err instanceof Error ? err.message : err);
+    }
+  }
+}
+
 async function syncAll(): Promise<void> {
+  await syncEmailCalendars();
   let accounts: Account[] = [];
   try {
     // Include "error" accounts too: a transient blip may have flipped one, and

@@ -121,6 +121,8 @@ router.delete(
     await db
       .delete(calendarAccounts)
       .where(and(eq(calendarAccounts.id, id), eq(calendarAccounts.organizationId, orgId), eq(calendarAccounts.userId, userId)));
+    // accountId is no longer FK-cascaded — clean up this account's events.
+    await db.delete(calendarEvents).where(and(eq(calendarEvents.accountId, id), eq(calendarEvents.organizationId, orgId)));
     res.json({ data: { ok: true } });
   }),
 );
