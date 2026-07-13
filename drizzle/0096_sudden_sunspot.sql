@@ -1,0 +1,1 @@
+ALTER TABLE "booking_pages" ADD COLUMN "distribution" text DEFAULT 'equal' NOT NULL;

@@ -39,6 +39,8 @@ function serialize(p: Page, members: MemberRow[] = [], owned = true, ownerName =
     roundRobin: p.roundRobin,
     isPublic: p.isPublic, publicSlug: p.publicSlug,
     members: members.map((m) => m.userId),
+    /** Round-robin distribution: "equal" | "priority". */
+    distribution: p.distribution,
     /** Round-robin priority per host (owner + members): 4 Highest…1 Lowest. */
     priorities, ownerPriority: p.ownerPriority,
     /** Is the requesting user the owner of this page? (member-visible pages are read-only unless they can manage the team) */
@@ -215,6 +217,7 @@ router.post(
       maxDaysAhead: clampInt(b.maxDaysAhead, 1, 365, 60),
       isActive: true, isDefault: false,
       isPublic: false, publicSlug: null as string | null,
+      distribution: b.distribution === "priority" ? "priority" : "equal",
       ownerPriority: clampPriority(b.priorities?.[userId] ?? b.ownerPriority ?? 3),
       createdAt: now, updatedAt: now,
     };
@@ -256,6 +259,7 @@ router.patch(
     if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 525600, page.minNoticeMin);
     if (b.maxDaysAhead !== undefined) set.maxDaysAhead = clampInt(b.maxDaysAhead, 1, 365, page.maxDaysAhead);
     if (b.isActive !== undefined) set.isActive = !!b.isActive;
+    if (b.distribution !== undefined) set.distribution = b.distribution === "priority" ? "priority" : "equal";
     // Owner's own round-robin priority (owner can set on their own page).
     const ownerPrio = b.priorities?.[page.userId] ?? b.ownerPriority;
     if (ownerPrio !== undefined) set.ownerPriority = clampPriority(ownerPrio);

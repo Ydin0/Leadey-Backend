@@ -92,7 +92,7 @@ bookingPublicRouter.post(
     if (hosts.length === 0) { res.status(400).json({ error: { message: "No host is available for this page." } }); return; }
     const offering = await offeringHosts(page, hosts, startISO);
     if (offering.length === 0) { res.status(409).json({ error: { message: "That time was just taken — pick another." } }); return; }
-    const picked = await fairPick(orgId, offering);
+    const picked = await fairPick(orgId, offering, page.distribution === "priority");
     const account = picked.account;
 
     // Attendees = the booker + guests (deduped, host excluded).

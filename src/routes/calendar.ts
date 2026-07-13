@@ -559,7 +559,9 @@ calendarPublicRouter.get(
         scope: cfg.scope,
       });
 
-      // Upsert by (org, user, provider).
+      // Upsert by (org, user, provider, EMAIL) — a rep can connect several
+      // calendars of the same provider (e.g. two Google accounts), so we key on
+      // the specific account address; a different email creates a new row.
       const [existing] = await db
         .select()
         .from(calendarAccounts)
@@ -567,6 +569,7 @@ calendarPublicRouter.get(
           eq(calendarAccounts.organizationId, claims.orgId),
           eq(calendarAccounts.userId, claims.userId),
           eq(calendarAccounts.provider, cfg.providerKey),
+          eq(calendarAccounts.email, email),
         ));
       let accountId = existing?.id;
       if (existing) {

@@ -133,13 +133,15 @@ export async function offeringHosts(page: Page, hosts: PageHost[], startISO: str
   return out;
 }
 
-/** Pick a host: highest-priority tier present among the candidates first, then
- *  least-loaded within it (fewest confirmed meetings), ties at random. A lower
- *  tier is only reached when no higher-priority host is free for the slot. */
-export async function fairPick(orgId: string, allCandidates: PageHost[]): Promise<PageHost> {
+/** Pick a host among the free candidates. With `usePriority`, restrict to the
+ *  highest-priority tier present first (a lower tier is only reached when no
+ *  higher-priority host is free); otherwise treat everyone equally. Then pick
+ *  the least-loaded (fewest confirmed meetings), ties at random. */
+export async function fairPick(orgId: string, allCandidates: PageHost[], usePriority = false): Promise<PageHost> {
   if (allCandidates.length === 0) return allCandidates[0];
-  const topPriority = Math.max(...allCandidates.map((c) => c.priority ?? 3));
-  const candidates = allCandidates.filter((c) => (c.priority ?? 3) === topPriority);
+  const candidates = usePriority
+    ? allCandidates.filter((c) => (c.priority ?? 3) === Math.max(...allCandidates.map((x) => x.priority ?? 3)))
+    : allCandidates;
   if (candidates.length <= 1) return candidates[0];
   const uids = candidates.map((c) => c.userId);
   const counts = await db

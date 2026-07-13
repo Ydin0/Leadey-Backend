@@ -107,8 +107,8 @@ router.post(
       if (hosts.length === 0) throw new ApiError(400, "This booking page has no calendar-connected host.");
       const offering = await offeringHosts(page, hosts, startISO);
       if (offering.length === 0) throw new ApiError(409, "That time was just taken — pick another slot.");
-      // Priority-aware: highest-priority free host first, then least-loaded.
-      const picked = await fairPick(orgId, offering);
+      // Priority-aware only when the page uses priority distribution.
+      const picked = await fairPick(orgId, offering, page.distribution === "priority");
       account = picked.account;
       durationMin = page.durationMin;
       video = page.video;

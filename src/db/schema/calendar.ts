@@ -30,7 +30,7 @@ export const calendarAccounts = pgTable(
   },
   (t) => [
     index("calendar_accounts_org_user_idx").on(t.organizationId, t.userId),
-    unique("calendar_accounts_org_user_provider_uq").on(t.organizationId, t.userId, t.provider),
+    unique("calendar_accounts_org_user_provider_email_uq").on(t.organizationId, t.userId, t.provider, t.email),
   ],
 );
 

@@ -57,9 +57,12 @@ export const bookingPages = pgTable(
     minNoticeMin: integer("min_notice_min").notNull().default(240),
     /** How far ahead slots are offered, in days. */
     maxDaysAhead: integer("max_days_ahead").notNull().default(60),
+    /** Round-robin distribution: "equal" = spread evenly (least-loaded, priority
+     *  ignored) · "priority" = allocate by each host's priority tier first. */
+    distribution: text("distribution").notNull().default("equal"),
     /** Round-robin priority of the OWNER as a host on this page. Higher = booked
-     *  first: 4 Highest · 3 High · 2 Low · 1 Lowest. A lower tier is only picked
-     *  when no higher-tier host is free for the slot. */
+     *  first: 4 Highest · 3 High · 2 Low · 1 Lowest. Only used when
+     *  distribution = "priority". */
     ownerPriority: integer("owner_priority").notNull().default(3),
     /** Shareable public link: /book/<publicSlug>. Minted on first publish. */
     isPublic: boolean("is_public").notNull().default(false),

@@ -1,0 +1,2 @@
+ALTER TABLE "calendar_accounts" DROP CONSTRAINT "calendar_accounts_org_user_provider_uq";--> statement-breakpoint
+ALTER TABLE "calendar_accounts" ADD CONSTRAINT "calendar_accounts_org_user_provider_email_uq" UNIQUE("organization_id","user_id","provider","email");

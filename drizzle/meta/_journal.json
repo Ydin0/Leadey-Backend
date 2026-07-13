@@ -666,6 +666,20 @@
       "when": 1783972865701,
       "tag": "0094_wooden_nicolaos",
       "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1783974677963,
+      "tag": "0095_harsh_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1783974801836,
+      "tag": "0096_sudden_sunspot",
+      "breakpoints": true
     }
   ]
 }
