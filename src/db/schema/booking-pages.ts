@@ -57,6 +57,10 @@ export const bookingPages = pgTable(
     minNoticeMin: integer("min_notice_min").notNull().default(240),
     /** How far ahead slots are offered, in days. */
     maxDaysAhead: integer("max_days_ahead").notNull().default(60),
+    /** Round-robin priority of the OWNER as a host on this page. Higher = booked
+     *  first: 4 Highest · 3 High · 2 Low · 1 Lowest. A lower tier is only picked
+     *  when no higher-tier host is free for the slot. */
+    ownerPriority: integer("owner_priority").notNull().default(3),
     /** Shareable public link: /book/<publicSlug>. Minted on first publish. */
     isPublic: boolean("is_public").notNull().default(false),
     publicSlug: text("public_slug"),
@@ -81,6 +85,8 @@ export const bookingPageMembers = pgTable(
       .notNull()
       .references(() => bookingPages.id, { onDelete: "cascade" }),
     userId: text("user_id").notNull(),
+    /** Round-robin priority: 4 Highest · 3 High · 2 Low · 1 Lowest. */
+    priority: integer("priority").notNull().default(3),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

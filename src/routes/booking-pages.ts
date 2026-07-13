@@ -29,13 +29,18 @@ async function canManageTeam(req: Request): Promise<boolean> {
   return hasPerm(perms.permissions, "settings.manageTeam");
 }
 
-function serialize(p: Page, memberIds: string[] = [], owned = true, ownerName = "") {
+interface MemberRow { userId: string; priority: number }
+function serialize(p: Page, members: MemberRow[] = [], owned = true, ownerName = "") {
+  const priorities: Record<string, number> = { [p.userId]: p.ownerPriority };
+  for (const m of members) priorities[m.userId] = m.priority;
   return {
     id: p.id, userId: p.userId, name: p.name, durationMin: p.durationMin, video: p.video,
     timezone: p.timezone, availability: p.availability, respectCalendar: p.respectCalendar,
     roundRobin: p.roundRobin,
     isPublic: p.isPublic, publicSlug: p.publicSlug,
-    members: memberIds,
+    members: members.map((m) => m.userId),
+    /** Round-robin priority per host (owner + members): 4 Highest…1 Lowest. */
+    priorities, ownerPriority: p.ownerPriority,
     /** Is the requesting user the owner of this page? (member-visible pages are read-only unless they can manage the team) */
     owned, ownerName,
     bufferBeforeMin: p.bufferBeforeMin, bufferAfterMin: p.bufferAfterMin,
@@ -43,22 +48,31 @@ function serialize(p: Page, memberIds: string[] = [], owned = true, ownerName = 
   };
 }
 
-/** Replace a page's assigned member set (owner excluded — always a host). */
-async function syncMembers(pageId: string, ownerId: string, members: unknown): Promise<void> {
+const clampPriority = (n: unknown): number => {
+  const v = Math.round(Number(n));
+  return Number.isFinite(v) ? Math.min(4, Math.max(1, v)) : 3;
+};
+
+/** Replace a page's assigned member set + their priorities (owner excluded —
+ *  the owner's priority lives on the page's ownerPriority column). `priorities`
+ *  maps userId → tier (1 Lowest … 4 Highest). */
+async function syncMembers(pageId: string, ownerId: string, members: unknown, priorities?: Record<string, unknown>): Promise<void> {
   const desired = new Set(
     (Array.isArray(members) ? members : [])
       .map((m) => (typeof m === "string" ? m : (m as { userId?: string })?.userId))
       .filter((x): x is string => !!x && x !== ownerId),
   );
+  const prio = (u: string): number => clampPriority(priorities?.[u] ?? 3);
   const existing = await db.select({ userId: bookingPageMembers.userId }).from(bookingPageMembers).where(eq(bookingPageMembers.bookingPageId, pageId));
   const have = new Set(existing.map((e) => e.userId));
-  const toAdd = [...desired].filter((u) => !have.has(u));
   const toRemove = [...have].filter((u) => !desired.has(u));
   if (toRemove.length) {
     await db.delete(bookingPageMembers).where(and(eq(bookingPageMembers.bookingPageId, pageId), inArray(bookingPageMembers.userId, toRemove)));
   }
-  if (toAdd.length) {
-    await db.insert(bookingPageMembers).values(toAdd.map((u) => ({ id: createId("bpm"), bookingPageId: pageId, userId: u, createdAt: new Date() }))).onConflictDoNothing();
+  for (const u of desired) {
+    await db.insert(bookingPageMembers)
+      .values({ id: createId("bpm"), bookingPageId: pageId, userId: u, priority: prio(u), createdAt: new Date() })
+      .onConflictDoUpdate({ target: [bookingPageMembers.bookingPageId, bookingPageMembers.userId], set: { priority: prio(u) } });
   }
 }
 
@@ -108,12 +122,12 @@ router.get(
   }),
 );
 
-/** Assigned member ids for a set of pages. */
-async function membersByPage(pageIds: string[]): Promise<Map<string, string[]>> {
-  const map = new Map<string, string[]>();
+/** Assigned members (with priority) for a set of pages. */
+async function membersByPage(pageIds: string[]): Promise<Map<string, MemberRow[]>> {
+  const map = new Map<string, MemberRow[]>();
   if (pageIds.length === 0) return map;
   const rows = await db.select().from(bookingPageMembers).where(inArray(bookingPageMembers.bookingPageId, pageIds));
-  for (const r of rows) (map.get(r.bookingPageId) ?? map.set(r.bookingPageId, []).get(r.bookingPageId)!).push(r.userId);
+  for (const r of rows) (map.get(r.bookingPageId) ?? map.set(r.bookingPageId, []).get(r.bookingPageId)!).push({ userId: r.userId, priority: r.priority });
   return map;
 }
 
@@ -201,6 +215,7 @@ router.post(
       maxDaysAhead: clampInt(b.maxDaysAhead, 1, 365, 60),
       isActive: true, isDefault: false,
       isPublic: false, publicSlug: null as string | null,
+      ownerPriority: clampPriority(b.priorities?.[userId] ?? b.ownerPriority ?? 3),
       createdAt: now, updatedAt: now,
     };
     // Members + publishing are team-management actions.
@@ -210,8 +225,8 @@ router.post(
       members = Array.isArray(b.members) ? b.members.map(String).filter((u: string) => u !== userId) : [];
     }
     await db.insert(bookingPages).values(row);
-    if (members.length) await syncMembers(row.id, userId, members);
-    res.status(201).json({ data: serialize(row as Page, members) });
+    if (members.length) await syncMembers(row.id, userId, members, b.priorities);
+    res.status(201).json({ data: serialize(row as Page, members.map((u) => ({ userId: u, priority: clampPriority(b.priorities?.[u] ?? 3) }))) });
   }),
 );
 
@@ -241,15 +256,19 @@ router.patch(
     if (b.minNoticeMin !== undefined) set.minNoticeMin = clampInt(b.minNoticeMin, 0, 20160, page.minNoticeMin);
     if (b.maxDaysAhead !== undefined) set.maxDaysAhead = clampInt(b.maxDaysAhead, 1, 365, page.maxDaysAhead);
     if (b.isActive !== undefined) set.isActive = !!b.isActive;
+    // Owner's own round-robin priority (owner can set on their own page).
+    const ownerPrio = b.priorities?.[page.userId] ?? b.ownerPriority;
+    if (ownerPrio !== undefined) set.ownerPriority = clampPriority(ownerPrio);
     // Publishing + members require team-management permission.
     if (b.isPublic !== undefined && isManager) {
       set.isPublic = !!b.isPublic;
       if (set.isPublic && !page.publicSlug) set.publicSlug = await mintUniqueSlug(set.name ?? page.name);
     }
     await db.update(bookingPages).set(set).where(eq(bookingPages.id, id));
-    if (b.members !== undefined && isManager) await syncMembers(id, page.userId, b.members);
+    if (b.members !== undefined && isManager) await syncMembers(id, page.userId, b.members, b.priorities);
+    else if (b.priorities !== undefined && isManager) await syncMembers(id, page.userId, await getPageMemberIds(id), b.priorities);
     const [updated] = await db.select().from(bookingPages).where(eq(bookingPages.id, id));
-    res.json({ data: serialize(updated, await getPageMemberIds(id)) });
+    res.json({ data: serialize(updated, (await membersByPage([id])).get(id) || []) });
   }),
 );
 

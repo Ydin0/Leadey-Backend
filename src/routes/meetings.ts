@@ -12,7 +12,7 @@ import { ApiError, createId } from "../lib/helpers";
 import { accountCanSchedule } from "../lib/email-providers";
 import { getBusyIntervals, computeSlots, localDateInTz } from "../lib/availability";
 import { getRoundRobinPool } from "./booking-pages";
-import { getPageHosts, offeringHosts } from "../lib/booking-service";
+import { getPageHosts, offeringHosts, fairPick } from "../lib/booking-service";
 import { createMeetingEvent, cancelMeetingEvent, type MeetingAttendee } from "../lib/meeting-scheduler";
 
 type Account = typeof emailAccounts.$inferSelect;
@@ -106,19 +106,8 @@ router.post(
       if (hosts.length === 0) throw new ApiError(400, "This booking page has no calendar-connected host.");
       const offering = await offeringHosts(page, hosts, startISO);
       if (offering.length === 0) throw new ApiError(409, "That time was just taken — pick another slot.");
-      let picked = offering[0];
-      if (offering.length > 1) {
-        const uids = offering.map((h) => h.userId);
-        const counts = await db
-          .select({ uid: scheduledMeetings.hostUserId, c: count() })
-          .from(scheduledMeetings)
-          .where(and(eq(scheduledMeetings.organizationId, orgId), eq(scheduledMeetings.status, "confirmed"), inArray(scheduledMeetings.hostUserId, uids)))
-          .groupBy(scheduledMeetings.hostUserId);
-        const cb = new Map(counts.map((r) => [r.uid, Number(r.c)]));
-        const min = Math.min(...offering.map((h) => cb.get(h.userId) ?? 0));
-        const least = offering.filter((h) => (cb.get(h.userId) ?? 0) === min);
-        picked = least[Math.floor(Math.random() * least.length)];
-      }
+      // Priority-aware: highest-priority free host first, then least-loaded.
+      const picked = await fairPick(orgId, offering);
       account = picked.account;
       durationMin = page.durationMin;
       video = page.video;

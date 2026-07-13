@@ -10,7 +10,7 @@ import { getBusyIntervals, computeSlots, zonedToUtc, localDateInTz, type DaySlot
 type Account = typeof emailAccounts.$inferSelect;
 type Page = typeof bookingPages.$inferSelect;
 
-export interface PageHost { userId: string; account: Account }
+export interface PageHost { userId: string; account: Account; priority: number }
 
 /** The calendar-capable email account that hosts a given user's meetings. */
 export async function resolveHostAccount(orgId: string, userId: string): Promise<Account | null> {
@@ -27,14 +27,23 @@ export async function getPageMemberIds(pageId: string): Promise<string[]> {
   return rows.map((r) => r.userId);
 }
 
-/** Every host in a page's pool (owner + assigned members) that can schedule. */
+/** userId → round-robin priority for a page (owner + assigned members). */
+export async function getPagePriorities(page: Page): Promise<Map<string, number>> {
+  const rows = await db.select({ userId: bookingPageMembers.userId, priority: bookingPageMembers.priority }).from(bookingPageMembers).where(eq(bookingPageMembers.bookingPageId, page.id));
+  const map = new Map<string, number>(rows.map((r) => [r.userId, r.priority]));
+  map.set(page.userId, page.ownerPriority);
+  return map;
+}
+
+/** Every host in a page's pool (owner + assigned members) that can schedule,
+ *  each tagged with its round-robin priority. */
 export async function getPageHosts(orgId: string, page: Page): Promise<PageHost[]> {
-  const memberIds = await getPageMemberIds(page.id);
-  const userIds = [...new Set([page.userId, ...memberIds])];
+  const priorities = await getPagePriorities(page);
+  const userIds = [...new Set([page.userId, ...(await getPageMemberIds(page.id))])];
   const hosts: PageHost[] = [];
   for (const uid of userIds) {
     const account = await resolveHostAccount(orgId, uid);
-    if (account) hosts.push({ userId: uid, account });
+    if (account) hosts.push({ userId: uid, account, priority: priorities.get(uid) ?? 3 });
   }
   return hosts;
 }
@@ -102,8 +111,13 @@ export async function offeringHosts(page: Page, hosts: PageHost[], startISO: str
   return out;
 }
 
-/** Pick the least-loaded host (fewest confirmed meetings), ties at random. */
-export async function fairPick(orgId: string, candidates: PageHost[]): Promise<PageHost> {
+/** Pick a host: highest-priority tier present among the candidates first, then
+ *  least-loaded within it (fewest confirmed meetings), ties at random. A lower
+ *  tier is only reached when no higher-priority host is free for the slot. */
+export async function fairPick(orgId: string, allCandidates: PageHost[]): Promise<PageHost> {
+  if (allCandidates.length === 0) return allCandidates[0];
+  const topPriority = Math.max(...allCandidates.map((c) => c.priority ?? 3));
+  const candidates = allCandidates.filter((c) => (c.priority ?? 3) === topPriority);
   if (candidates.length <= 1) return candidates[0];
   const uids = candidates.map((c) => c.userId);
   const counts = await db
