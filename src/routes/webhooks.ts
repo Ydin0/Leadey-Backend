@@ -431,7 +431,7 @@ router.post("/clerk", async (req: Request, res: Response) => {
           imageUrl: data.image_url,
           plan: "trial",
           planStatus: "trialing",
-          trialEndsAt: new Date(Date.now() + 60 * 86400000), // 60-day trial
+          trialEndsAt: new Date(Date.now() + 30 * 86400000), // 30-day trial
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });

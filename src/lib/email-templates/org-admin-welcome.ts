@@ -16,7 +16,7 @@ export interface OrgAdminWelcomeInput {
 export function renderOrgAdminWelcome(input: OrgAdminWelcomeInput): RenderedEmail {
   const subject = `Welcome to Leadey — your ${escapeHtml(input.organizationName)} workspace is ready`;
   const preheader = `Set up your account, invite teammates, and start running outbound that converts.`;
-  const trialDays = input.trialDays ?? 60;
+  const trialDays = input.trialDays ?? 30;
 
   const body = /* html */ `
     <h1 class="hero-title" style="margin: 0 0 14px; font-size: 26px; line-height: 1.25; font-weight: 600; color: #FFFFFF; letter-spacing: -0.02em;">
