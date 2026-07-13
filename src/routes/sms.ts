@@ -13,6 +13,7 @@ import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { requirePerm } from "../lib/permission-service";
 import { getTelephonyBudgetStatus } from "../lib/telephony-budget";
+import { landlineBlockEnabled, checkSmsCapability } from "../lib/phone-lookup";
 
 /** Rough dial-country of a number, so we text a UK lead from a UK number and a
  *  US lead from a US number (Twilio rejects mismatched From/To combinations). */
@@ -76,6 +77,16 @@ router.post(
       .where(and(eq(leads.id, leadId), eq(leads.funnelId, funnelId), eq(funnels.organizationId, orgId)));
     if (!lead) throw new ApiError(404, "Lead not found");
     if (!lead.phone) throw new ApiError(400, "This lead has no phone number");
+
+    // Don't text landlines — Twilio can't deliver, and it wastes spend. Only a
+    // number Twilio positively identifies as a landline is refused (per-org
+    // toggle, default on); anything else falls through.
+    if (await landlineBlockEnabled(orgId)) {
+      const cap = await checkSmsCapability(lead.phone);
+      if (!cap.smsCapable) {
+        throw new ApiError(400, `This number is a ${cap.lineType || "non-mobile"} line and can't receive SMS.`);
+      }
+    }
 
     // Telephony spend gates: balance floor + monthly budget. The "out of
     // calling credit" phrase is matched client-side — keep it stable.

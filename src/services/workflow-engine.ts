@@ -242,6 +242,18 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
           return;
         }
       } catch { /* budget check is best-effort */ }
+      // Never blast texts at landlines (per-org toggle, default on). Only a
+      // number Twilio positively classifies as a landline is skipped.
+      try {
+        const { landlineBlockEnabled, checkSmsCapability } = await import("../lib/phone-lookup");
+        if (await landlineBlockEnabled(orgId)) {
+          const cap = await checkSmsCapability(lead.phone);
+          if (!cap.smsCapable) {
+            await logRun(enr, node, "skipped", { reason: `not SMS-capable (${cap.lineType || "landline"})` });
+            return;
+          }
+        }
+      } catch { /* lookup is best-effort — never fail the workflow on it */ }
       try {
         const base = process.env.PUBLIC_API_URL || process.env.API_BASE_URL || "";
         const msg = await twilio().messages.create({
