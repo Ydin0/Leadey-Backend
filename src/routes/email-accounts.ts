@@ -14,6 +14,7 @@ import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
 import { ApiError, createId } from "../lib/helpers";
 import { signState, verifyState, encryptSecret } from "../lib/crypto";
+import { isEmailSuppressed, suppressEmail } from "../lib/suppression";
 import { sendEmailVia, verifySmtp, packTokens, accountCanSchedule, type EmailAttachment } from "../lib/email-providers";
 import { readAttachmentFile } from "../lib/template-attachment-storage";
 
@@ -333,6 +334,9 @@ router.post(
     // a new address) wins; otherwise default to the lead's own email.
     const toEmail = String(req.body?.toEmail || "").trim() || lead.email;
     if (!toEmail) throw new ApiError(400, "A recipient email address is required");
+    if (await isEmailSuppressed(orgId, toEmail)) {
+      throw new ApiError(409, "This address has unsubscribed or hard-bounced and is on your suppression list. Remove it there to email again.");
+    }
     const toName = toEmail === lead.email ? lead.name : null;
 
     // Pick the sender account: explicit choice → the rep's default → first.
@@ -776,6 +780,37 @@ publicRouter.get(
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
     res.set("Pragma", "no-cache");
     res.end(PIXEL);
+  }),
+);
+
+// ── PUBLIC: one-click unsubscribe ───────────────────────────────────
+const unsubPage = (title: string, body: string) =>
+  `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+  `<title>${title}</title></head>` +
+  `<body style="margin:0;font-family:Arial,Helvetica,sans-serif;background:#0A0E1F;color:#e5e7eb">` +
+  `<div style="max-width:460px;margin:14vh auto 0;padding:32px 28px;background:#151a2e;border:1px solid #262b45;border-radius:14px;text-align:center">` +
+  `<h1 style="font-size:18px;margin:0 0 10px;color:#fff">${title}</h1>` +
+  `<p style="font-size:14px;line-height:1.6;margin:0;color:#9ca3af">${body}</p>` +
+  `</div></body></html>`;
+
+publicRouter.get(
+  "/unsubscribe/:token",
+  asyncHandler(async (req, res) => {
+    res.set("Content-Type", "text/html; charset=utf-8");
+    const token = String(req.params.token || "");
+    const state = verifyState<{ orgId?: string; emailKey?: string; leadId?: string | null; exp?: number }>(token);
+    if (!state?.orgId || !state.emailKey) {
+      res.status(400).send(unsubPage("Invalid link", "This unsubscribe link is invalid or has expired."));
+      return;
+    }
+    try {
+      await suppressEmail(state.orgId, state.emailKey, "unsubscribe", state.leadId ?? null);
+    } catch (err) {
+      console.error("[unsubscribe] failed:", err);
+    }
+    res.status(200).send(
+      unsubPage("You've been unsubscribed", `We won't send any more emails to <strong style="color:#e5e7eb">${state.emailKey}</strong>.`),
+    );
   }),
 );
 

@@ -1,13 +1,71 @@
-import { eq, and, or, inArray, desc } from "drizzle-orm";
+import { eq, and, or, inArray, desc, sql } from "drizzle-orm";
 import { db } from "../db";
 import { emailAccounts, emailMessages } from "../db/schema/email-accounts";
-import { leadEvents } from "../db/schema/leads";
+import { leadEvents, leads } from "../db/schema/leads";
 import { createId } from "../lib/helpers";
 import { fetchNewMessages, type InboundMessage } from "../lib/email-providers";
+import { suppressEmail } from "../lib/suppression";
 import { createNotification } from "../routes/notifications";
 import { fireTrigger, notifyWorkflowEvent } from "./workflow-engine";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
+
+// A reply asking to stop receiving mail — honored as an unsubscribe.
+const STOP_RE = /\bunsubscribe\b|\bopt[\s.-]?out\b|remove me|(^|\n)\s*stop\b/i;
+
+// A bounce / non-delivery report (NDR) from a receiving mail server.
+const BOUNCE_FROM_RE = /mailer-daemon@|postmaster@/i;
+const BOUNCE_SUBJECT_RE =
+  /undelivered|delivery status notification|delivery (has )?failed|failure notice|returned mail|mail delivery (failed|subsystem)|could ?n[o']?t be delivered/i;
+const isBounce = (m: InboundMessage) =>
+  BOUNCE_FROM_RE.test(m.fromEmail || "") || BOUNCE_SUBJECT_RE.test(m.subject || "");
+const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+
+/** Handle a bounce/NDR: find the original recipient we sent to, mark the
+ *  message + lead bounced, and auto-suppress so we stop emailing them. */
+async function handleBounce(account: typeof emailAccounts.$inferSelect, inbound: InboundMessage): Promise<void> {
+  const orgId = account.organizationId;
+  const sel = {
+    id: emailMessages.id, leadId: emailMessages.leadId,
+    funnelId: emailMessages.funnelId, toEmail: emailMessages.toEmail,
+  };
+
+  // Primary: match the failed message via References/In-Reply-To headers.
+  const refs = [...inbound.references];
+  if (inbound.inReplyTo) refs.push(inbound.inReplyTo);
+  let orig: { id: string; leadId: string | null; funnelId: string | null; toEmail: string } | undefined;
+  if (refs.length) {
+    [orig] = await db
+      .select(sel).from(emailMessages)
+      .where(and(eq(emailMessages.organizationId, orgId), eq(emailMessages.direction, "outbound"), inArray(emailMessages.messageIdHeader, refs)))
+      .orderBy(desc(emailMessages.createdAt)).limit(1);
+  }
+
+  // Fallback: the failed recipient's address appears in the NDR body — match it
+  // against a recent outbound recipient of ours.
+  if (!orig) {
+    const body = `${inbound.text || ""} ${inbound.html || ""}`;
+    const found = [...new Set((body.match(EMAIL_RE) || []).map((e) => e.toLowerCase()))]
+      .filter((e) => e !== account.email.toLowerCase() && !BOUNCE_FROM_RE.test(e));
+    if (found.length) {
+      [orig] = await db
+        .select(sel).from(emailMessages)
+        .where(and(
+          eq(emailMessages.organizationId, orgId), eq(emailMessages.direction, "outbound"),
+          inArray(sql`lower(${emailMessages.toEmail})`, found),
+        ))
+        .orderBy(desc(emailMessages.createdAt)).limit(1);
+    }
+  }
+
+  if (!orig?.toEmail) return; // couldn't attribute the bounce — drop it
+  await db.update(emailMessages).set({ status: "bounced" }).where(eq(emailMessages.id, orig.id));
+  if (orig.leadId) {
+    await db.update(leads).set({ status: "bounced" }).where(eq(leads.id, orig.leadId));
+  }
+  // suppressEmail records the bounce lead-event + exits active enrollments.
+  await suppressEmail(orgId, orig.toEmail, "bounce", orig.leadId);
+}
 
 /** Match an inbound message to one of our tracked outbound emails so we can
  *  attach the reply to the right lead. Prefers thread/in-reply-to/references;
@@ -59,6 +117,12 @@ async function pollAccount(account: typeof emailAccounts.$inferSelect): Promise<
       if (dup) continue;
     }
 
+    // Bounce / non-delivery report → mark bounced + auto-suppress.
+    if (isBounce(inbound)) {
+      try { await handleBounce(account, inbound); } catch (err) { console.error("[email-poller] bounce handling failed:", err); }
+      continue;
+    }
+
     const match = await matchOutbound(account.organizationId, inbound);
     if (!match) continue; // not a reply to anything we sent — ignore
 
@@ -93,6 +157,11 @@ async function pollAccount(account: typeof emailAccounts.$inferSelect): Promise<
       meta: { channel: "email", direction: "inbound", subject: inbound.subject, body: inbound.text || inbound.html },
       timestamp: now,
     });
+    // A "stop"/"unsubscribe" reply is honored as an opt-out (in addition to
+    // being recorded as a normal reply above).
+    if (STOP_RE.test(`${inbound.subject || ""}\n${inbound.text || inbound.html || ""}`) && inbound.fromEmail) {
+      void suppressEmail(account.organizationId, inbound.fromEmail, "unsubscribe", match.leadId);
+    }
     // Workflow reactions: wake wait-for-reply steps + apply exit-on-reply, and
     // enroll into any "reply received" workflows.
     void notifyWorkflowEvent(match.leadId, "replied");

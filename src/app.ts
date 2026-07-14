@@ -26,6 +26,7 @@ import billingRouter from "./routes/billing";
 import creditsRouter from "./routes/credits";
 import smartViewsRouter from "./routes/smart-views";
 import funnelTagsRouter from "./routes/funnel-tags";
+import emailSuppressionsRouter from "./routes/email-suppressions";
 import masterRouter from "./routes/master";
 import teamRouter from "./routes/team";
 import dialerRouter from "./routes/dialer";
@@ -96,6 +97,7 @@ app.use("/webhooks/clerk", express.raw({ type: "application/json" }));
 app.use("/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use("/webhooks/calendly", express.raw({ type: "application/json" }));
 app.use("/webhooks/meta", express.raw({ type: "application/json" }));
+app.use("/webhooks/resend", express.raw({ type: "application/json" }));
 
 // Large enough for bulk CSV lead imports (tens of thousands of rows arrive as
 // one JSON body). The frontend also trims each row to only the mapped columns.
@@ -146,6 +148,7 @@ app.use("/api", billingRouter);
 app.use("/api", creditsRouter);
 app.use("/api", smartViewsRouter);
 app.use("/api", funnelTagsRouter);
+app.use("/api", emailSuppressionsRouter);
 app.use("/api", masterRouter);
 app.use("/api", teamRouter);
 app.use("/api", apiKeysRouter);

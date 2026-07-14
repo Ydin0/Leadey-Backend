@@ -4,6 +4,7 @@ import twilioSdk from "twilio";
 import { Webhook } from "svix";
 import { db } from "../db/index";
 import { leads, leadEvents } from "../db/schema/leads";
+import { emailMessages } from "../db/schema/email-accounts";
 import { funnels, funnelSteps } from "../db/schema/funnels";
 import { scraperContacts } from "../db/schema/contacts";
 import { callRecords } from "../db/schema/call-records";
@@ -22,8 +23,56 @@ import { addCredits, billEnrichmentResults } from "../lib/credits";
 import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments, upsertMembership, deleteMembership, deleteAllMembershipsForUser } from "../lib/org-membership";
 import { invalidateUserPermissions } from "../lib/permission-service";
 import { fireTrigger, fireTriggerForLead, notifyWorkflowEvent } from "../services/workflow-engine";
+import { suppressEmail } from "../lib/suppression";
 
 const router = Router();
+
+// ─── Resend webhook (bounces / complaints) ──────────────────────────────
+// Secondary bounce path (the primary is NDR detection in the email poller):
+// covers the Resend fallback + system mail. Best-effort signature verify.
+router.post("/resend", async (req: Request, res: Response) => {
+  try {
+    const raw = req.body;
+    let payload: any;
+    const secret = process.env.RESEND_WEBHOOK_SECRET;
+    if (secret && Buffer.isBuffer(raw)) {
+      try {
+        payload = new Webhook(secret).verify(raw.toString("utf8"), {
+          "svix-id": String(req.headers["svix-id"] || ""),
+          "svix-timestamp": String(req.headers["svix-timestamp"] || ""),
+          "svix-signature": String(req.headers["svix-signature"] || ""),
+        });
+      } catch (e) {
+        console.error("[resend webhook] signature verify failed:", e instanceof Error ? e.message : e);
+        return res.status(400).json({ error: "invalid signature" });
+      }
+    } else {
+      payload = Buffer.isBuffer(raw) ? JSON.parse(raw.toString("utf8")) : raw;
+    }
+
+    const type = String(payload?.type || "");
+    if (type === "email.bounced" || type === "email.complained") {
+      const data = payload?.data || {};
+      const rawTo = Array.isArray(data.to) ? data.to : data.to ? [data.to] : data.email ? [data.email] : [];
+      const reason = type === "email.complained" ? "complaint" : "bounce";
+      for (const to of rawTo) {
+        const key = String(to || "").trim().toLowerCase();
+        if (!key) continue;
+        // Resend is global — attribute the address to whichever org(s) sent to it.
+        const orgs = await db
+          .selectDistinct({ orgId: emailMessages.organizationId })
+          .from(emailMessages)
+          .where(and(eq(emailMessages.direction, "outbound"), sql`lower(${emailMessages.toEmail}) = ${key}`))
+          .limit(20);
+        for (const o of orgs) await suppressEmail(o.orgId, key, reason as "bounce" | "complaint", null);
+      }
+    }
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("[resend webhook] error:", err);
+    res.status(200).json({ received: true });
+  }
+});
 
 // ─── Smartlead webhook ──────────────────────────────────────────────────
 

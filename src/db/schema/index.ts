@@ -12,6 +12,7 @@ export { smsMessages } from "./sms";
 export { whatsappAccounts } from "./whatsapp-accounts";
 export { notifications } from "./notifications";
 export { emailAccounts, emailMessages, emailThreadState } from "./email-accounts";
+export { emailSuppressions } from "./email-suppressions";
 export { calendlyAccounts, calendlyMeetings } from "./calendly";
 export { calendarAccounts, calendarEvents } from "./calendar";
 export { settings } from "./settings";

@@ -1,4 +1,4 @@
-import { eq, and, inArray, gte, lte, isNull, sql } from "drizzle-orm";
+import { eq, and, inArray, gte, lte, lt, isNull, sql } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/workflows";
@@ -15,11 +15,15 @@ import { UnipileClient } from "../lib/unipile-client";
 import { canExecute, recordExecution, type LinkedInAction } from "../lib/linkedin-rate-limiter";
 import { sendEmail } from "../lib/email";
 import { sendEmailVia, type EmailAttachment } from "../lib/email-providers";
+import { isEmailSuppressed, unsubscribeFooterHtml } from "../lib/suppression";
 import { withSignature } from "../routes/email-accounts";
 import { templateAttachments } from "../db/schema/template-attachments";
 import { readAttachmentFile } from "../lib/template-attachment-storage";
 import { sendWhatsapp } from "./whatsapp-sender";
 import { setLeadCustomFields, getCustomFieldsForLeads, listFieldDefinitions } from "../lib/custom-fields-service";
+import { leadFieldDefinitions, leadFieldValues } from "../db/schema/custom-fields";
+import { smartViews } from "../db/schema/smart-views";
+import { buildLeadFilterWhere } from "../lib/lead-filter";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { createId } from "../lib/helpers";
 
@@ -35,7 +39,9 @@ type Enrollment = typeof workflowEnrollments.$inferSelect;
 export type TriggerType =
   | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "meeting_booked" | "manual"
   // Org-level triggers (workflows with funnelId = null):
-  | "meeting_upcoming" | "opportunity_created" | "opportunity_stage_changed" | "opportunity_won" | "opportunity_lost";
+  | "meeting_upcoming" | "opportunity_created" | "opportunity_stage_changed" | "opportunity_won" | "opportunity_lost"
+  // Sweeper-driven enrollment triggers:
+  | "matches_smart_view" | "date_field";
 export function triggerTypeFromLabel(label: string): TriggerType {
   switch (label) {
     case "Status changes": return "status_changed";
@@ -47,6 +53,8 @@ export function triggerTypeFromLabel(label: string): TriggerType {
     case "Opportunity stage changes": return "opportunity_stage_changed";
     case "Opportunity won": return "opportunity_won";
     case "Opportunity lost": return "opportunity_lost";
+    case "Matches a smart view": return "matches_smart_view";
+    case "Date reaches": return "date_field";
     case "Manually added": return "manual";
     default: return "lead_enters_campaign";
   }
@@ -180,13 +188,23 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
   switch (node.type) {
     case "email": {
       if (!lead.email) { await logRun(enr, node, "skipped", { reason: "no email" }); return; }
+      // Compliance: never send automated email to a suppressed address
+      // (unsubscribed / bounced / complained / manually blocked).
+      if (await isEmailSuppressed(orgId, lead.email)) {
+        await logRun(enr, node, "skipped", { reason: "suppressed" });
+        return;
+      }
       const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
       const subject = renderTokens(String(d.subject || ""), tokens);
       // Prefer a rich HTML body when the node carries one (template with links/
       // formatting); otherwise convert the plain-text body's newlines.
-      const html = d.bodyHtml
+      const baseHtml = d.bodyHtml
         ? renderTokens(String(d.bodyHtml), tokens)
         : renderTokens(String(d.body || ""), tokens).replace(/\n/g, "<br>");
+      // Automated emails always carry an unsubscribe footer (CAN-SPAM/GDPR),
+      // appended after the signature.
+      const footer = unsubscribeFooterHtml(orgId, lead.email, lead.id);
+      let sentHtml = baseHtml + footer;
       // Attachments the node references (e.g. a template's welcome-pack PDFs).
       const { files: attachments, refs: attachmentRefs } = await loadWorkflowAttachments(orgId, d.attachmentIds);
       const accounts = await db.select().from(emailAccounts).where(eq(emailAccounts.organizationId, orgId));
@@ -209,7 +227,8 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
           const { resolveSignatureChoice } = await import("../lib/signature");
           const sigChoice = typeof d.signatureId === "string" ? d.signatureId : undefined;
           const resolvedSig = await resolveSignatureChoice(account, sigChoice);
-          const htmlWithSig = withSignature(html, resolvedSig);
+          const htmlWithSig = withSignature(baseHtml, resolvedSig) + footer;
+          sentHtml = htmlWithSig;
           const res = await sendEmailVia(account, { to: lead.email, subject, html: htmlWithSig, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,
@@ -219,11 +238,11 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
             messageIdHeader: res.messageIdHeader, status: "sent", attachments: attachmentRefs, createdAt: new Date(),
           });
         } else {
-          await sendEmail({ to: lead.email, subject, html, from: String(d.from || "") || undefined });
+          await sendEmail({ to: lead.email, subject, html: sentHtml, from: String(d.from || "") || undefined });
         }
         await db.insert(leadEvents).values({
           id: createId("event"), leadId: lead.id, type: "step_outcome", outcome: "sent",
-          stepIndex: 0, meta: { channel: "email", direction: "outbound", subject, body: html, source: "workflow" }, timestamp: new Date(),
+          stepIndex: 0, meta: { channel: "email", direction: "outbound", subject, body: sentHtml, source: "workflow" }, timestamp: new Date(),
         });
         await logRun(enr, node, "done", { subject });
       } catch (e) {
@@ -790,6 +809,116 @@ export async function exitMeetingWorkflows(meetingId: string): Promise<void> {
       .set({ status: "exited", nextRunAt: null, waitingFor: null, completedAt: new Date() })
       .where(and(eq(workflowEnrollments.status, "active"), sql`${workflowEnrollments.context}->>'meetingId' = ${meetingId}`));
   } catch { /* best effort */ }
+}
+
+/** Sweep for "matches a smart view" workflows: continuously enroll every lead
+ *  matching the workflow's saved Smart View. `enrollInto`'s re-enrollment-off
+ *  dedup means already-enrolled leads are skipped, so each sweep only picks up
+ *  NEW matches — exactly Close's "continuous enrollment". Runs ~every 5 min. */
+export async function sweepSmartViewWorkflows(): Promise<void> {
+  try {
+    const wfs = await db.select().from(workflows).where(eq(workflows.status, "active"));
+    for (const wf of wfs) {
+      const g = graphOf(wf);
+      const trigger = g.nodes.find((n) => n.type === "trigger");
+      if (!trigger) continue;
+      const tdata = (trigger.data || {}) as Record<string, unknown>;
+      if (triggerTypeFromLabel(String(tdata.label || "")) !== "matches_smart_view") continue;
+      const viewId = String(tdata.viewId || "").trim();
+      if (!viewId) continue;
+
+      const [view] = await db
+        .select({ definition: smartViews.definition })
+        .from(smartViews)
+        .where(and(eq(smartViews.id, viewId), eq(smartViews.organizationId, wf.organizationId)));
+      if (!view) continue;
+
+      // buildLeadFilterWhere yields a predicate over `leads` only — join funnels
+      // for org scoping (and constrain to this campaign for campaign workflows).
+      const pred = buildLeadFilterWhere(view.definition, { orgId: wf.organizationId });
+      const conds = [eq(funnels.organizationId, wf.organizationId)];
+      if (wf.funnelId) conds.push(eq(leads.funnelId, wf.funnelId));
+      if (pred) conds.push(pred);
+
+      const rows = await db
+        .select({ id: leads.id })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(...conds))
+        .limit(5000);
+      const ids = rows.map((r) => r.id);
+      if (ids.length) await enrollInto(wf, ids);
+    }
+  } catch (e) {
+    console.error("[workflow-engine] sweepSmartViewWorkflows error:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** Sweep for "date reaches" workflows: enroll leads whose configured date field
+ *  falls N days before/after today. Generalizes the meeting sweeper to any date
+ *  field (renewal, contract end, …). `enrollInto` dedup → fires once per lead.
+ *  Runs ~hourly. */
+export async function sweepDateFieldWorkflows(): Promise<void> {
+  try {
+    const wfs = await db.select().from(workflows).where(eq(workflows.status, "active"));
+    // Target calendar day (UTC): before → field = today + offset; after → today − offset.
+    const base = new Date();
+    for (const wf of wfs) {
+      const g = graphOf(wf);
+      const trigger = g.nodes.find((n) => n.type === "trigger");
+      if (!trigger) continue;
+      const tdata = (trigger.data || {}) as Record<string, unknown>;
+      if (triggerTypeFromLabel(String(tdata.label || "")) !== "date_field") continue;
+      const fieldKey = String(tdata.fieldKey || "").trim();
+      if (!fieldKey) continue;
+      const offsetDays = Math.max(0, Math.min(3650, Math.round(Number(tdata.offsetDays) || 0)));
+      const direction = String(tdata.direction || "before") === "after" ? "after" : "before";
+      const shift = direction === "after" ? -offsetDays : offsetDays;
+      const target = new Date(base);
+      target.setUTCDate(target.getUTCDate() + shift);
+      const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+
+      const orgScope = [eq(funnels.organizationId, wf.organizationId)];
+      if (wf.funnelId) orgScope.push(eq(leads.funnelId, wf.funnelId));
+
+      let ids: string[] = [];
+      if (fieldKey === "nextDate" || fieldKey === "next_date") {
+        const rows = await db
+          .select({ id: leads.id })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(...orgScope, gte(leads.nextDate, dayStart), lt(leads.nextDate, dayEnd)))
+          .limit(5000);
+        ids = rows.map((r) => r.id);
+      } else {
+        // Custom date field: match its value in the day bucket. Guard the TEXT
+        // value with a date-shaped regex so a bad string never breaks the cast.
+        const [def] = await db
+          .select({ id: leadFieldDefinitions.id })
+          .from(leadFieldDefinitions)
+          .where(and(eq(leadFieldDefinitions.organizationId, wf.organizationId), eq(leadFieldDefinitions.key, fieldKey)));
+        if (!def) continue;
+        const rows = await db
+          .select({ id: leads.id })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .innerJoin(leadFieldValues, eq(leadFieldValues.leadId, leads.id))
+          .where(and(
+            ...orgScope,
+            eq(leadFieldValues.fieldDefinitionId, def.id),
+            sql`${leadFieldValues.value} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'`,
+            sql`(${leadFieldValues.value})::timestamptz >= ${dayStart}`,
+            sql`(${leadFieldValues.value})::timestamptz < ${dayEnd}`,
+          ))
+          .limit(5000);
+        ids = rows.map((r) => r.id);
+      }
+      if (ids.length) await enrollInto(wf, ids);
+    }
+  } catch (e) {
+    console.error("[workflow-engine] sweepDateFieldWorkflows error:", e instanceof Error ? e.message : e);
+  }
 }
 
 /** Resolve a lead's org and fire an ORG-LEVEL trigger (opportunity_* etc.). */
