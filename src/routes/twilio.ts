@@ -31,6 +31,23 @@ function asyncHandler<P = Record<string, string>>(handler: AsyncHandler<P>) {
 
 const authRouter = Router();
 
+// The browser Voice client's identity is scoped to (user, org) — NOT the bare
+// Clerk user id. A user can belong to several Clerk orgs and have phone lines
+// assigned to them in more than one; with a bare-userId identity, a single
+// browser softphone received inbound calls for EVERY org that had a line
+// assigned to that user, regardless of which org they were viewing — a
+// cross-tenant breach (a Corpwise call ringing a rep working in Hyrra). Scoping
+// the identity to the active org means a session only ever receives calls for
+// the org it's actually in.
+export function voiceIdentity(userId: string, orgId: string | null | undefined): string {
+  return orgId ? `${userId}__${orgId}` : userId;
+}
+export function parseVoiceIdentity(identity: string): { userId: string; orgId: string | null } {
+  const i = identity.indexOf("__org_");
+  if (i === -1) return { userId: identity, orgId: null };
+  return { userId: identity.slice(0, i), orgId: identity.slice(i + 2) };
+}
+
 // POST /api/twilio/token — generate Twilio access token for browser Voice SDK
 authRouter.post(
   "/twilio/token",
@@ -42,7 +59,7 @@ authRouter.post(
       process.env.TWILIO_ACCOUNT_SID!,
       process.env.TWILIO_API_KEY!,
       process.env.TWILIO_API_SECRET!,
-      { identity: auth.userId, ttl: 3600 },
+      { identity: voiceIdentity(auth.userId, auth.orgId), ttl: 3600 },
     );
 
     const voiceGrant = new VoiceGrant({
@@ -193,18 +210,21 @@ webhookRouter.post(
           allLines.find((l) => l.number.replace(/[^\d]/g, "") === dialedDigits) ||
           null;
 
-        // The browser registers with the user's Clerk id as its Voice identity,
-        // and phone_lines.assignedTo holds that same id. An assigned line rings
-        // just that user; an org-wide line rings everyone (first to answer wins).
+        // Ring the ORG-SCOPED Voice identity (userId__orgId), never the bare
+        // user id — otherwise a rep who owns lines in multiple orgs receives
+        // this call in whichever org they're currently viewing (cross-tenant
+        // leak). Scoping to THIS line's org means only a session actually in the
+        // line's org rings. An assigned line rings just that user; an org-wide
+        // line rings everyone in the org (first to answer wins).
         let identities: string[] = [];
         if (line?.assignedTo) {
-          identities = [line.assignedTo];
+          identities = [voiceIdentity(line.assignedTo, line.organizationId)];
         } else if (line) {
           const orgUsers = await db
             .select({ id: users.id })
             .from(users)
             .where(e(users.organizationId, line.organizationId));
-          identities = orgUsers.map((u) => u.id);
+          identities = orgUsers.map((u) => voiceIdentity(u.id, line.organizationId));
         }
 
         if (identities.length > 0) {
@@ -256,8 +276,10 @@ webhookRouter.post(
         const { db } = await import("../db");
         const { phoneLines } = await import("../db/schema/phone-lines");
         const { users } = await import("../db/schema/organizations");
-        const { eq: e, sql: s } = await import("drizzle-orm");
-        const userId = from!.slice("client:".length);
+        const { eq: e, and: aAnd, sql: s } = await import("drizzle-orm");
+        // From = "client:<userId>__<orgId>" (org-scoped identity). Parse out the
+        // bare user id + the org the softphone is active in.
+        const { userId, orgId: activeOrgId } = parseVoiceIdentity(from!.slice("client:".length));
         const d = (x: string | null) => (x || "").replace(/[^\d]/g, "");
         const cid = d(callerId);
 
@@ -272,21 +294,24 @@ webhookRouter.post(
         }
 
         if (!owned) {
-          // Fall back to a line assigned to this rep (any org), else the first
-          // line of their users-table home org.
+          // Fall back to a line in the rep's ACTIVE org — their assigned line
+          // there, else that org's first line. Scoping to the active org (not
+          // just "any org") stops an outbound call in one org from ever
+          // presenting a number that belongs to a DIFFERENT org.
+          const scopeOrg = activeOrgId ?? null;
           const [assigned] = await db
             .select({ number: phoneLines.number })
             .from(phoneLines)
-            .where(e(phoneLines.assignedTo, userId))
+            .where(scopeOrg ? aAnd(e(phoneLines.assignedTo, userId), e(phoneLines.organizationId, scopeOrg)) : e(phoneLines.assignedTo, userId))
             .limit(1);
           let fb: string | undefined = assigned?.number;
           if (!fb) {
-            const [u] = await db.select({ orgId: users.organizationId }).from(users).where(e(users.id, userId)).limit(1);
-            if (u?.orgId) {
+            const orgForFallback = scopeOrg ?? (await db.select({ orgId: users.organizationId }).from(users).where(e(users.id, userId)).limit(1))[0]?.orgId;
+            if (orgForFallback) {
               const [l] = await db
                 .select({ number: phoneLines.number })
                 .from(phoneLines)
-                .where(e(phoneLines.organizationId, u.orgId))
+                .where(e(phoneLines.organizationId, orgForFallback))
                 .limit(1);
               fb = l?.number;
             }
