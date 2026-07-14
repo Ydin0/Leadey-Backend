@@ -694,6 +694,13 @@
       "when": 1783976873178,
       "tag": "0098_brainy_vapor",
       "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1784028274557,
+      "tag": "0099_add_user_default_signature",
+      "breakpoints": true
     }
   ]
 }

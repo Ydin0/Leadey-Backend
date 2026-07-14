@@ -94,6 +94,10 @@ export const users = pgTable("users", {
   /** Free-form extra fields for signature variables (e.g. booking_link,
    *  pronouns) → resolved as {{sender_<key>}} at send time. */
   signatureFields: jsonb("signature_fields").$type<Record<string, string>>(),
+  /** This rep's personal default shared signature (emailSignatures.id). When
+   *  set, the "Default signature" choice in the composer resolves to this
+   *  instead of the mailbox's own — a per-user preference, not org-wide. */
+  defaultSignatureId: text("default_signature_id"),
   imageUrl: text("image_url"),
   role: text("role"),
   platformRole: text("platform_role"),

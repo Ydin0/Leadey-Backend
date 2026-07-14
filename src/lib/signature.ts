@@ -83,7 +83,18 @@ export async function resolveSignatureChoice(
   account: { signatureId?: string | null; signature?: string | null; userId: string; organizationId: string },
   choice: string | null | undefined,
 ): Promise<string | null> {
-  if (choice == null || choice === "default") return resolveAccountSignature(account);
   if (choice === "none") return null;
+  if (choice == null || choice === "default") {
+    // A per-user default signature (set by the rep) wins over the mailbox's own
+    // configured signature, so "Default signature" honours their preference.
+    const [u] = await db
+      .select({ defaultSignatureId: users.defaultSignatureId })
+      .from(users)
+      .where(eq(users.id, account.userId));
+    if (u?.defaultSignatureId) {
+      return resolveAccountSignature({ ...account, signatureId: u.defaultSignatureId, signature: null });
+    }
+    return resolveAccountSignature(account);
+  }
   return resolveAccountSignature({ ...account, signatureId: choice, signature: null });
 }

@@ -583,13 +583,14 @@ router.get(
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     const [u] = await db
-      .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title, signatureFields: users.signatureFields })
+      .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title, signatureFields: users.signatureFields, defaultSignatureId: users.defaultSignatureId })
       .from(users)
       .where(eq(users.id, userId));
     res.json({
       data: {
         firstName: u?.firstName ?? "", lastName: u?.lastName ?? "", email: u?.email ?? "",
         phone: u?.phone ?? "", title: u?.title ?? "", signatureFields: u?.signatureFields ?? {},
+        defaultSignatureId: u?.defaultSignatureId ?? null,
       },
     });
   }),
@@ -601,8 +602,19 @@ router.patch(
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     if (!userId) throw new ApiError(401, "Not authenticated");
-    const patch: Partial<{ title: string | null; signatureFields: Record<string, string>; updatedAt: Date }> = { updatedAt: new Date() };
+    const patch: Partial<{ title: string | null; signatureFields: Record<string, string>; defaultSignatureId: string | null; updatedAt: Date }> = { updatedAt: new Date() };
     if (req.body?.title !== undefined) patch.title = String(req.body.title || "").slice(0, 160) || null;
+    if (req.body?.defaultSignatureId !== undefined) {
+      const orgId = getOrgId(req);
+      const id = req.body.defaultSignatureId ? String(req.body.defaultSignatureId) : null;
+      if (id) {
+        // Only allow marking a signature that actually exists in this org.
+        const [sig] = await db.select({ id: emailSignatures.id }).from(emailSignatures)
+          .where(and(eq(emailSignatures.id, id), eq(emailSignatures.organizationId, orgId)));
+        if (!sig) throw new ApiError(404, "Signature not found");
+      }
+      patch.defaultSignatureId = id;
+    }
     if (req.body?.signatureFields !== undefined && req.body.signatureFields && typeof req.body.signatureFields === "object") {
       const clean: Record<string, string> = {};
       for (const [k, v] of Object.entries(req.body.signatureFields as Record<string, unknown>)) {
