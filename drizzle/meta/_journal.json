@@ -701,6 +701,13 @@
       "when": 1784028274557,
       "tag": "0099_add_user_default_signature",
       "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1784040117270,
+      "tag": "0100_inbox_line_indexes",
+      "breakpoints": true
     }
   ]
 }

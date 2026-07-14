@@ -1,0 +1,2 @@
+CREATE INDEX "call_records_line_called_at" ON "call_records" USING btree ("line_id","called_at");--> statement-breakpoint
+CREATE INDEX "sms_messages_line_created_idx" ON "sms_messages" USING btree ("line_id","created_at");

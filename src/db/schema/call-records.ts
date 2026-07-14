@@ -82,6 +82,8 @@ export const callRecords = pgTable("call_records", {
   index("call_records_org_called_at").on(t.organizationId, t.calledAt),
   // Per-lead recency lookups.
   index("call_records_lead_id").on(t.leadId),
+  // Inbox: missed calls filtered by the org line(s) they came in on.
+  index("call_records_line_called_at").on(t.lineId, t.calledAt),
   // Phone-number matching (lead activity counts, universal company timeline):
   // calls are matched to people by normalized counterparty digits, so index
   // the digit expressions on both directions.

@@ -40,5 +40,7 @@ export const smsMessages = pgTable(
     // Cost reporting: org-scoped period scans (daily buckets, monthly
     // aggregates, paginated raw usage logs ordered by created_at DESC).
     index("sms_messages_org_created_idx").on(t.organizationId, t.createdAt),
+    // Inbox: threads/counts scoped to the org line(s) they're on.
+    index("sms_messages_line_created_idx").on(t.lineId, t.createdAt),
   ],
 );

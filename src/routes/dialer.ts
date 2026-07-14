@@ -1015,12 +1015,6 @@ export async function findNextDialable(
   session: typeof dialerSessions.$inferSelect,
 ): Promise<typeof dialerQueueItems.$inferSelect | null> {
   const orgId = session.organizationId;
-  // Serialize "pick next" across every rep in this org. Without this, two reps
-  // advancing at the same instant both read the queue before either marks a
-  // lead in_progress, so both grab the SAME lead and dial it simultaneously
-  // (the "we called the same lead at the same time" complaint). The lock is
-  // released automatically when the transaction commits.
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${orgId}))`);
 
   const f = (session.filtersJson as {
     excludeDoNotCall?: boolean;
@@ -1135,6 +1129,17 @@ export async function findNextDialable(
         recentByMaster.set(r.masterContactId, t);
     }
   }
+
+  // ── Critical section ─────────────────────────────────────────────
+  // Serialize only the "read live claims → pick → claim" step across every rep
+  // in this org. Without it, two reps advancing at the same instant both read
+  // the queue before either marks a lead in_progress and grab the SAME lead.
+  // The heavy recency reads above run OUTSIDE this lock (they're advisory), so
+  // the lock is held for a few tiny queries instead of a full org-wide
+  // call_records scan — which is what let one org's dialers stall each other
+  // (and every other request queue behind the held pool connection) under load.
+  // The lock releases automatically when the transaction commits.
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${orgId}))`);
 
   // Leads another rep is ACTIVELY on right now — pass over (don't double-ring).
   // Active OR paused sessions count (a rep who paused mid-lead still owns it),
