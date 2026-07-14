@@ -200,6 +200,16 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return null;
   }
 
+  // Called today — has the lead had any call placed to it on the current
+  // server day. "No" (is=false) includes leads never called at all, which is
+  // exactly what a power-dialer queue wants ("everyone I haven't reached yet").
+  if (field === "calledToday") {
+    if (op !== "is") return null;
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    const today = sql`exists (select 1 from call_records cr where ${callMatch} and cr.called_at::date = current_date)`;
+    return String(c.value) === "true" ? today : sql`not ${today}`;
+  }
+
   // Campaign membership (org all-leads page). A lead belongs to exactly one
   // funnel; "is any of" matches per enrollment. Ids are org-scoped upstream.
   if (field === "funnelId") {
