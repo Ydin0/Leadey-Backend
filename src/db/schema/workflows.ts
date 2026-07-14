@@ -39,9 +39,10 @@ export const workflows = pgTable(
   {
     id: text("id").primaryKey(),
     organizationId: text("organization_id").notNull(),
-    funnelId: text("funnel_id")
-      .notNull()
-      .references(() => funnels.id, { onDelete: "cascade" }),
+    // NULL = an ORG-LEVEL workflow (not tied to a campaign) — triggered by
+    // meetings/opportunities. A non-null funnelId scopes the workflow to that
+    // campaign (and cascades on campaign delete).
+    funnelId: text("funnel_id").references(() => funnels.id, { onDelete: "cascade" }),
     name: text("name").notNull().default("Untitled workflow"),
     status: text("status").notNull().default("draft"), // draft | active | paused
     graph: jsonb("graph").$type<WorkflowGraph>().notNull().default({ nodes: [], edges: [] }),

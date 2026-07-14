@@ -219,6 +219,8 @@ router.delete(
         }
       }
       await db.update(scheduledMeetings).set({ status: "cancelled", updatedAt: new Date() }).where(eq(scheduledMeetings.id, id));
+      // Stop any "meeting upcoming" org workflows queued for this meeting.
+      void import("../services/workflow-engine").then((m2) => m2.exitMeetingWorkflows(id));
       if (m.leadId) {
         await db.insert(leadEvents).values({
           id: createId("event"), leadId: m.leadId, type: "meeting_canceled", outcome: "canceled", stepIndex: 0,

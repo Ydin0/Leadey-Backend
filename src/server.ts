@@ -6,6 +6,7 @@ import { startTranscriptionBackfill } from "./services/transcription-backfill";
 import { startInvoiceAutogen } from "./services/invoice-autogen";
 import { startCostSyncScheduler } from "./lib/twilio-cost-sync";
 import { startTrialNotifier } from "./services/trial-notifier";
+import { startMeetingWorkflowSweeper } from "./services/meeting-workflow-sweeper";
 
 const PORT = process.env.PORT || 3001;
 
@@ -18,6 +19,7 @@ const server = app.listen(PORT, () => {
   startInvoiceAutogen();
   startCostSyncScheduler();
   startTrialNotifier();
+  startMeetingWorkflowSweeper();
 });
 
 // Keep sockets alive LONGER than Railway's edge proxy idle timeout (~60s):

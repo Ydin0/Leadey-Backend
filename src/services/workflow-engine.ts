@@ -1,4 +1,4 @@
-import { eq, and, inArray, gte, sql } from "drizzle-orm";
+import { eq, and, inArray, gte, lte, isNull, sql } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/workflows";
@@ -10,6 +10,7 @@ import { smsMessages } from "../db/schema/sms";
 import { phoneLines } from "../db/schema/phone-lines";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { linkedinAccounts } from "../db/schema/linkedin-accounts";
+import { scheduledMeetings } from "../db/schema/scheduled-meetings";
 import { UnipileClient } from "../lib/unipile-client";
 import { canExecute, recordExecution, type LinkedInAction } from "../lib/linkedin-rate-limiter";
 import { sendEmail } from "../lib/email";
@@ -32,13 +33,20 @@ type Enrollment = typeof workflowEnrollments.$inferSelect;
 
 /** Map a Trigger node's selected label to a canonical trigger key. */
 export type TriggerType =
-  | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "meeting_booked" | "manual";
+  | "lead_enters_campaign" | "status_changed" | "tag_added" | "reply_received" | "meeting_booked" | "manual"
+  // Org-level triggers (workflows with funnelId = null):
+  | "meeting_upcoming" | "opportunity_created" | "opportunity_stage_changed" | "opportunity_won" | "opportunity_lost";
 export function triggerTypeFromLabel(label: string): TriggerType {
   switch (label) {
     case "Status changes": return "status_changed";
     case "Tag added": return "tag_added";
     case "Reply received": return "reply_received";
     case "Meeting booked": return "meeting_booked";
+    case "Meeting upcoming": return "meeting_upcoming";
+    case "Opportunity created": return "opportunity_created";
+    case "Opportunity stage changes": return "opportunity_stage_changed";
+    case "Opportunity won": return "opportunity_won";
+    case "Opportunity lost": return "opportunity_lost";
     case "Manually added": return "manual";
     default: return "lead_enters_campaign";
   }
@@ -98,7 +106,7 @@ export function renderTokens(text: string, tokens: Record<string, string>): stri
 /** Build the full token map for a lead: standard tokens + every org custom
  *  field (defaulting to "" so a mapped-but-unset field renders blank, not a
  *  literal {{key}}) overlaid with the lead's actual values. */
-async function leadTokens(lead: Lead, orgId: string): Promise<Record<string, string>> {
+async function leadTokens(lead: Lead, orgId: string, context?: Record<string, unknown>): Promise<Record<string, string>> {
   const [defs, valMap] = await Promise.all([
     listFieldDefinitions(orgId).catch(() => [] as { key: string }[]),
     getCustomFieldsForLeads([lead.id]).catch(() => null),
@@ -106,7 +114,17 @@ async function leadTokens(lead: Lead, orgId: string): Promise<Record<string, str
   const cfs = new Map<string, string>();
   for (const d of defs) cfs.set(d.key, ""); // known fields default to empty
   for (const f of valMap?.get(lead.id) || []) cfs.set(f.key, f.value);
-  return buildTokens(lead, [...cfs].map(([key, value]) => ({ key, value })));
+  const map = buildTokens(lead, [...cfs].map(([key, value]) => ({ key, value })));
+  // Meeting workflow tokens (from enrollment.context stashed by the sweeper).
+  if (context && typeof context === "object") {
+    if (context.meetingTitle) map.meeting_title = String(context.meetingTitle);
+    const start = context.meetingStart ? new Date(String(context.meetingStart)) : null;
+    if (start && !Number.isNaN(start.getTime())) {
+      map.meeting_time = `${start.toLocaleString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} UTC`;
+      map.meeting_date = start.toLocaleDateString("en-US", { timeZone: "UTC", weekday: "long", month: "long", day: "numeric" });
+    }
+  }
+  return map;
 }
 
 const twilio = () => twilioSdk(process.env.TWILIO_ACCOUNT_SID!, process.env.TWILIO_AUTH_TOKEN!);
@@ -161,7 +179,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
   switch (node.type) {
     case "email": {
       if (!lead.email) { await logRun(enr, node, "skipped", { reason: "no email" }); return; }
-      const tokens = await leadTokens(lead, orgId);
+      const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
       const subject = renderTokens(String(d.subject || ""), tokens);
       // Prefer a rich HTML body when the node carries one (template with links/
       // formatting); otherwise convert the plain-text body's newlines.
@@ -214,7 +232,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
     }
     case "sms": {
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
-      const tokens = await leadTokens(lead, orgId);
+      const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
       const body = renderTokens(String(d.message || ""), tokens);
       const orgLines = await db.select().from(phoneLines).where(eq(phoneLines.organizationId, orgId));
       const active = orgLines.filter((l) => l.status === "active");
@@ -277,7 +295,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
     }
     case "whatsapp": {
       if (!lead.phone) { await logRun(enr, node, "skipped", { reason: "no phone" }); return; }
-      const tokens = await leadTokens(lead, orgId);
+      const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
       const body = renderTokens(String(d.message || ""), tokens);
       // Optional approved-template send (required outside the 24h window for
       // cold outreach). Variables are token-rendered against the lead.
@@ -421,7 +439,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         }
         if (!providerId) { await logRun(enr, node, "skipped", { reason: "could not resolve LinkedIn profile" }); return; }
 
-        const tokens = await leadTokens(lead, orgId);
+        const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
         const message = renderTokens(String(d.message || ""), tokens);
 
         if (action === "visit") {
@@ -651,7 +669,7 @@ export async function fireTrigger(
 
 /** Create active enrollments for the given leads into one workflow, honoring its
  *  re-enrollment policy. Returns how many were enrolled. */
-async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[], actorUserId: string | null = null): Promise<number> {
+async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[], actorUserId: string | null = null, context?: Record<string, unknown>): Promise<number> {
   const g = graphOf(wf);
   const start = triggerStart(g);
   if (!start || ids.length === 0) return 0;
@@ -671,8 +689,107 @@ async function enrollInto(wf: typeof workflows.$inferSelect, ids: string[], acto
   await db.insert(workflowEnrollments).values(toEnroll.map((leadId) => ({
     id: createId("wfe"), workflowId: wf.id, organizationId: wf.organizationId, leadId,
     status: "active", currentNodeId: start, nextRunAt: new Date(), triggeredBy: actorUserId,
+    ...(context ? { context } : {}),
   })));
   return toEnroll.length;
+}
+
+/** Org-level counterpart of fireTrigger: enroll leads into every active
+ *  ORG-LEVEL workflow (funnelId = null) whose Trigger matches `type`. Used for
+ *  meeting/opportunity automations that aren't tied to a single campaign. */
+export async function fireOrgTrigger(
+  orgId: string, leadIds: string | string[], type: TriggerType, ctx?: TriggerCtx & { context?: Record<string, unknown> },
+): Promise<void> {
+  try {
+    const ids = Array.isArray(leadIds) ? leadIds : [leadIds];
+    if (ids.length === 0) return;
+    const wfs = await db.select().from(workflows).where(and(
+      eq(workflows.organizationId, orgId), isNull(workflows.funnelId), eq(workflows.status, "active"),
+    ));
+    for (const wf of wfs) {
+      const g = graphOf(wf);
+      const trigger = g.nodes.find((n) => n.type === "trigger");
+      if (!trigger) continue;
+      const tdata = (trigger.data || {}) as Record<string, unknown>;
+      if (triggerTypeFromLabel(String(tdata.label || "")) !== type) continue;
+      await enrollInto(wf, ids, ctx?.actorUserId ?? null, ctx?.context);
+    }
+  } catch (e) {
+    console.error("[workflow-engine] fireOrgTrigger error:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** Sweep for "meeting upcoming" org workflows: enroll a meeting's lead once the
+ *  meeting enters the trigger's minutes-before window. Idempotent via a
+ *  per-(workflow, meeting) dedup on enrollment.context.meetingId, so it's safe
+ *  to run every minute and tolerant of missed ticks / rescheduled meetings.
+ *  Called on an interval from the meeting-workflow sweeper. */
+export async function sweepDueMeetingWorkflows(): Promise<void> {
+  try {
+    const wfs = await db.select().from(workflows).where(and(isNull(workflows.funnelId), eq(workflows.status, "active")));
+    const now = Date.now();
+    for (const wf of wfs) {
+      const g = graphOf(wf);
+      const trigger = g.nodes.find((n) => n.type === "trigger");
+      if (!trigger) continue;
+      const tdata = (trigger.data || {}) as Record<string, unknown>;
+      if (triggerTypeFromLabel(String(tdata.label || "")) !== "meeting_upcoming") continue;
+      const offsetMin = Math.max(1, Math.min(10080, Number(tdata.minutesBefore) || 15));
+      const windowEnd = new Date(now + offsetMin * 60_000);
+
+      // Meetings that will start within the offset window (and haven't started).
+      const due = await db
+        .select({ id: scheduledMeetings.id, leadId: scheduledMeetings.leadId, startTime: scheduledMeetings.startTime, title: scheduledMeetings.title })
+        .from(scheduledMeetings)
+        .where(and(
+          eq(scheduledMeetings.organizationId, wf.organizationId),
+          eq(scheduledMeetings.status, "confirmed"),
+          gte(scheduledMeetings.startTime, new Date(now)),
+          lte(scheduledMeetings.startTime, windowEnd),
+        ));
+      const withLead = due.filter((m) => m.leadId);
+      if (withLead.length === 0) continue;
+
+      // Dedup: skip meetings this workflow already enrolled (context.meetingId).
+      const ids = withLead.map((m) => m.id);
+      const seen = await db
+        .select({ mid: sql<string>`${workflowEnrollments.context}->>'meetingId'` })
+        .from(workflowEnrollments)
+        .where(and(eq(workflowEnrollments.workflowId, wf.id), sql`${workflowEnrollments.context}->>'meetingId' = ANY(${ids})`));
+      const seenIds = new Set(seen.map((s) => s.mid));
+
+      for (const m of withLead) {
+        if (seenIds.has(m.id)) continue;
+        await enrollInto(wf, [m.leadId as string], null, {
+          meetingId: m.id,
+          meetingStart: m.startTime?.toISOString?.() ?? null,
+          meetingTitle: m.title ?? null,
+        });
+      }
+    }
+  } catch (e) {
+    console.error("[workflow-engine] sweepDueMeetingWorkflows error:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** Exit active enrollments created for a meeting that was cancelled/deleted. */
+export async function exitMeetingWorkflows(meetingId: string): Promise<void> {
+  try {
+    await db.update(workflowEnrollments)
+      .set({ status: "exited", nextRunAt: null, waitingFor: null, completedAt: new Date() })
+      .where(and(eq(workflowEnrollments.status, "active"), sql`${workflowEnrollments.context}->>'meetingId' = ${meetingId}`));
+  } catch { /* best effort */ }
+}
+
+/** Resolve a lead's org and fire an ORG-LEVEL trigger (opportunity_* etc.). */
+export async function fireOrgTriggerForLead(leadId: string, type: TriggerType, ctx?: TriggerCtx & { context?: Record<string, unknown> }): Promise<void> {
+  try {
+    const [lead] = await db.select({ funnelId: leads.funnelId }).from(leads).where(eq(leads.id, leadId));
+    if (!lead) return;
+    const [f] = await db.select({ orgId: funnels.organizationId }).from(funnels).where(eq(funnels.id, lead.funnelId));
+    if (!f) return;
+    await fireOrgTrigger(f.orgId, leadId, type, ctx);
+  } catch { /* best effort */ }
 }
 
 /** Manually enroll specific leads into a specific workflow (the "Enroll leads"
@@ -692,6 +809,8 @@ export async function fireTriggerForLead(leadId: string, type: TriggerType, ctx?
     const [f] = await db.select({ orgId: funnels.organizationId }).from(funnels).where(eq(funnels.id, lead.funnelId));
     if (!f) return;
     await fireTrigger(f.orgId, lead.funnelId, leadId, type, ctx);
+    // Also match ORG-LEVEL workflows (e.g. an org-wide "meeting booked" flow).
+    await fireOrgTrigger(f.orgId, leadId, type, ctx);
   } catch { /* best effort */ }
 }
 

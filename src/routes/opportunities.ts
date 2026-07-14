@@ -945,6 +945,7 @@ router.post(
       });
     });
     const [created] = await db.select().from(opportunities).where(eq(opportunities.id, id));
+    fireOppWorkflow(created.sourceLeadId, "opportunity_created", { id: created.id, name: created.name });
     res.status(201).json({ data: serializeOpp(created) });
   }),
 );
@@ -1076,6 +1077,15 @@ async function logStageChangeOnLead(opts: {
   }
 }
 
+/** Fire an ORG-LEVEL opportunity workflow trigger for the opp's source lead.
+ *  Best-effort, fire-and-forget (mirrors the meeting/reply trigger hooks). */
+function fireOppWorkflow(sourceLeadId: string | null, type: string, opp: { id: string; name: string }) {
+  if (!sourceLeadId) return;
+  void import("../services/workflow-engine").then((m) =>
+    m.fireOrgTriggerForLead(sourceLeadId, type as never, { context: { opportunityId: opp.id, oppName: opp.name } }),
+  ).catch(() => {});
+}
+
 router.patch(
   "/opportunities/:id",
   asyncHandler(async (req, res) => {
@@ -1205,6 +1215,7 @@ router.patch(
           userId,
           userName,
         });
+        fireOppWorkflow(updated.sourceLeadId, "opportunity_stage_changed", { id: updated.id, name: updated.name });
       }
     }
 
@@ -1277,6 +1288,7 @@ router.post(
       userId,
       userName,
     });
+    fireOppWorkflow(opp.sourceLeadId, "opportunity_won", { id: opp.id, name: opp.name });
     const [updated] = await db.select().from(opportunities).where(eq(opportunities.id, id));
     res.json({ data: serializeOpp(updated) });
   }),
@@ -1326,6 +1338,7 @@ router.post(
       userId,
       userName,
     });
+    fireOppWorkflow(opp.sourceLeadId, "opportunity_lost", { id: opp.id, name: opp.name });
     const [updated] = await db.select().from(opportunities).where(eq(opportunities.id, id));
     res.json({ data: serializeOpp(updated) });
   }),

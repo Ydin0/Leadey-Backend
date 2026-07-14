@@ -1,0 +1,1 @@
+ALTER TABLE "workflows" ALTER COLUMN "funnel_id" DROP NOT NULL;

@@ -10,7 +10,7 @@ import { desc } from "drizzle-orm";
 import { getOrgId } from "../lib/auth";
 import { requirePerm } from "../lib/permission-service";
 import { ApiError, createId } from "../lib/helpers";
-import { enrollLeadsDirect, triggerStart } from "../services/workflow-engine";
+import { enrollLeadsDirect, triggerStart, triggerTypeFromLabel } from "../services/workflow-engine";
 
 const router = Router();
 
@@ -323,6 +323,184 @@ router.delete(
     const w = await loadWorkflowOr404(orgId, req.params.funnelId, req.params.workflowId);
     await db.delete(workflows).where(eq(workflows.id, w.id));
     res.json({ data: { id: w.id, deleted: true } });
+  }),
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// Standalone (org-level) workflow routes — power the top-level Workflows page.
+// A workflow with funnelId = null is an ORG-LEVEL workflow (meetings / opps).
+// These address workflows by id (org-scoped) rather than through a campaign.
+// ════════════════════════════════════════════════════════════════════════
+
+function triggerTypeOf(w: typeof workflows.$inferSelect): string {
+  const g = (w.graph || { nodes: [] }) as WorkflowGraph;
+  const t = g.nodes?.find((n) => n.type === "trigger");
+  return t ? triggerTypeFromLabel(String((t.data as Record<string, unknown>)?.label || "")) : "lead_enters_campaign";
+}
+
+async function loadWfById(orgId: string, id: string) {
+  const [w] = await db.select().from(workflows).where(and(eq(workflows.id, id), eq(workflows.organizationId, orgId)));
+  if (!w) throw new ApiError(404, "Workflow not found");
+  return w;
+}
+
+// GET /workflows — every workflow in the org (campaign + org-level), each with
+// its campaign name (null = org-level) + trigger type + enrollment stats.
+router.get(
+  "/workflows",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const rows = await db
+      .select({ w: workflows, funnelName: funnels.name })
+      .from(workflows)
+      .leftJoin(funnels, eq(funnels.id, workflows.funnelId))
+      .where(eq(workflows.organizationId, orgId))
+      .orderBy(desc(workflows.updatedAt));
+    const stats = await statsByWorkflow(rows.map((r) => r.w.id));
+    res.json({
+      data: rows.map(({ w, funnelName }) => ({
+        ...serialize(w, stats.get(w.id)),
+        funnelName: funnelName ?? null,
+        triggerType: triggerTypeOf(w),
+      })),
+    });
+  }),
+);
+
+// POST /workflows — create a campaign OR org-level workflow.
+//   body: { name?, funnelId? (null ⇒ org-level), triggerLabel? }
+router.post(
+  "/workflows",
+  requirePerm("campaigns.manageWorkflows"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const body = (req.body || {}) as Record<string, unknown>;
+    const funnelId = typeof body.funnelId === "string" && body.funnelId ? body.funnelId : null;
+    if (funnelId) await assertFunnel(orgId, funnelId);
+    const name = (typeof body.name === "string" && body.name.trim()) || "Untitled workflow";
+    // Seed the trigger node: campaign workflows default to "Lead enters campaign";
+    // org-level default to "Meeting upcoming" (the flagship use case).
+    const triggerLabel = (typeof body.triggerLabel === "string" && body.triggerLabel) || (funnelId ? "Lead enters campaign" : "Meeting upcoming");
+    const graph = seedGraph();
+    (graph.nodes[0].data as Record<string, unknown>).label = triggerLabel;
+    if (triggerLabel === "Meeting upcoming") (graph.nodes[0].data as Record<string, unknown>).minutesBefore = 15;
+    const id = createId("wf");
+    await db.insert(workflows).values({
+      id, organizationId: orgId, funnelId, name, status: "draft", graph, settings: DEFAULT_SETTINGS,
+    });
+    const w = await loadWfById(orgId, id);
+    res.status(201).json({ data: { ...serialize(w), funnelName: null, triggerType: triggerTypeOf(w) } });
+  }),
+);
+
+router.get(
+  "/workflows/:id",
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWfById(orgId, req.params.id);
+    const stats = await statsByWorkflow([w.id]);
+    let funnelName: string | null = null;
+    if (w.funnelId) {
+      const [f] = await db.select({ name: funnels.name }).from(funnels).where(eq(funnels.id, w.funnelId));
+      funnelName = f?.name ?? null;
+    }
+    res.json({ data: { ...serialize(w, stats.get(w.id)), funnelName, triggerType: triggerTypeOf(w) } });
+  }),
+);
+
+router.patch(
+  "/workflows/:id",
+  requirePerm("campaigns.manageWorkflows"),
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const existing = await loadWfById(orgId, req.params.id);
+    const body = (req.body || {}) as Record<string, unknown>;
+    const patch: Partial<typeof workflows.$inferInsert> = { updatedAt: new Date() };
+    if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
+    if (typeof body.status === "string") {
+      if (!VALID_STATUS.has(body.status)) throw new ApiError(400, "Invalid status");
+      patch.status = body.status;
+    }
+    if (body.graph && typeof body.graph === "object") {
+      const g = body.graph as Partial<WorkflowGraph>;
+      patch.graph = { nodes: Array.isArray(g.nodes) ? g.nodes : [], edges: Array.isArray(g.edges) ? g.edges : [] };
+    }
+    if (body.settings && typeof body.settings === "object") {
+      patch.settings = { ...(existing.settings || {}), ...(body.settings as WorkflowSettings) };
+    }
+    await db.update(workflows).set(patch).where(eq(workflows.id, existing.id));
+    const w = await loadWfById(orgId, existing.id);
+    const stats = await statsByWorkflow([w.id]);
+    res.json({ data: { ...serialize(w, stats.get(w.id)), triggerType: triggerTypeOf(w) } });
+  }),
+);
+
+router.delete(
+  "/workflows/:id",
+  requirePerm("campaigns.manageWorkflows"),
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWfById(orgId, req.params.id);
+    await db.delete(workflows).where(eq(workflows.id, w.id));
+    res.json({ data: { id: w.id, deleted: true } });
+  }),
+);
+
+router.post(
+  "/workflows/:id/enroll",
+  requirePerm("campaigns.manageWorkflows"),
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWfById(orgId, req.params.id);
+    const leadIds = Array.isArray(req.body?.leadIds) ? (req.body.leadIds as unknown[]).map(String) : [];
+    if (leadIds.length === 0) throw new ApiError(400, "leadIds required");
+    const enrolled = await enrollLeadsDirect(orgId, w.id, leadIds, getAuth(req as unknown as Request)?.userId ?? null);
+    res.json({ data: { enrolled } });
+  }),
+);
+
+router.get(
+  "/workflows/:id/enrollments",
+  asyncHandler<{ id: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWfById(orgId, req.params.id);
+    const statusFilter = typeof req.query.status === "string" ? req.query.status : "";
+    const conds = [eq(workflowEnrollments.workflowId, w.id)];
+    if (statusFilter) conds.push(eq(workflowEnrollments.status, statusFilter));
+    const rows = await db
+      .select({
+        id: workflowEnrollments.id, status: workflowEnrollments.status,
+        currentNodeId: workflowEnrollments.currentNodeId, nextRunAt: workflowEnrollments.nextRunAt,
+        waitingFor: workflowEnrollments.waitingFor, lastError: workflowEnrollments.lastError,
+        enteredAt: workflowEnrollments.enteredAt, completedAt: workflowEnrollments.completedAt,
+        leadId: workflowEnrollments.leadId, leadName: leads.name, leadCompany: leads.company, leadEmail: leads.email,
+      })
+      .from(workflowEnrollments)
+      .leftJoin(leads, eq(leads.id, workflowEnrollments.leadId))
+      .where(and(...conds))
+      .orderBy(desc(workflowEnrollments.enteredAt))
+      .limit(300);
+    res.json({
+      data: rows.map((r) => ({
+        id: r.id, status: r.status, currentNodeId: r.currentNodeId,
+        nextRunAt: r.nextRunAt ? r.nextRunAt.toISOString() : null, waitingFor: r.waitingFor, lastError: r.lastError,
+        enteredAt: r.enteredAt.toISOString(), completedAt: r.completedAt ? r.completedAt.toISOString() : null,
+        lead: { id: r.leadId, name: r.leadName || "Unknown", company: r.leadCompany || "", email: r.leadEmail || "" },
+      })),
+    });
+  }),
+);
+
+router.get(
+  "/workflows/:id/enrollments/:enrollmentId/runs",
+  asyncHandler<{ id: string; enrollmentId: string }>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const w = await loadWfById(orgId, req.params.id);
+    const [enr] = await db.select({ id: workflowEnrollments.id }).from(workflowEnrollments)
+      .where(and(eq(workflowEnrollments.id, req.params.enrollmentId), eq(workflowEnrollments.workflowId, w.id)));
+    if (!enr) throw new ApiError(404, "Enrollment not found");
+    const runs = await db.select().from(workflowStepRuns).where(eq(workflowStepRuns.enrollmentId, enr.id)).orderBy(workflowStepRuns.ranAt).limit(500);
+    res.json({ data: runs.map((r) => ({ id: r.id, nodeId: r.nodeId, type: r.type, status: r.status, detail: r.detail, ranAt: r.ranAt.toISOString() })) });
   }),
 );
 
