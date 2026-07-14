@@ -585,6 +585,7 @@ router.get(
     const search = req.query.search as string | undefined;
     const disposition = req.query.disposition as string | undefined;
     const leadIdParam = req.query.leadId as string | undefined;
+    const leadIdsParam = (req.query.leadIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
     const minDuration = req.query.minDuration ? parseInt(req.query.minDuration as string) : undefined;
     const maxDuration = req.query.maxDuration ? parseInt(req.query.maxDuration as string) : undefined;
     const startDate = req.query.startDate as string | undefined;
@@ -612,10 +613,16 @@ router.get(
     if (maxDuration !== undefined && !Number.isNaN(maxDuration)) conditions.push(lte(callRecords.duration, maxDuration));
     if (startDate) { const d = new Date(startDate); if (!Number.isNaN(d.getTime())) conditions.push(gte(callRecords.calledAt, d)); }
     if (endDate) { const d = new Date(endDate); if (!Number.isNaN(d.getTime())) conditions.push(lte(callRecords.calledAt, d)); }
+    // Batch: calls for a set of company contacts in ONE query (the lead profile
+    // fetches every contact's calls at once). Indexed on lead_id — cheap and
+    // bounded, unlike the per-lead phone-fallback path below.
+    if (leadIdsParam && leadIdsParam.length) {
+      conditions.push(inArray(callRecords.leadId, leadIdsParam));
+    }
     // Filter to a single campaign lead's calls. Matches the precise leadId we
     // now stamp at dial time, OR (fallback for calls that predate that column)
     // any call to/from the lead's or its sibling contacts' phone numbers.
-    if (leadIdParam) {
+    else if (leadIdParam) {
       const [lead] = await db
         .select({ phone: leads.phone, company: leads.company, funnelId: leads.funnelId })
         .from(leads)
