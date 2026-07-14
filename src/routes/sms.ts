@@ -257,6 +257,9 @@ router.get(
       companyDomain: string | null; masterCompanyId: string | null;
       channel: string; lastBody: string; lastDirection: string; lastAt: string;
       inboundCount: number; total: number; needsReply: boolean;
+      // Which org line this conversation is on (latest message's line) + its owner.
+      lineId: string | null; lineNumber: string | null;
+      assignedTo: string | null; assignedToName: string | null;
     };
     const threads = new Map<string, Thread>();
     for (const r of rows) {
@@ -273,6 +276,7 @@ router.get(
           channel: m.channel || "sms",
           lastBody: m.body, lastDirection: m.direction, lastAt: m.createdAt.toISOString(),
           inboundCount: 0, total: 0, needsReply: m.direction === "inbound",
+          lineId: m.lineId ?? null, lineNumber: null, assignedTo: null, assignedToName: null,
         };
         threads.set(key, t);
       }
@@ -344,6 +348,30 @@ router.get(
       t.company = t.company || lead.company || null;
       t.companyDomain = lead.companyDomain ?? null;
       t.masterCompanyId = lead.masterCompanyId ?? null;
+    }
+
+    // Stamp each thread with the org line it's on (number + assigned rep), so the
+    // inbox can mark which of our numbers the text hit and filter by it.
+    const lineIds = [...new Set(list.map((t) => t.lineId).filter(Boolean) as string[])];
+    if (lineIds.length) {
+      const lineRows = await db
+        .select({ id: phoneLines.id, number: phoneLines.number, assignedTo: phoneLines.assignedTo, assignedToName: phoneLines.assignedToName })
+        .from(phoneLines)
+        .where(and(eq(phoneLines.organizationId, orgId), inArray(phoneLines.id, lineIds)));
+      const byLine = new Map(lineRows.map((l) => [l.id, l]));
+      // Backfill any owner names missing on the line rows from the users table.
+      const ownerIds = [...new Set(lineRows.filter((l) => l.assignedTo && !l.assignedToName).map((l) => l.assignedTo as string))];
+      const ownerNames = ownerIds.length
+        ? new Map((await db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email }).from(users).where(inArray(users.id, ownerIds)))
+            .map((u) => [u.id, [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || null]))
+        : new Map<string, string | null>();
+      for (const t of list) {
+        const line = t.lineId ? byLine.get(t.lineId) : undefined;
+        if (!line) continue;
+        t.lineNumber = line.number;
+        t.assignedTo = line.assignedTo;
+        t.assignedToName = line.assignedToName || (line.assignedTo ? ownerNames.get(line.assignedTo) ?? null : null);
+      }
     }
 
     res.json({ data: list });

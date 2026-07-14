@@ -578,6 +578,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const lineId = req.query.lineId as string | undefined;
+    const lineIds = (req.query.lineIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
     const direction = req.query.direction as string | undefined;
     const userId = req.query.userId as string | undefined;
     const hasRecording = req.query.hasRecording as string | undefined;
@@ -600,7 +601,8 @@ router.get(
     const meId = getAuth(req)?.userId || "";
 
     const conditions = [eq(callRecords.organizationId, orgId)];
-    if (lineId) conditions.push(eq(callRecords.lineId, lineId));
+    if (lineIds && lineIds.length) conditions.push(inArray(callRecords.lineId, lineIds));
+    else if (lineId) conditions.push(eq(callRecords.lineId, lineId));
     if (direction) conditions.push(eq(callRecords.direction, direction));
     if (recScope === "own") conditions.push(eq(callRecords.userId, meId));
     else if (userId) conditions.push(eq(callRecords.userId, userId));

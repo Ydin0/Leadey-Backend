@@ -48,8 +48,9 @@ async function dueTasksForUser(orgId: string, userId: string) {
     ));
 }
 
-/** Inbound calls in the last 7 days that didn't connect → likely need a callback. */
-async function callbacksForOrg(orgId: string) {
+/** Inbound calls in the last 7 days that didn't connect → likely need a callback.
+ *  Optionally scoped to a set of org phone lines (the inbox line filter). */
+async function callbacksForOrg(orgId: string, lineIds?: string[]) {
   const since = new Date(Date.now() - 7 * DAY);
   return db
     .select()
@@ -59,19 +60,25 @@ async function callbacksForOrg(orgId: string) {
       eq(callRecords.direction, "inbound"),
       gte(callRecords.calledAt, since),
       inArray(callRecords.disposition, UNCONNECTED),
+      ...(lineIds && lineIds.length ? [inArray(callRecords.lineId, lineIds)] : []),
     ))
     .orderBy(desc(callRecords.calledAt))
     .limit(100);
 }
 
-/** SMS threads (last 30d) whose most-recent message is inbound → awaiting reply. */
-async function needsReplySms(orgId: string) {
+/** SMS threads (last 30d) whose most-recent message is inbound → awaiting reply.
+ *  Optionally scoped to a set of org phone lines (the inbox line filter). */
+async function needsReplySms(orgId: string, lineIds?: string[]) {
   const since = new Date(Date.now() - 30 * DAY);
   const rows = await db
     .select({ msg: smsMessages, leadName: leads.name, company: leads.company })
     .from(smsMessages)
     .leftJoin(leads, eq(leads.id, smsMessages.leadId))
-    .where(and(eq(smsMessages.organizationId, orgId), gte(smsMessages.createdAt, since)))
+    .where(and(
+      eq(smsMessages.organizationId, orgId),
+      gte(smsMessages.createdAt, since),
+      ...(lineIds && lineIds.length ? [inArray(smsMessages.lineId, lineIds)] : []),
+    ))
     .orderBy(desc(smsMessages.createdAt))
     .limit(1000);
   const seen = new Map<string, { msg: typeof smsMessages.$inferSelect; leadName: string | null; company: string | null }>();
@@ -90,11 +97,14 @@ router.get(
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
     if (!userId) { res.json({ data: { tasks: 0, reminders: 0, calls: 0, messages: 0, emails: 0, potential: 0, total: 0 } }); return; }
+    // Optional line filter — scopes the calls + messages counts (not tasks/emails)
+    // so the Missed Calls / Messages tab badges track the inbox's Numbers filter.
+    const lineIds = (req.query.lineIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
 
     const [tasks, calls, sms, potential, emails] = await Promise.all([
       dueTasksForUser(orgId, userId),
-      callbacksForOrg(orgId),
-      needsReplySms(orgId),
+      callbacksForOrg(orgId, lineIds),
+      needsReplySms(orgId, lineIds),
       potentialContacts(orgId),
       unreadEmailThreadCount(orgId),
     ]);
