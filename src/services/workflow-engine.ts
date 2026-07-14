@@ -52,8 +52,9 @@ export function triggerTypeFromLabel(label: string): TriggerType {
   }
 }
 
-/** Context carried by a trigger so its config can filter (status-to, tag, …). */
-export interface TriggerCtx { status?: string; tag?: string; actorUserId?: string | null }
+/** Context carried by a trigger so its config can filter (status-to, tag,
+ *  pipeline, target stage …). */
+export interface TriggerCtx { status?: string; tag?: string; pipelineId?: string; stageId?: string; actorUserId?: string | null }
 
 function graphOf(w: { graph: WorkflowGraph | null }): WorkflowGraph {
   return w.graph && Array.isArray(w.graph.nodes) ? w.graph : { nodes: [], edges: [] };
@@ -712,6 +713,16 @@ export async function fireOrgTrigger(
       if (!trigger) continue;
       const tdata = (trigger.data || {}) as Record<string, unknown>;
       if (triggerTypeFromLabel(String(tdata.label || "")) !== type) continue;
+      // Opportunity triggers can be scoped to a specific pipeline (all four) and
+      // a specific target stage (stage-changed only). Empty = any.
+      if (type.startsWith("opportunity_")) {
+        const wantPipeline = String(tdata.pipelineId || "").trim();
+        if (wantPipeline && ctx?.pipelineId !== wantPipeline) continue;
+        if (type === "opportunity_stage_changed") {
+          const wantStage = String(tdata.toStageId || "").trim();
+          if (wantStage && ctx?.stageId !== wantStage) continue;
+        }
+      }
       await enrollInto(wf, ids, ctx?.actorUserId ?? null, ctx?.context);
     }
   } catch (e) {
