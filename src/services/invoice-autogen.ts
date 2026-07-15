@@ -190,33 +190,29 @@ export async function resweepTelephonyForOrg(orgId: string): Promise<void> {
   if (cfg.autoTopup) await maybeAutoTopup(orgId);
 }
 
-export async function runInvoiceAutogen(): Promise<void> {
+type OrgCfg = { bufferPct: number; autoTopup: boolean; multiplier: number; roundUp: boolean };
+const DEFAULT_CFG: OrgCfg = { bufferPct: 0, autoTopup: false, multiplier: 2, roundUp: false };
+
+/** Orgs with telephony activity in the current or previous month (or an active
+ *  rented line), plus each one's billing config + the resolved periods. Shared
+ *  by the 6-hourly invoice sweep and the frequent usage draw-down. */
+async function discoverTelephonyTargets(): Promise<{
+  orgIds: string[]; cfg: Map<string, OrgCfg>; currency: string; current: string; previous: string;
+}> {
   const current = monthRange().period;
   const previous = prevPeriod(current);
   const currency = (await getAccountCurrency()).toLowerCase();
 
-  // Telephony: orgs with any activity in either month, or active rented lines.
   const orgIds = new Set<string>();
   const since = monthRange(previous).start;
   const [callOrgs, smsOrgs, lineOrgs] = await Promise.all([
-    db
-      .selectDistinct({ orgId: callRecords.organizationId })
-      .from(callRecords)
-      .where(gte(callRecords.calledAt, since)),
-    db
-      .selectDistinct({ orgId: smsMessages.organizationId })
-      .from(smsMessages)
-      .where(gte(smsMessages.createdAt, since)),
-    db
-      .selectDistinct({ orgId: phoneLines.organizationId })
-      .from(phoneLines)
-      .where(eq(phoneLines.status, "active")),
+    db.selectDistinct({ orgId: callRecords.organizationId }).from(callRecords).where(gte(callRecords.calledAt, since)),
+    db.selectDistinct({ orgId: smsMessages.organizationId }).from(smsMessages).where(gte(smsMessages.createdAt, since)),
+    db.selectDistinct({ orgId: phoneLines.organizationId }).from(phoneLines).where(eq(phoneLines.status, "active")),
   ]);
   for (const r of [...callOrgs, ...smsOrgs, ...lineOrgs]) if (r.orgId) orgIds.add(r.orgId);
 
-  // Per-org billing config (buffer %, markup, round-up, auto top-up).
-  type OrgCfg = { bufferPct: number; autoTopup: boolean; multiplier: number; roundUp: boolean };
-  const orgConfig = new Map<string, OrgCfg>();
+  const cfg = new Map<string, OrgCfg>();
   if (orgIds.size) {
     const rows = await db
       .select({
@@ -229,13 +225,43 @@ export async function runInvoiceAutogen(): Promise<void> {
       .from(organizations)
       .where(inArray(organizations.id, [...orgIds]));
     for (const r of rows)
-      orgConfig.set(r.id, {
+      cfg.set(r.id, {
         bufferPct: r.bufferPct ?? 0,
         autoTopup: r.autoTopup,
         multiplier: (r.markupX100 ?? 200) / 100,
         roundUp: r.roundUp ?? false,
       });
   }
+  return { orgIds: [...orgIds], cfg, currency, current, previous };
+}
+
+/**
+ * LIGHTWEIGHT, HIGH-FREQUENCY wallet draw-down — the "live wallet" path.
+ * Re-derives each active org's billed usage for the current + previous period
+ * and brings the telephony credit ledger in line, WITHOUT touching invoice
+ * documents (that stays on the 6-hourly sweep). Because it's cheap it can run
+ * every few minutes, so the wallet tracks spend near-real-time instead of
+ * lagging up to 6h. Auto top-up is safe to call here — it self-guards with a
+ * cooldown claim.
+ */
+export async function runTelephonyUsageDrawdown(): Promise<void> {
+  const { orgIds, cfg, current, previous } = await discoverTelephonyTargets();
+  for (const orgId of orgIds) {
+    const c = cfg.get(orgId) ?? DEFAULT_CFG;
+    try {
+      for (const period of [previous, current]) {
+        const built = await buildTelephonyInvoice(orgId, period, c.multiplier, c.bufferPct, c.roundUp);
+        await applyUsageDelta(orgId, period, built.usageMinor);
+      }
+      if (c.autoTopup) await maybeAutoTopup(orgId);
+    } catch (err) {
+      console.error(`[TelephonyUsageSync] draw-down failed for org ${orgId}:`, err);
+    }
+  }
+}
+
+export async function runInvoiceAutogen(): Promise<void> {
+  const { orgIds, cfg: orgConfig, currency, current, previous } = await discoverTelephonyTargets();
 
   let processed = 0;
   for (const orgId of orgIds) {

@@ -16,7 +16,7 @@
  * admin-triggered and lazily when the data is stale.
  */
 import twilioSdk from "twilio";
-import { and, eq, gte, lte, isNotNull } from "drizzle-orm";
+import { and, asc, eq, gte, lte, isNull, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
@@ -30,7 +30,7 @@ const client = twilioSdk(
 // Cap a single sync pass so an admin click can't fan out unbounded API calls.
 // The call list is account-wide and includes child (PSTN) legs, so this must
 // comfortably exceed a month's total legs across all orgs.
-const MAX_RESOURCES = 20000;
+const MAX_RESOURCES = 50000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 let cachedCurrency: string | null = null;
@@ -116,6 +116,67 @@ export async function syncCallPrices(since: Date, until: Date): Promise<number> 
       .where(eq(callRecords.twilioCallSid, sid))
       .returning({ id: callRecords.id });
     updated += rows.length;
+  }
+  return updated;
+}
+
+/**
+ * Straggler pass: price calls we own that STILL have no price, targeted
+ * directly by SID regardless of age — so a call that aged out of the rolling
+ * window (or was truncated by the account-wide list cap) still gets its exact
+ * cost instead of sitting on the fallback estimate forever. Fetches each
+ * parent leg + its children by SID (the PSTN cost lives on the child leg).
+ * Bounded per run; oldest-first so the backlog drains steadily.
+ */
+export async function syncUnsyncedCallPrices(maxCalls = 400): Promise<number> {
+  const now = Date.now();
+  // Old enough that Twilio has finalized the price (>10 min), young enough to
+  // still be in Twilio's ~13-month retention (cap at 120 days to be safe).
+  const stragglers = await db
+    .select({ sid: callRecords.twilioCallSid })
+    .from(callRecords)
+    .where(
+      and(
+        isNull(callRecords.twilioPrice),
+        isNotNull(callRecords.twilioCallSid),
+        lte(callRecords.calledAt, new Date(now - 10 * 60 * 1000)),
+        gte(callRecords.calledAt, new Date(now - 120 * DAY_MS)),
+      ),
+    )
+    .orderBy(asc(callRecords.calledAt))
+    .limit(maxCalls);
+
+  let updated = 0;
+  for (const { sid } of stragglers) {
+    if (!sid) continue;
+    try {
+      let price = 0;
+      let unit: string | null = null;
+      let anyFinal = false;
+      const parent = await client.calls(sid).fetch();
+      if (parent.price != null && parent.price !== "") {
+        price += Math.abs(Number(parent.price));
+        unit = parent.priceUnit || unit;
+        anyFinal = true;
+      }
+      const children = await client.calls.list({ parentCallSid: sid, limit: 20 });
+      for (const c of children) {
+        if (c.price != null && c.price !== "") {
+          price += Math.abs(Number(c.price));
+          unit = unit || c.priceUnit || null;
+          anyFinal = true;
+        }
+      }
+      if (!anyFinal || !Number.isFinite(price)) continue; // still settling
+      const rows = await db
+        .update(callRecords)
+        .set({ twilioPrice: price, twilioPriceUnit: unit, twilioPriceSyncedAt: new Date() })
+        .where(eq(callRecords.twilioCallSid, sid))
+        .returning({ id: callRecords.id });
+      updated += rows.length;
+    } catch {
+      // 20404 (call not found / aged out) or transient — skip; retried next run.
+    }
   }
   return updated;
 }
@@ -284,6 +345,12 @@ export function startCostSyncScheduler(): void {
       const r = await runCostSync({ since, until });
       if (!r.skipped && (r.calls > 0 || r.messages > 0)) {
         console.log(`[cost-sync] synced ${r.calls} calls, ${r.messages} messages`);
+      }
+      // Drain any older stragglers that aged out of the rolling window so no
+      // call is left on a fallback estimate indefinitely.
+      if (!r.skipped) {
+        const drained = await syncUnsyncedCallPrices();
+        if (drained > 0) console.log(`[cost-sync] priced ${drained} straggler call(s)`);
       }
     } catch (err) {
       console.error("[cost-sync] scheduled run failed:", err);

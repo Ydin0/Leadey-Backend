@@ -4,6 +4,7 @@ import { startWorkflowEngine } from "./services/workflow-engine";
 import { startCalendarSync } from "./services/calendar-sync";
 import { startTranscriptionBackfill } from "./services/transcription-backfill";
 import { startInvoiceAutogen } from "./services/invoice-autogen";
+import { startTelephonyUsageSync } from "./services/telephony-usage-sync";
 import { startCostSyncScheduler } from "./lib/twilio-cost-sync";
 import { startTrialNotifier } from "./services/trial-notifier";
 import { startMeetingWorkflowSweeper } from "./services/meeting-workflow-sweeper";
@@ -19,6 +20,7 @@ const server = app.listen(PORT, () => {
   startCalendarSync();
   startTranscriptionBackfill();
   startInvoiceAutogen();
+  startTelephonyUsageSync();
   startCostSyncScheduler();
   startTrialNotifier();
   startMeetingWorkflowSweeper();
