@@ -13,6 +13,7 @@ import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { encryptSecret, signState, verifyState } from "../lib/crypto";
 import { syncAccount } from "../services/calendar-sync";
+import { getDispositions, setDisposition, dispositionKey, MEETING_SOURCES, type Disposition } from "../lib/meeting-dispositions";
 
 const backendBase = () => process.env.WEBHOOK_BASE_URL || "http://localhost:3001";
 const appBase = () => process.env.APP_BASE_URL || "http://localhost:3000";
@@ -165,11 +166,15 @@ router.get(
       .where(and(eq(calendarAccounts.organizationId, orgId), eq(calendarAccounts.userId, userId)));
 
     const now = new Date();
+    // Include recent PAST meetings too (last 180 days) so the lead profile can
+    // show history + attendance dispositions, not just upcoming ones.
+    const pastFloor = new Date(now.getTime() - 180 * 86400000);
     type Meeting = {
       id: string; source: "google" | "outlook" | "calendly" | "leadey";
       title: string; startTime: string | null; endTime: string | null;
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
+      disposition: Disposition | null;
     };
     const meetings: Meeting[] = [];
     const leadEmail = (lead.email || "").trim().toLowerCase();
@@ -184,12 +189,13 @@ router.get(
         eq(scheduledMeetings.organizationId, orgId),
         eq(scheduledMeetings.leadId, lead.id),
         eq(scheduledMeetings.status, "confirmed"),
-        gte(scheduledMeetings.startTime, now),
+        gte(scheduledMeetings.startTime, pastFloor),
       ));
 
     // Reconcile against the host calendar so a meeting the host cancelled
     // directly in Google/Outlook disappears here too. Only definitive
-    // cancelled/missing states drop it; API errors keep it (fail-open).
+    // cancelled/missing states drop it; API errors keep it (fail-open). Only
+    // FUTURE meetings are reconciled — a past meeting is history, not cancellable.
     if (booked.length) {
       const acctIds = [...new Set(booked.map((m) => m.hostAccountId).filter((x): x is string => !!x))];
       const accts = acctIds.length
@@ -197,6 +203,7 @@ router.get(
         : [];
       const acctById = new Map(accts.map((a) => [a.id, a]));
       const keep = await Promise.all(booked.map(async (m) => {
+        if (m.startTime && m.startTime < now) return true; // past → keep as history
         const acc = m.hostAccountId ? acctById.get(m.hostAccountId) : null;
         if (!acc) return true;
         try {
@@ -225,7 +232,7 @@ router.get(
         .where(and(
           eq(calendarEvents.organizationId, orgId),
           eq(calendarEvents.status, "confirmed"),
-          gte(calendarEvents.startTime, now),
+          gte(calendarEvents.startTime, pastFloor),
         ));
       const seenEvent = new Set<string>();
       for (const ev of rows) {
@@ -253,6 +260,7 @@ router.get(
           location: ev.location,
           organizerEmail: ev.organizerEmail,
           responseStatus: (matched && responses[matched]) || null,
+          disposition: null,
         });
       }
     }
@@ -265,7 +273,7 @@ router.get(
         eq(calendlyMeetings.organizationId, orgId),
         eq(calendlyMeetings.leadId, lead.id),
         eq(calendlyMeetings.status, "scheduled"),
-        gte(calendlyMeetings.startTime, now),
+        gte(calendlyMeetings.startTime, pastFloor),
       ));
     for (const m of cal) {
       meetings.push({
@@ -279,6 +287,7 @@ router.get(
         organizerEmail: null,
         // The invitee booked this slot themselves, so it's an implicit accept.
         responseStatus: "accepted",
+        disposition: null,
       });
     }
 
@@ -294,8 +303,13 @@ router.get(
         location: m.location,
         organizerEmail: m.hostEmail,
         responseStatus: null,
+        disposition: null,
       });
     }
+
+    // Attach saved attendance dispositions by the stable ${source}:${id} key.
+    const dispMap = await getDispositions(orgId, meetings.map((m) => dispositionKey(m.source, m.id)));
+    for (const m of meetings) m.disposition = dispMap.get(dispositionKey(m.source, m.id)) ?? null;
 
     meetings.sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
     // A Leadey-connected email account can also host — so the section shouldn't
@@ -355,6 +369,7 @@ router.get(
       title: string; startTime: string | null; endTime: string | null;
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
+      disposition: Disposition | null;
       leadId: string | null; funnelId: string | null; leadName: string | null; company: string | null;
       /** Owner rep (whose calendar/Calendly this meeting belongs to). */
       userId: string | null;
@@ -393,6 +408,7 @@ router.get(
         location: null,
         organizerEmail: null,
         responseStatus: "accepted", // invitee booked the slot themselves
+        disposition: null,
         leadId: lead.id,
         funnelId: lead.funnelId,
         leadName: lead.name ?? m.inviteeName ?? null,
@@ -442,6 +458,7 @@ router.get(
         location: m.location,
         organizerEmail: m.hostEmail,
         responseStatus: null,
+        disposition: null,
         leadId: lead.id,
         funnelId: lead.funnelId,
         leadName: lead.name,
@@ -489,6 +506,7 @@ router.get(
         organizerEmail: ev.organizerEmail,
         // The LEAD's RSVP — that's the signal reps care about.
         responseStatus: responses[matchedEmail] || null,
+        disposition: null,
         leadId: lead.id,
         funnelId: lead.funnelId,
         leadName: lead.name,
@@ -497,8 +515,33 @@ router.get(
       });
     }
 
+    // Attach saved attendance dispositions by the stable ${source}:${id} key.
+    const orgDispMap = await getDispositions(orgId, meetings.map((m) => dispositionKey(m.source, m.id)));
+    for (const m of meetings) m.disposition = orgDispMap.get(dispositionKey(m.source, m.id)) ?? null;
+
     meetings.sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
     res.json({ data: { meetings, calendarConnected: !!calAcct, calendlyConnected: !!cdlyAcct } });
+  }),
+);
+
+// ── PUT /api/calendar/meetings/:source/:id/disposition ──────────────
+// Mark a (past) meeting attended / no_show, or clear it (disposition: null).
+router.put(
+  "/calendar/meetings/:source/:id/disposition",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    const source = String(req.params.source);
+    const id = String(req.params.id);
+    if (!MEETING_SOURCES.has(source)) throw new ApiError(400, "Unknown meeting source");
+    if (!id) throw new ApiError(400, "Meeting id is required");
+    const raw = (req.body || {}).disposition;
+    const disposition = raw == null || raw === "" ? null : String(raw);
+    if (disposition !== null && disposition !== "attended" && disposition !== "no_show") {
+      throw new ApiError(400, "disposition must be 'attended', 'no_show', or null");
+    }
+    await setDisposition(orgId, source, id, disposition as Disposition | null, userId);
+    res.json({ data: { source, id, disposition } });
   }),
 );
 
