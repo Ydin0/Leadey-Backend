@@ -137,10 +137,21 @@ router.post(
     // Broaden matching beyond attendee-email overlap so a recording whose
     // invitee emails Fathom/Fireflies didn't capture (a common reason a recent
     // meeting silently fails to match) is still linked: also match the lead's
-    // name in the title, or the recording's time lining up with a known meeting
-    // for this lead. Gather those signals up front.
-    const nameNeedle = (lead.name || "").trim().toLowerCase();
-    const useName = nameNeedle.length >= 4;
+    // name as a WHOLE WORD in the recording title (meeting titles are commonly
+    // "<First> and <Rep>"). Time-proximity is deliberately NOT a match trigger —
+    // it caught unrelated back-to-back meetings (an internal standup 30m before
+    // the real call) and attached them to the lead. Match must be on identity
+    // (email or the lead's own name), never merely "happened around the same time".
+    const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const nameTokens = (lead.name || "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((t) => t.length >= 4) // skip initials / ultra-common short tokens
+      .map((t) => new RegExp(`\\b${escapeRe(t)}\\b`, "i"));
+    const nameHit = (title: string): boolean => !!title && nameTokens.some((re) => re.test(title));
+
+    // Known meeting times are used ONLY to link a matched recording to a calendar
+    // row (meetingId), never to decide the match itself.
     const sinceWindow = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
     const knownMeetings: { id: string; t: number }[] = [];
     const sched = await db
@@ -165,13 +176,11 @@ router.post(
       }
       return best?.id ?? null;
     };
-    const matches = (parts: string[], title: string, heldAt: Date | null): boolean =>
-      parts.some((p) => candidates.has(p)) ||
-      (useName && title.toLowerCase().includes(nameNeedle)) ||
-      nearestMeetingId(heldAt) != null;
+    const matches = (parts: string[], title: string): boolean =>
+      parts.some((p) => candidates.has(p)) || nameHit(title);
 
-    if (candidates.size === 0 && knownMeetings.length === 0) {
-      res.json({ data: { linked: 0, checked: 0, connected: false, reason: "This lead has no email or scheduled meeting to match against." } });
+    if (candidates.size === 0) {
+      res.json({ data: { linked: 0, checked: 0, connected: false, reason: "This lead has no email to match recordings against." } });
       return;
     }
 
@@ -194,7 +203,7 @@ router.post(
         const meetings = await new FathomClient(fathomKey).listRecent(100);
         checked += meetings.length;
         for (const m of meetings) {
-          if (!m.externalId || !matches(m.participants, m.title, m.heldAt)) continue;
+          if (!m.externalId || !matches(m.participants, m.title)) continue;
           const meetingId = nearestMeetingId(m.heldAt);
           await db.insert(meetingTranscripts).values({
             id: createId("mtr"), organizationId: orgId, provider: "fathom", externalId: m.externalId,
@@ -217,7 +226,7 @@ router.post(
         const recents = await client.listRecent(100);
         checked += recents.length;
         for (const r of recents) {
-          if (!r.externalId || !matches(r.participants, r.title, r.heldAt)) continue;
+          if (!r.externalId || !matches(r.participants, r.title)) continue;
           const full = await client.getTranscript(r.externalId).catch(() => r);
           const t = full || r;
           const meetingId = nearestMeetingId(t.heldAt);
