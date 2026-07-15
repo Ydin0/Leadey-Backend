@@ -121,19 +121,27 @@ export async function syncCallPrices(since: Date, until: Date): Promise<number> 
 }
 
 /**
- * Straggler pass: price calls we own that STILL have no price, targeted
+ * Straggler pass: resolve calls we own that STILL have no price, targeted
  * directly by SID regardless of age — so a call that aged out of the rolling
- * window (or was truncated by the account-wide list cap) still gets its exact
- * cost instead of sitting on the fallback estimate forever. Fetches each
- * parent leg + its children by SID (the PSTN cost lives on the child leg).
+ * window (or was truncated by the account-wide list cap) still gets settled
+ * instead of sitting on a fallback estimate forever. Fetches each parent leg +
+ * its children by SID (the PSTN cost lives on the child leg) and:
+ *  - stamps the exact summed price if Twilio has priced any leg;
+ *  - stamps $0 once every leg is TERMINAL and the call is > 48h old (missed /
+ *    no-answer / busy / failed calls Twilio never charges for — otherwise they
+ *    linger unpriced forever and get re-fetched every tick);
+ *  - otherwise leaves it (still settling) for a later run.
  * Bounded per run; oldest-first so the backlog drains steadily.
  */
+const TERMINAL_CALL_STATUS = new Set(["completed", "no-answer", "busy", "failed", "canceled"]);
+const SETTLE_GRACE_MS = 48 * 60 * 60 * 1000;
+
 export async function syncUnsyncedCallPrices(maxCalls = 400): Promise<number> {
   const now = Date.now();
   // Old enough that Twilio has finalized the price (>10 min), young enough to
   // still be in Twilio's ~13-month retention (cap at 120 days to be safe).
   const stragglers = await db
-    .select({ sid: callRecords.twilioCallSid })
+    .select({ sid: callRecords.twilioCallSid, calledAt: callRecords.calledAt })
     .from(callRecords)
     .where(
       and(
@@ -147,27 +155,28 @@ export async function syncUnsyncedCallPrices(maxCalls = 400): Promise<number> {
     .limit(maxCalls);
 
   let updated = 0;
-  for (const { sid } of stragglers) {
+  for (const { sid, calledAt } of stragglers) {
     if (!sid) continue;
     try {
       let price = 0;
       let unit: string | null = null;
-      let anyFinal = false;
+      let anyPrice = false;
+      let allTerminal = true;
       const parent = await client.calls(sid).fetch();
-      if (parent.price != null && parent.price !== "") {
-        price += Math.abs(Number(parent.price));
-        unit = parent.priceUnit || unit;
-        anyFinal = true;
-      }
-      const children = await client.calls.list({ parentCallSid: sid, limit: 20 });
-      for (const c of children) {
-        if (c.price != null && c.price !== "") {
-          price += Math.abs(Number(c.price));
-          unit = unit || c.priceUnit || null;
-          anyFinal = true;
+      const legs = [parent, ...(await client.calls.list({ parentCallSid: sid, limit: 20 }))];
+      for (const leg of legs) {
+        if (leg.price != null && leg.price !== "") {
+          price += Math.abs(Number(leg.price));
+          unit = unit || leg.priceUnit || null;
+          anyPrice = true;
         }
+        if (!TERMINAL_CALL_STATUS.has(String(leg.status))) allTerminal = false;
       }
-      if (!anyFinal || !Number.isFinite(price)) continue; // still settling
+      // Resolve when we have a real price, OR the call is fully terminal and old
+      // enough that a price will never arrive (→ genuinely $0, e.g. no-answer).
+      const ageMs = now - (calledAt?.getTime?.() ?? now);
+      const resolved = anyPrice || (allTerminal && ageMs > SETTLE_GRACE_MS);
+      if (!resolved || !Number.isFinite(price)) continue; // still settling
       const rows = await db
         .update(callRecords)
         .set({ twilioPrice: price, twilioPriceUnit: unit, twilioPriceSyncedAt: new Date() })
