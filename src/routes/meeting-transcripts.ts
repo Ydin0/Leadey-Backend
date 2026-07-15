@@ -263,6 +263,20 @@ router.get(
   }),
 );
 
+// ─── DELETE /meeting-transcripts/:id — remove a recording from the lead ─────
+// Unlinks a wrongly-matched (or unwanted) recording. Hard-deletes the row; a
+// re-pull for the correct lead will re-create it.
+router.delete(
+  "/meeting-transcripts/:id",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    await db
+      .delete(meetingTranscripts)
+      .where(and(eq(meetingTranscripts.id, String(req.params.id)), eq(meetingTranscripts.organizationId, orgId)));
+    res.status(204).end();
+  }),
+);
+
 // ─── GET /meeting-transcripts/:id — full detail ─────────────────────────────
 router.get(
   "/meeting-transcripts/:id",
