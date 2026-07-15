@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { eq, and, inArray, asc, max, count } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
+import multer from "multer";
 import { db } from "../db/index";
 import {
   kbOffers,
@@ -14,8 +15,12 @@ import { getOrgId } from "../lib/auth";
 import { getPerms } from "../lib/permission-service";
 import { hasPerm } from "../lib/permission-catalog";
 import { ApiError, createId } from "../lib/helpers";
+import { saveKbFile, readKbFile, deleteKbFile, kbMimeForKey } from "../lib/kb-file-storage";
 
 const router = Router();
+
+const KB_MAX_FILE_BYTES = 100 * 1024 * 1024; // 100 MB per lesson file
+const kbUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: KB_MAX_FILE_BYTES } });
 
 type AsyncHandler<P = Record<string, string>> = (
   req: Request<P>,
@@ -508,6 +513,59 @@ router.post(
         .where(and(eq(kbProgress.userId, userId), eq(kbProgress.lessonId, id)));
     }
     res.json({ data: { lessonId: id, done } });
+  }),
+);
+
+// ─── POST /knowledge-base/files — upload a lesson file ──────────────────────
+// Ad-hoc upload (like /template-attachments): stores the file and returns its
+// metadata, which the editor adds to the lesson's content.files on save. The
+// returned `url` points at the authed serve route below.
+router.post(
+  "/knowledge-base/files",
+  kbUpload.single("file"),
+  asyncHandler(async (req, res) => {
+    await assertAdmin(req);
+    if (!req.file || !req.file.buffer?.length) throw new ApiError(400, "A file is required");
+    const fileId = createId("kbf");
+    const key = await saveKbFile(fileId, req.file.originalname, req.file.buffer, req.file.mimetype);
+    res.status(201).json({
+      data: {
+        name: req.file.originalname,
+        key,
+        url: `/knowledge-base/files/${encodeURIComponent(key)}`,
+        type: req.file.mimetype || kbMimeForKey(key),
+        size: req.file.size,
+      },
+    });
+  }),
+);
+
+// ─── GET /knowledge-base/files/:key — serve a file inline ───────────────────
+// Authed (mounted under /api). The frontend fetches this with its bearer token
+// as a blob to embed (PDF viewer) or download. Served inline with the right
+// content-type so the browser renders PDFs/images directly.
+router.get(
+  "/knowledge-base/files/:key",
+  asyncHandler(async (req, res) => {
+    getOrgId(req); // require an authenticated org context
+    const key = String(req.params.key);
+    const buffer = await readKbFile(key);
+    if (!buffer) throw new ApiError(404, "File not found");
+    res.setHeader("Content-Type", kbMimeForKey(key));
+    res.setHeader("Content-Disposition", "inline");
+    res.setHeader("Content-Length", String(buffer.length));
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.end(buffer);
+  }),
+);
+
+// ─── DELETE /knowledge-base/files/:key — remove a stored file ───────────────
+router.delete(
+  "/knowledge-base/files/:key",
+  asyncHandler(async (req, res) => {
+    await assertAdmin(req);
+    await deleteKbFile(String(req.params.key));
+    res.status(204).end();
   }),
 );
 

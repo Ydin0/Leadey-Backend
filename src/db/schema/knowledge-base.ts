@@ -14,8 +14,8 @@ export interface KbLessonContent {
   script?: { hook: string; points: string[]; objections: { o: string; a: string }[] };
   // quiz
   questions?: { q: string; options: string[]; answer: number }[];
-  // file
-  files?: { name: string; url: string; type?: string }[];
+  // file — either an uploaded file (served by us; carries `key`) or a linked URL
+  files?: { name: string; url: string; type?: string; key?: string; size?: number }[];
   // faq
   items?: { q: string; a: string }[];
 }
