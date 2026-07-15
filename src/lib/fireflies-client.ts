@@ -44,20 +44,31 @@ export class FirefliesClient {
     return { email: data?.user?.email ?? null, name: data?.user?.name ?? null };
   }
 
-  /** List recent transcripts (lightweight — no sentences) for matching. */
+  /** List recent transcripts (lightweight — no sentences) for matching.
+   *  Fireflies caps `transcripts(limit)` at 50 per query and rejects anything
+   *  larger with "Invalid argument(s) were provided", so page through with
+   *  `skip` to honour a larger requested total. */
   async listRecent(limit = 50): Promise<FirefliesTranscript[]> {
-    const data = await this.gql<{ transcripts: RawTranscript[] }>(
-      `query Recent($limit: Int) {
-        transcripts(limit: $limit) {
-          id title date duration
-          participants
-          summary { overview action_items keywords }
-          video_url audio_url transcript_url
-        }
-      }`,
-      { limit },
-    );
-    return (data?.transcripts || []).map((t) => normalize(t, []));
+    const PAGE = 50;
+    const out: FirefliesTranscript[] = [];
+    for (let skip = 0; skip < limit; skip += PAGE) {
+      const take = Math.min(PAGE, limit - skip);
+      const data = await this.gql<{ transcripts: RawTranscript[] }>(
+        `query Recent($limit: Int, $skip: Int) {
+          transcripts(limit: $limit, skip: $skip) {
+            id title date duration
+            participants
+            summary { overview action_items keywords }
+            video_url audio_url transcript_url
+          }
+        }`,
+        { limit: take, skip },
+      );
+      const batch = data?.transcripts || [];
+      out.push(...batch.map((t) => normalize(t, [])));
+      if (batch.length < take) break; // reached the end
+    }
+    return out;
   }
 
   /** Full transcript with speaker-tagged sentences. */
