@@ -214,6 +214,7 @@ export async function creditAutoTopupOnce(
   description = "Auto top-up",
 ): Promise<void> {
   if (amountMinor <= 0) return;
+  let credited = false;
   await db.transaction(async (tx) => {
     await lockOrg(tx, orgId);
     const [dup] = await tx
@@ -230,7 +231,21 @@ export async function creditAutoTopupOnce(
       description,
       metadata: { currency, paymentIntentId, auto: true },
     });
+    credited = true;
   });
+  // Email the branded receipt from the IN-PROCESS path too — the money moves
+  // here (off-session charge), so receipts must not depend solely on the Stripe
+  // webhook, which can be delayed/undelivered or blocked by a later step in its
+  // handler. sendPaymentReceipt claims the PI id in payment_receipts before
+  // sending, so this never double-sends with the webhook's own receipt call.
+  if (credited) {
+    try {
+      const { sendPaymentReceipt } = await import("./payment-receipt");
+      await sendPaymentReceipt({ orgId, reference: paymentIntentId, amountMinor, currency, description });
+    } catch (err) {
+      console.error("[telephony] receipt after top-up failed:", err instanceof Error ? err.message : err);
+    }
+  }
 }
 
 const AUTOTOPUP_COOLDOWN_MIN = 20; // one attempt per window across instances
