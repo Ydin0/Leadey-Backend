@@ -1,16 +1,19 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { and, eq, desc } from "drizzle-orm";
+import { and, eq, desc, gte } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db";
 import { meetingTranscripts } from "../db/schema/meeting-transcripts";
 import { leads } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
+import { scheduledMeetings } from "../db/schema/scheduled-meetings";
+import { calendarEvents } from "../db/schema/calendar";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { getSetting, upsertSetting, deleteSetting } from "../lib/settings-service";
 import { encryptSecret, decryptSecret } from "../lib/crypto";
 import { FathomClient } from "../lib/fathom-client";
 import { FirefliesClient } from "../lib/fireflies-client";
+import { scoreCall } from "../lib/call-scoring";
 
 const router = Router();
 
@@ -94,14 +97,17 @@ function serialize(t: typeof meetingTranscripts.$inferSelect, detail = false) {
   return {
     id: t.id,
     provider: t.provider,
+    meetingId: t.meetingId,
     title: t.title,
     heldAt: t.heldAt ? t.heldAt.toISOString() : null,
     durationSec: t.durationSec,
     embedUrl: t.embedUrl,
     recordingUrl: t.recordingUrl,
     hasRecording: !!(t.embedUrl || t.recordingUrl),
+    scored: !!t.score,
     summary: detail ? t.summary : undefined,
     transcript: detail ? t.transcript : undefined,
+    score: detail ? t.score : undefined,
     sentenceCount: t.transcript?.length ?? 0,
   };
 }
@@ -117,7 +123,7 @@ router.post(
     const leadId = String(req.params.leadId);
 
     const [lead] = await db
-      .select({ id: leads.id, email: leads.email, extraEmails: leads.extraEmails })
+      .select({ id: leads.id, name: leads.name, email: leads.email, extraEmails: leads.extraEmails })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(and(eq(leads.id, leadId), eq(funnels.organizationId, orgId)));
@@ -127,8 +133,45 @@ router.post(
     const add = (e?: string | null) => { const n = (e || "").trim().toLowerCase(); if (n) candidates.add(n); };
     add(lead.email);
     for (const x of lead.extraEmails || []) add(x.value);
-    if (candidates.size === 0) {
-      res.json({ data: { linked: 0, checked: 0, connected: false, reason: "This lead has no email to match against." } });
+
+    // Broaden matching beyond attendee-email overlap so a recording whose
+    // invitee emails Fathom/Fireflies didn't capture (a common reason a recent
+    // meeting silently fails to match) is still linked: also match the lead's
+    // name in the title, or the recording's time lining up with a known meeting
+    // for this lead. Gather those signals up front.
+    const nameNeedle = (lead.name || "").trim().toLowerCase();
+    const useName = nameNeedle.length >= 4;
+    const sinceWindow = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
+    const knownMeetings: { id: string; t: number }[] = [];
+    const sched = await db
+      .select({ id: scheduledMeetings.id, t: scheduledMeetings.startTime })
+      .from(scheduledMeetings)
+      .where(and(eq(scheduledMeetings.organizationId, orgId), eq(scheduledMeetings.leadId, lead.id)));
+    for (const s of sched) if (s.t) knownMeetings.push({ id: s.id, t: s.t.getTime() });
+    if (candidates.size > 0) {
+      const evs = await db
+        .select({ id: calendarEvents.id, t: calendarEvents.startTime, emails: calendarEvents.attendeeEmails })
+        .from(calendarEvents)
+        .where(and(eq(calendarEvents.organizationId, orgId), gte(calendarEvents.startTime, sinceWindow)));
+      for (const e of evs) if (e.t && (e.emails || []).some((x) => candidates.has(x))) knownMeetings.push({ id: e.id, t: e.t.getTime() });
+    }
+    const NEAR_MS = 90 * 60 * 1000;
+    const nearestMeetingId = (h: Date | null): string | null => {
+      if (!h) return null;
+      let best: { id: string; d: number } | null = null;
+      for (const k of knownMeetings) {
+        const d = Math.abs(k.t - h.getTime());
+        if (d < NEAR_MS && (!best || d < best.d)) best = { id: k.id, d };
+      }
+      return best?.id ?? null;
+    };
+    const matches = (parts: string[], title: string, heldAt: Date | null): boolean =>
+      parts.some((p) => candidates.has(p)) ||
+      (useName && title.toLowerCase().includes(nameNeedle)) ||
+      nearestMeetingId(heldAt) != null;
+
+    if (candidates.size === 0 && knownMeetings.length === 0) {
+      res.json({ data: { linked: 0, checked: 0, connected: false, reason: "This lead has no email or scheduled meeting to match against." } });
       return;
     }
 
@@ -148,18 +191,19 @@ router.post(
     // Fathom — recordings include transcript + summary inline.
     if (fathomKey) {
       try {
-        const meetings = await new FathomClient(fathomKey).listRecent(50);
+        const meetings = await new FathomClient(fathomKey).listRecent(100);
         checked += meetings.length;
         for (const m of meetings) {
-          if (!m.externalId || !m.participants.some((p) => candidates.has(p))) continue;
+          if (!m.externalId || !matches(m.participants, m.title, m.heldAt)) continue;
+          const meetingId = nearestMeetingId(m.heldAt);
           await db.insert(meetingTranscripts).values({
             id: createId("mtr"), organizationId: orgId, provider: "fathom", externalId: m.externalId,
-            leadId: lead.id, fetchedByUserId: userId, title: m.title, heldAt: m.heldAt, durationSec: m.durationSec,
+            leadId: lead.id, meetingId, fetchedByUserId: userId, title: m.title, heldAt: m.heldAt, durationSec: m.durationSec,
             summary: m.summary, transcript: m.transcript, recordingUrl: m.recordingUrl, embedUrl: m.embedUrl,
             createdAt: now, updatedAt: now,
           }).onConflictDoUpdate({
             target: [meetingTranscripts.organizationId, meetingTranscripts.provider, meetingTranscripts.externalId],
-            set: { leadId: lead.id, title: m.title, heldAt: m.heldAt, durationSec: m.durationSec, summary: m.summary, transcript: m.transcript, recordingUrl: m.recordingUrl, embedUrl: m.embedUrl, updatedAt: now },
+            set: { leadId: lead.id, meetingId, title: m.title, heldAt: m.heldAt, durationSec: m.durationSec, summary: m.summary, transcript: m.transcript, recordingUrl: m.recordingUrl, embedUrl: m.embedUrl, updatedAt: now },
           });
           linked++;
         }
@@ -170,20 +214,21 @@ router.post(
     if (firefliesKey) {
       try {
         const client = new FirefliesClient(firefliesKey);
-        const recents = await client.listRecent(50);
+        const recents = await client.listRecent(100);
         checked += recents.length;
         for (const r of recents) {
-          if (!r.externalId || !r.participants.some((p) => candidates.has(p))) continue;
+          if (!r.externalId || !matches(r.participants, r.title, r.heldAt)) continue;
           const full = await client.getTranscript(r.externalId).catch(() => r);
           const t = full || r;
+          const meetingId = nearestMeetingId(t.heldAt);
           await db.insert(meetingTranscripts).values({
             id: createId("mtr"), organizationId: orgId, provider: "fireflies", externalId: t.externalId,
-            leadId: lead.id, fetchedByUserId: userId, title: t.title, heldAt: t.heldAt, durationSec: t.durationSec,
+            leadId: lead.id, meetingId, fetchedByUserId: userId, title: t.title, heldAt: t.heldAt, durationSec: t.durationSec,
             summary: t.summary, transcript: t.transcript, recordingUrl: t.recordingUrl, embedUrl: null,
             createdAt: now, updatedAt: now,
           }).onConflictDoUpdate({
             target: [meetingTranscripts.organizationId, meetingTranscripts.provider, meetingTranscripts.externalId],
-            set: { leadId: lead.id, title: t.title, heldAt: t.heldAt, durationSec: t.durationSec, summary: t.summary, transcript: t.transcript, recordingUrl: t.recordingUrl, updatedAt: now },
+            set: { leadId: lead.id, meetingId, title: t.title, heldAt: t.heldAt, durationSec: t.durationSec, summary: t.summary, transcript: t.transcript, recordingUrl: t.recordingUrl, updatedAt: now },
           });
           linked++;
         }
@@ -220,6 +265,37 @@ router.get(
       .where(and(eq(meetingTranscripts.id, String(req.params.id)), eq(meetingTranscripts.organizationId, orgId)));
     if (!row) throw new ApiError(404, "Transcript not found");
     res.json({ data: serialize(row, true) });
+  }),
+);
+
+// ─── POST /meeting-transcripts/:id/score — AI call scoring (cached) ──────────
+// Scores the call against the closing framework. Cached on the row; pass
+// { force: true } to re-score.
+router.post(
+  "/meeting-transcripts/:id/score",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const force = !!req.body?.force;
+    const [row] = await db
+      .select()
+      .from(meetingTranscripts)
+      .where(and(eq(meetingTranscripts.id, String(req.params.id)), eq(meetingTranscripts.organizationId, orgId)));
+    if (!row) throw new ApiError(404, "Transcript not found");
+
+    if (row.score && !force) {
+      res.json({ data: row.score });
+      return;
+    }
+    if (!row.transcript || row.transcript.length === 0) {
+      throw new ApiError(422, "This meeting has no transcript to score yet.");
+    }
+    const score = await scoreCall(row.transcript, { title: row.title });
+    if (!score) throw new ApiError(422, "Couldn't score this call — the transcript is too short or scoring is unavailable.");
+    await db
+      .update(meetingTranscripts)
+      .set({ score, updatedAt: new Date() })
+      .where(eq(meetingTranscripts.id, row.id));
+    res.json({ data: score });
   }),
 );
 

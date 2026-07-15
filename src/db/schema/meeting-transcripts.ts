@@ -17,6 +17,31 @@ export interface TranscriptSummary {
   keywords: string[];
 }
 
+/** One scored dimension of a call (0..max). */
+export interface CallScoreMetric {
+  key: string;
+  label: string;
+  score: number;
+  max: number;
+  note: string | null;
+}
+
+/** AI scoring of a call against a closing framework. Generated on demand from
+ *  the transcript and cached on the row; re-scoreable. */
+export interface CallScore {
+  /** 0..100 overall. */
+  overall: number;
+  /** Short verdict word, e.g. "Strong" / "Solid" / "Needs work". */
+  verdict: string;
+  metrics: CallScoreMetric[];
+  strengths: string[];
+  improvements: string[];
+  /** Rep-vs-prospect talk share (percent), when derivable from speakers. */
+  talkRatio: { rep: number; prospect: number } | null;
+  model: string;
+  generatedAt: string;
+}
+
 /**
  * A meeting transcript pulled from Fathom or Fireflies and linked to a lead.
  * Keyed by (org, provider, externalId) so re-pulling upserts rather than
@@ -43,6 +68,8 @@ export const meetingTranscripts = pgTable(
     heldAt: timestamp("held_at", { withTimezone: true }),
     durationSec: integer("duration_sec"),
     summary: jsonb("summary").$type<TranscriptSummary | null>(),
+    /** Cached AI call scoring (generated on demand from the transcript). */
+    score: jsonb("score").$type<CallScore | null>(),
     transcript: jsonb("transcript").$type<TranscriptSentence[]>().notNull().default([]),
     /** Direct video/audio URL (Fireflies) — may be embeddable. */
     recordingUrl: text("recording_url"),

@@ -1,0 +1,1 @@
+ALTER TABLE "meeting_transcripts" ADD COLUMN "score" jsonb;

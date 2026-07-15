@@ -729,6 +729,13 @@
       "when": 1784115782177,
       "tag": "0103_meeting_dispositions",
       "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1784141447793,
+      "tag": "0104_meeting_transcript_score",
+      "breakpoints": true
     }
   ]
 }
