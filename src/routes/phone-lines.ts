@@ -900,6 +900,34 @@ router.post(
       }
     }
 
+    // Inbound calls: the softphone usually doesn't know which lead is calling
+    // (a raw number rings in), so match the caller to a lead by phone here —
+    // otherwise an answered inbound call never attaches to the lead profile.
+    // (Outbound already carries leadId from the dial context; missed inbound is
+    // resolved in the inbound-status webhook the same way.)
+    let resolvedLeadId: string | null = leadId || null;
+    let resolvedFunnelId: string | null = funnelId || null;
+    let resolvedContactName: string | null = contactName || null;
+    if (direction === "inbound" && !resolvedLeadId) {
+      const fromKey = safeFrom.replace(/[^0-9]/g, "").slice(-10);
+      if (fromKey.length >= 7) {
+        const [lead] = await db
+          .select({ id: leads.id, funnelId: leads.funnelId, name: leads.name })
+          .from(leads)
+          .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+          .where(and(
+            eq(funnels.organizationId, orgId),
+            sql`right(regexp_replace(${leads.phone}, '[^0-9]', '', 'g'), 10) = ${fromKey}`,
+          ))
+          .limit(1);
+        if (lead) {
+          resolvedLeadId = lead.id;
+          resolvedFunnelId = lead.funnelId;
+          if (!resolvedContactName) resolvedContactName = lead.name;
+        }
+      }
+    }
+
     const id = createId("cr");
     const [record] = await db
       .insert(callRecords)
@@ -911,10 +939,10 @@ router.post(
         direction,
         fromNumber: safeFrom,
         toNumber: safeTo,
-        contactName: contactName || null,
+        contactName: resolvedContactName,
         companyName: companyName || null,
-        leadId: leadId || null,
-        funnelId: funnelId || null,
+        leadId: resolvedLeadId,
+        funnelId: resolvedFunnelId,
         duration: safeDuration,
         disposition: disposition || "completed",
         userId,
