@@ -1,12 +1,41 @@
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { calendarAccounts, calendarEvents } from "../db/schema/calendar";
 import { emailAccounts } from "../db/schema/email-accounts";
+import { scheduledMeetings } from "../db/schema/scheduled-meetings";
+import { leads } from "../db/schema/leads";
+import { funnels } from "../db/schema/funnels";
 import { getAccessToken as getEmailAccessToken, accountCanSchedule } from "../lib/email-providers";
 import { users } from "../db/schema/organizations";
 import { encryptSecret, decryptSecret } from "../lib/crypto";
 import { createId } from "../lib/helpers";
 import { notifyCalendarDisconnected, clearEmailClaim } from "../lib/system-emails";
+
+/** Fire the "meeting booked" workflow trigger when a NEWLY-synced connected-
+ *  calendar event matches a lead by attendee email — so a meeting booked
+ *  directly in Google/Outlook (not just Calendly / Leadey booking) enrolls the
+ *  lead. Skips events already booked via Leadey (they fired on creation). */
+async function fireCalendarMeetingBooked(orgId: string, attendeeEmails: string[], providerEventId: string): Promise<void> {
+  try {
+    const emails = (attendeeEmails || []).map((e) => (e || "").trim().toLowerCase()).filter(Boolean);
+    if (!emails.length) return;
+    // Booked inside Leadey? Its own flow already fired meeting_booked.
+    const [sm] = await db.select({ id: scheduledMeetings.id }).from(scheduledMeetings).where(eq(scheduledMeetings.providerEventId, providerEventId)).limit(1);
+    if (sm) return;
+    const [lead] = await db
+      .select({ id: leads.id })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(funnels.organizationId, orgId), inArray(sql`lower(${leads.email})`, emails)))
+      .limit(1);
+    if (!lead) return;
+    const { fireTriggerForLead, notifyWorkflowEvent } = await import("./workflow-engine");
+    void notifyWorkflowEvent(lead.id, "meeting_booked");
+    void fireTriggerForLead(lead.id, "meeting_booked");
+  } catch (err) {
+    console.error("[calendar-sync] meeting_booked fire failed:", err instanceof Error ? err.message : err);
+  }
+}
 
 type Account = typeof calendarAccounts.$inferSelect;
 
@@ -293,6 +322,12 @@ async function writeEvents(accountId: string, orgId: string, ownerUserId: string
       await db.insert(calendarEvents).values({
         id: createId("cev"), organizationId: orgId, accountId, providerEventId: ev.providerEventId, ...values,
       });
+      // A brand-new upcoming meeting on a connected calendar that involves a
+      // lead counts as "a meeting is booked" — fire the trigger once (on first
+      // sync of this event). Past events (history backfill) don't count.
+      if (ev.status === "confirmed" && ev.startTime && ev.startTime >= now) {
+        void fireCalendarMeetingBooked(orgId, ev.attendeeEmails, ev.providerEventId);
+      }
     }
   }
   // Prune events the provider no longer returns — but ONLY within the fetch
