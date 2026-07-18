@@ -1,9 +1,10 @@
-import { eq, and, inArray, gte, lte, lt, isNull, sql } from "drizzle-orm";
+import { eq, and, inArray, gte, lte, lt, desc, isNull, sql } from "drizzle-orm";
 import twilioSdk from "twilio";
 import { db } from "../db";
 import { workflows, workflowEnrollments, workflowStepRuns } from "../db/schema/workflows";
 import type { WorkflowGraph, WorkflowNode, WorkflowSettings } from "../db/schema/workflows";
 import { leads, leadEvents } from "../db/schema/leads";
+import { opportunities, pipelines, pipelineStages, opportunityEvents } from "../db/schema/opportunities";
 import { funnels, funnelMembers } from "../db/schema/funnels";
 import { emailAccounts, emailMessages, type EmailAttachmentRef } from "../db/schema/email-accounts";
 import { smsMessages } from "../db/schema/sms";
@@ -386,6 +387,60 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
       const owner = members[idx].userId;
       await db.update(leads).set({ ownerId: owner, updatedAt: new Date() }).where(eq(leads.id, lead.id));
       await logRun(enr, node, "done", { owner });
+      return;
+    }
+    case "opportunity": {
+      // Move the lead's opportunity to a target stage (and pipeline). Mirrors
+      // the manual stage-change: terminal semantics for closedAt, opportunity
+      // timeline events, and re-firing opportunity_stage_changed so downstream
+      // automations can chain (e.g. enter stage → wait 30d → move stage).
+      const targetStageId = String(d.stageId || "").trim();
+      if (!targetStageId) { await logRun(enr, node, "skipped", { reason: "no stage configured" }); return; }
+
+      // Resolve the lead's opportunity: direct link first, else by source lead.
+      let opp: typeof opportunities.$inferSelect | undefined;
+      if (lead.opportunityId) {
+        [opp] = await db.select().from(opportunities).where(and(eq(opportunities.id, lead.opportunityId), eq(opportunities.organizationId, orgId)));
+      }
+      if (!opp) {
+        [opp] = await db.select().from(opportunities)
+          .where(and(eq(opportunities.sourceLeadId, lead.id), eq(opportunities.organizationId, orgId)))
+          .orderBy(desc(opportunities.createdAt)).limit(1);
+      }
+      if (!opp) { await logRun(enr, node, "skipped", { reason: "lead has no opportunity" }); return; }
+
+      // Target stage must belong to this org; its own pipeline is authoritative
+      // (so a cross-pipeline move lands the deal on a valid stage).
+      const [stage] = await db
+        .select({ id: pipelineStages.id, type: pipelineStages.type, pipelineId: pipelineStages.pipelineId, label: pipelineStages.label })
+        .from(pipelineStages)
+        .innerJoin(pipelines, eq(pipelines.id, pipelineStages.pipelineId))
+        .where(and(eq(pipelineStages.id, targetStageId), eq(pipelines.organizationId, orgId)));
+      if (!stage) { await logRun(enr, node, "skipped", { reason: "target stage not found" }); return; }
+      if (opp.stageId === targetStageId) { await logRun(enr, node, "done", { reason: "already in target stage" }); return; }
+
+      const isTerminal = stage.type !== "open";
+      const fromStageId = opp.stageId;
+      const fromPipelineId = opp.pipelineId;
+      await db.update(opportunities).set({
+        stageId: targetStageId,
+        pipelineId: stage.pipelineId,
+        closedAt: isTerminal ? sql`coalesce(${opportunities.closedAt}, now())` : null,
+        ...(isTerminal ? {} : { lostReason: null }),
+        updatedAt: new Date(),
+      }).where(eq(opportunities.id, opp.id));
+
+      const evs: { type: string; meta: Record<string, unknown> }[] = [];
+      if (fromPipelineId !== stage.pipelineId) evs.push({ type: "pipeline_changed", meta: { from: fromPipelineId, to: stage.pipelineId } });
+      evs.push({ type: "stage_changed", meta: { from: fromStageId, to: targetStageId } });
+      if (isTerminal && !opp.closedAt) evs.push({ type: stage.type, meta: { stageId: targetStageId } });
+      await db.insert(opportunityEvents).values(evs.map((e) => ({
+        id: createId("oe"), opportunityId: opp!.id, organizationId: orgId, type: e.type, meta: e.meta, userId: null, userName: "Workflow",
+      })));
+
+      // Let opportunity-stage workflows react to this move.
+      void fireOrgTrigger(orgId, lead.id, "opportunity_stage_changed", { pipelineId: stage.pipelineId, stageId: targetStageId });
+      await logRun(enr, node, "done", { stageId: targetStageId, pipelineId: stage.pipelineId, label: stage.label });
       return;
     }
     case "webhook": {
