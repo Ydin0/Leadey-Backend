@@ -31,6 +31,17 @@ export interface CreatedMeeting {
 
 /** Create a real calendar event on the host mailbox and email invites to every
  *  attendee (Google Meet for Gmail hosts, Teams for Outlook hosts). */
+/** True when the provider rejected the call for lack of calendar-write scope —
+ *  i.e. the mailbox was connected before calendar access was granted and needs
+ *  reconnecting. */
+function isScopeError(status: number, data: unknown): boolean {
+  if (status !== 403) return false;
+  const blob = JSON.stringify(data ?? "").toLowerCase();
+  return /insufficient (authentication )?scopes|scope_insufficient|insufficientpermissions|does not have permission|access is denied/.test(blob);
+}
+const RECONNECT_MSG =
+  "This mailbox isn't authorised to create calendar events yet. Reconnect it in Settings → Email Accounts and approve calendar access, then try again.";
+
 export async function createMeetingEvent(input: CreateMeetingInput): Promise<CreatedMeeting> {
   const token = await getAccessToken(input.account);
   if (input.account.provider === "gmail") return createGoogleEvent(token, input);
@@ -55,7 +66,10 @@ async function createGoogleEvent(token: string, input: CreateMeetingInput): Prom
     { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) },
   );
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Google event create failed: ${data?.error?.message || res.status}`);
+  if (!res.ok) {
+    if (isScopeError(res.status, data)) throw new Error(RECONNECT_MSG);
+    throw new Error(`Google event create failed: ${data?.error?.message || res.status}`);
+  }
   const joinUrl: string | null =
     data.hangoutLink ||
     (Array.isArray(data.conferenceData?.entryPoints)
@@ -83,7 +97,10 @@ async function createOutlookEvent(token: string, input: CreateMeetingInput): Pro
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Microsoft event create failed: ${data?.error?.message || res.status}`);
+  if (!res.ok) {
+    if (isScopeError(res.status, data)) throw new Error(RECONNECT_MSG);
+    throw new Error(`Microsoft event create failed: ${data?.error?.message || res.status}`);
+  }
   return { provider: "microsoft", providerEventId: String(data.id), joinUrl: data.onlineMeeting?.joinUrl || null };
 }
 
