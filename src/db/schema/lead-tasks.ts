@@ -1,4 +1,4 @@
-import { pgTable, text, boolean, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, boolean, timestamp, index } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 import { funnels } from "./funnels";
 import { leads } from "./leads";
@@ -26,4 +26,9 @@ export const leadTasks = pgTable("lead_tasks", {
   createdBy: text("created_by"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Lead View loads a lead's tasks by lead id.
+  index("lead_tasks_lead_id_idx").on(t.leadId),
+  // Inbox "due tasks" + dashboard "my tasks": the signed-in rep's open tasks.
+  index("lead_tasks_org_assignee_done_idx").on(t.organizationId, t.assigneeId, t.done),
+]);

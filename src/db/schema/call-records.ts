@@ -95,4 +95,16 @@ export const callRecords = pgTable("call_records", {
     t.organizationId,
     sql`regexp_replace(${t.fromNumber}, '[^0-9]', '', 'g')`,
   ),
+  // Last-10-digit matching (lead-profile call list, inbound-call → lead
+  // resolution, dialer recency): queries wrap the digits in right(…,10), which
+  // the plain-digits indexes above DON'T match — so index that exact shape too,
+  // otherwise every such lookup full-scans call_records.
+  index("call_records_org_to_last10_idx").on(
+    t.organizationId,
+    sql`right(regexp_replace(${t.toNumber}, '[^0-9]', '', 'g'), 10)`,
+  ),
+  index("call_records_org_from_last10_idx").on(
+    t.organizationId,
+    sql`right(regexp_replace(${t.fromNumber}, '[^0-9]', '', 'g'), 10)`,
+  ),
 ]);

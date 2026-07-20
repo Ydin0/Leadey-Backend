@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, boolean, jsonb, timestamp, real } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, boolean, jsonb, timestamp, real, index } from "drizzle-orm/pg-core";
 
 // ─── Scraper Assignments ─────────────────────────────────────────────
 // User-configured scraper instance, org-scoped
@@ -122,4 +122,10 @@ export const scraperSignals = pgTable("scraper_signals", {
   status: text("status").notNull().default("new"),
   rawData: jsonb("raw_data").$type<Record<string, unknown>>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // Signals are listed per org (companies feed, scrapers tab) and per
+  // assignment (a scraper's signal detail) — neither had an index, so every
+  // read full-scanned the table.
+  index("scraper_signals_org_idx").on(t.organizationId),
+  index("scraper_signals_assignment_idx").on(t.assignmentId),
+]);
