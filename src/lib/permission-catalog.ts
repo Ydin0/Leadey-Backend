@@ -72,8 +72,11 @@ export const PERMISSION_CATALOG = {
     scopes: {},
     // manageOrgConfig = lead statuses, campaign tags, custom fields, call
     // outcomes, task categories, departments. manageTeam = invite/remove,
-    // roles, per-user permissions, KPI config.
-    booleans: ["manageBilling", "manageTeam", "managePhoneLines", "manageIntegrations", "manageOrgConfig", "manageApiKeys"],
+    // roles, per-user permissions, KPI config. connectOwnEmail = see the Email
+    // Accounts settings tab to connect one's OWN mailbox + calendar (a baseline
+    // per-user capability, ON by default for everyone — distinct from the
+    // org-wide manageIntegrations).
+    booleans: ["connectOwnEmail", "manageBilling", "manageTeam", "managePhoneLines", "manageIntegrations", "manageOrgConfig", "manageApiKeys"],
   },
 } as const satisfies Record<string, ModuleSpec>;
 
@@ -195,6 +198,8 @@ export const BUILTIN_ROLES: Record<BuiltinRole, ResolvedPermissions> = {
 
   viewer: preset(NO_PERMISSIONS, {
     // Read-only across the board; can still open the modules they can see.
+    // Everyone can connect their own mailbox/calendar so they can be booked in.
+    "settings.connectOwnEmail": true,
     "campaigns.access": "assigned",
     "leads.view": "campaigns",
     "opportunities.view": "assigned",
