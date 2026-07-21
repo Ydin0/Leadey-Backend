@@ -59,7 +59,10 @@ authRouter.post(
       process.env.TWILIO_ACCOUNT_SID!,
       process.env.TWILIO_API_KEY!,
       process.env.TWILIO_API_SECRET!,
-      { identity: voiceIdentity(auth.userId, auth.orgId), ttl: 3600 },
+      // 24h (Twilio's max) — the browser SDK proactively refreshes on
+      // tokenWillExpire, so a long TTL just means far fewer expiry cycles (and
+      // survives a backgrounded/throttled tab that misses a refresh tick).
+      { identity: voiceIdentity(auth.userId, auth.orgId), ttl: 86400 },
     );
 
     const voiceGrant = new VoiceGrant({
