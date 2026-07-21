@@ -589,6 +589,9 @@ router.post(
         /** Skip leads in a terminal status (Not Interested, DNC, Qualified…). */
         excludeClosed?: boolean;
         respectTimezone?: boolean;
+        /** Dial EVERY phone-having lead, ignoring the campaign's saved Smart
+         *  View filter (e.g. a stale "status = new" that now matches nobody). */
+        ignoreCampaignFilter?: boolean;
       };
     };
     if (!funnelStepId && !funnelId) {
@@ -644,10 +647,9 @@ router.post(
     // queues exactly the same set the rep is looking at (or every phone-having
     // lead when no filter is active). Derived fields (callCount, custom:*, …)
     // are handled by the shared server-side evaluator.
-    const filterWhere = buildLeadFilterWhere(
-      (funnel.config as Record<string, unknown> | null)?.leadFilters,
-      { orgId },
-    );
+    const filterWhere = filters?.ignoreCampaignFilter
+      ? null
+      : buildLeadFilterWhere((funnel.config as Record<string, unknown> | null)?.leadFilters, { orgId });
     const candidateLeads = await db
       .select()
       .from(leads)
@@ -852,7 +854,7 @@ router.post(
       if (filterWhere && candidateLeads.length === 0) {
         throw new ApiError(
           400,
-          "No leads match this campaign's active Smart View filter. Clear or change the filter on the campaign's leads list, then start the dialer again.",
+          "No leads match this campaign's saved filter (e.g. “status is New”, which excludes already-worked leads). Turn on “Dial every lead” to ignore it, or change the filter on the campaign's leads list.",
         );
       }
       throw new ApiError(
