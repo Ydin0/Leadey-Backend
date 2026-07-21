@@ -819,7 +819,7 @@ export async function sweepDueMeetingWorkflows(): Promise<void> {
       if (!trigger) continue;
       const tdata = (trigger.data || {}) as Record<string, unknown>;
       if (triggerTypeFromLabel(String(tdata.label || "")) !== "meeting_upcoming") continue;
-      const offsetMin = Math.max(1, Math.min(10080, Number(tdata.minutesBefore) || 15));
+      const offsetMin = Math.max(1, Math.min(43200, Number(tdata.minutesBefore) || 15)); // up to 30 days
       const windowEnd = new Date(now + offsetMin * 60_000);
 
       // Meetings that will start within the offset window (and haven't started).
