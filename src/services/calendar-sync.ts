@@ -295,52 +295,62 @@ async function fetchMicrosoftEvents(token: string): Promise<NormalizedEvent[]> {
  *  email account), pruning within-window events the provider no longer returns. */
 async function writeEvents(accountId: string, orgId: string, ownerUserId: string, provider: string, events: NormalizedEvent[]): Promise<void> {
   const now = new Date();
-  const seen = new Set<string>();
-  for (const ev of events) {
-    seen.add(ev.providerEventId);
-    const existing = await db
-      .select({ id: calendarEvents.id })
-      .from(calendarEvents)
-      .where(and(eq(calendarEvents.accountId, accountId), eq(calendarEvents.providerEventId, ev.providerEventId)));
-    const values = {
-      userId: ownerUserId,
-      provider,
-      title: ev.title,
-      startTime: ev.startTime,
-      endTime: ev.endTime,
-      joinUrl: ev.joinUrl,
-      location: ev.location,
-      organizerEmail: ev.organizerEmail,
-      attendeeEmails: ev.attendeeEmails,
-      attendeeResponses: ev.attendeeResponses,
-      status: ev.status,
-      updatedAt: now,
-    };
-    if (existing[0]) {
-      await db.update(calendarEvents).set(values).where(eq(calendarEvents.id, existing[0].id));
-    } else {
-      await db.insert(calendarEvents).values({
-        id: createId("cev"), organizationId: orgId, accountId, providerEventId: ev.providerEventId, ...values,
-      });
-      // A brand-new upcoming meeting on a connected calendar that involves a
-      // lead counts as "a meeting is booked" — fire the trigger once (on first
-      // sync of this event). Past events (history backfill) don't count.
-      if (ev.status === "confirmed" && ev.startTime && ev.startTime >= now) {
+  const seen = new Set(events.map((e) => e.providerEventId));
+
+  if (events.length) {
+    // Dedupe by providerEventId — a single ON CONFLICT batch can't touch the
+    // same conflict key twice.
+    const byId = new Map<string, NormalizedEvent>();
+    for (const ev of events) byId.set(ev.providerEventId, ev);
+    const rows = [...byId.values()].map((ev) => ({
+      id: createId("cev"), organizationId: orgId, accountId, providerEventId: ev.providerEventId,
+      userId: ownerUserId, provider, title: ev.title, startTime: ev.startTime, endTime: ev.endTime,
+      joinUrl: ev.joinUrl, location: ev.location, organizerEmail: ev.organizerEmail,
+      attendeeEmails: ev.attendeeEmails, attendeeResponses: ev.attendeeResponses, status: ev.status, updatedAt: now,
+    }));
+
+    // ONE bulk upsert per chunk instead of a SELECT + UPDATE/INSERT per event
+    // (this loop previously did 15M+ round-trips). `xmax = 0` on the RETURNING
+    // row flags a genuine INSERT (vs an ON CONFLICT update) so we still fire
+    // meeting_booked only for brand-new events.
+    const CHUNK = 200;
+    const newlyInserted = new Set<string>();
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const ret = await db
+        .insert(calendarEvents)
+        .values(rows.slice(i, i + CHUNK))
+        .onConflictDoUpdate({
+          target: [calendarEvents.accountId, calendarEvents.providerEventId],
+          set: {
+            userId: sql`excluded.user_id`, provider: sql`excluded.provider`, title: sql`excluded.title`,
+            startTime: sql`excluded.start_time`, endTime: sql`excluded.end_time`, joinUrl: sql`excluded.join_url`,
+            location: sql`excluded.location`, organizerEmail: sql`excluded.organizer_email`,
+            attendeeEmails: sql`excluded.attendee_emails`, attendeeResponses: sql`excluded.attendee_responses`,
+            status: sql`excluded.status`, updatedAt: now,
+          },
+        })
+        .returning({ providerEventId: calendarEvents.providerEventId, inserted: sql<boolean>`(xmax = 0)` });
+      for (const r of ret) if (r.inserted) newlyInserted.add(r.providerEventId);
+    }
+    // A brand-new upcoming, lead-involving event = "a meeting is booked".
+    for (const ev of byId.values()) {
+      if (newlyInserted.has(ev.providerEventId) && ev.status === "confirmed" && ev.startTime && ev.startTime >= now) {
         void fireCalendarMeetingBooked(orgId, ev.attendeeEmails, ev.providerEventId);
       }
     }
   }
+
   // Prune events the provider no longer returns — but ONLY within the fetch
-  // window (older events are history and were never fetched this pass).
+  // window (older events are history) — in one bulk delete, not row-by-row.
   const pruneFrom = lookbackStart();
   const stored = await db
     .select({ id: calendarEvents.id, providerEventId: calendarEvents.providerEventId, startTime: calendarEvents.startTime })
     .from(calendarEvents)
     .where(eq(calendarEvents.accountId, accountId));
-  for (const row of stored) {
-    if (row.startTime && row.startTime < pruneFrom) continue;
-    if (!seen.has(row.providerEventId)) await db.delete(calendarEvents).where(eq(calendarEvents.id, row.id));
-  }
+  const toDelete = stored
+    .filter((r) => (!r.startTime || r.startTime >= pruneFrom) && !seen.has(r.providerEventId))
+    .map((r) => r.id);
+  if (toDelete.length) await db.delete(calendarEvents).where(inArray(calendarEvents.id, toDelete));
 }
 
 export async function syncAccount(account: Account): Promise<void> {

@@ -35,6 +35,9 @@ export const smsMessages = pgTable(
   (t) => [
     index("sms_messages_lead_idx").on(t.leadId),
     index("sms_messages_org_idx").on(t.organizationId),
+    // Twilio cost sync updates prices by twilio_sid — index it so those writes
+    // don't full-scan (same fix as call_records.twilio_call_sid).
+    index("sms_messages_twilio_sid_idx").on(t.twilioSid),
     // Keyset-paginated timeline reads: (lead_id, created_at DESC).
     index("sms_messages_lead_created_idx").on(t.leadId, t.createdAt),
     // Cost reporting: org-scoped period scans (daily buckets, monthly

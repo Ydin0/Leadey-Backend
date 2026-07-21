@@ -1,0 +1,2 @@
+CREATE INDEX IF NOT EXISTS "call_records_twilio_call_sid_idx" ON "call_records" USING btree ("twilio_call_sid");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "sms_messages_twilio_sid_idx" ON "sms_messages" USING btree ("twilio_sid");

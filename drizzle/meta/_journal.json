@@ -743,6 +743,13 @@
       "when": 1784556659466,
       "tag": "0105_perf_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1784624961330,
+      "tag": "0106_sid_indexes",
+      "breakpoints": true
     }
   ]
 }

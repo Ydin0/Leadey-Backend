@@ -82,6 +82,9 @@ export const callRecords = pgTable("call_records", {
   index("call_records_org_called_at").on(t.organizationId, t.calledAt),
   // Per-lead recency lookups.
   index("call_records_lead_id").on(t.leadId),
+  // The Twilio cost sync writes prices with WHERE twilio_call_sid = ? — without
+  // this, every one of those (very frequent) updates full-scanned the table.
+  index("call_records_twilio_call_sid_idx").on(t.twilioCallSid),
   // Inbox: missed calls filtered by the org line(s) they came in on.
   index("call_records_line_called_at").on(t.lineId, t.calledAt),
   // Phone-number matching (lead activity counts, universal company timeline):
