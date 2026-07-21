@@ -92,3 +92,5 @@ export { emailSends } from "./email-sends";
 export { dismissedPotentialContacts } from "./dismissed-potential-contacts";
 
 export { emailSignatures } from "./email-signatures";
+
+export { inboxReadState } from "./inbox-read-state";

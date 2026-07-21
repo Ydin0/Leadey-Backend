@@ -750,6 +750,13 @@
       "when": 1784624961330,
       "tag": "0106_sid_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1784648073876,
+      "tag": "0107_inbox_read_state",
+      "breakpoints": true
     }
   ]
 }

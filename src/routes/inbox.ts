@@ -1,10 +1,11 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getAuth } from "@clerk/express";
-import { eq, and, gte, lt, or, isNull, inArray, desc, sql } from "drizzle-orm";
+import { eq, and, gte, gt, lt, or, isNull, inArray, desc, sql } from "drizzle-orm";
 import { db } from "../db";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
+import { inboxReadState } from "../db/schema/inbox-read-state";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { masterContacts } from "../db/schema/master";
@@ -49,8 +50,9 @@ async function dueTasksForUser(orgId: string, userId: string) {
 }
 
 /** Inbound calls in the last 7 days that didn't connect → likely need a callback.
- *  Optionally scoped to a set of org phone lines (the inbox line filter). */
-async function callbacksForOrg(orgId: string, lineIds?: string[]) {
+ *  Optionally scoped to a set of org phone lines (the inbox line filter), and to
+ *  calls newer than a "seen" watermark (so the badge only counts unseen ones). */
+async function callbacksForOrg(orgId: string, lineIds?: string[], seenAt?: Date | null) {
   const since = new Date(Date.now() - 7 * DAY);
   return db
     .select()
@@ -61,6 +63,7 @@ async function callbacksForOrg(orgId: string, lineIds?: string[]) {
       gte(callRecords.calledAt, since),
       inArray(callRecords.disposition, UNCONNECTED),
       ...(lineIds && lineIds.length ? [inArray(callRecords.lineId, lineIds)] : []),
+      ...(seenAt ? [gt(callRecords.calledAt, seenAt)] : []),
     ))
     .orderBy(desc(callRecords.calledAt))
     .limit(100);
@@ -101,9 +104,16 @@ router.get(
     // so the Missed Calls / Messages tab badges track the inbox's Numbers filter.
     const lineIds = (req.query.lineIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
 
+    // The rep's "seen" watermark for the notification-style tabs (missed calls),
+    // so the badge counts only calls that arrived since they last viewed them.
+    const [readState] = await db
+      .select({ callsSeenAt: inboxReadState.callsSeenAt })
+      .from(inboxReadState)
+      .where(eq(inboxReadState.userId, userId));
+
     const [tasks, calls, sms, potential, emails] = await Promise.all([
       dueTasksForUser(orgId, userId),
-      callbacksForOrg(orgId, lineIds),
+      callbacksForOrg(orgId, lineIds, readState?.callsSeenAt ?? null),
       needsReplySms(orgId, lineIds),
       potentialContacts(orgId),
       unreadEmailThreadCount(orgId),
@@ -119,6 +129,29 @@ router.get(
       total: tasks.length + calls.length + sms.length + potential.length + emails,
     };
     res.json({ data: counts });
+  }),
+);
+
+// ─── POST /inbox/seen ───────────────────────────────────────────────
+// Acknowledge a notification-style tab: mark everything currently there as seen
+// by advancing the rep's watermark to now, so the tab badge clears (new activity
+// afterwards re-increments it). Body: { tab: "calls" | "messages" }.
+router.post(
+  "/inbox/seen",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const userId = getAuth(req)?.userId || null;
+    if (!userId) { res.json({ data: { ok: true } }); return; }
+    const tab = String((req.body as { tab?: string })?.tab || "");
+    if (tab !== "calls" && tab !== "messages") throw new ApiError(400, "tab must be 'calls' or 'messages'");
+
+    const now = new Date();
+    const patch = tab === "calls" ? { callsSeenAt: now } : { messagesSeenAt: now };
+    await db
+      .insert(inboxReadState)
+      .values({ userId, organizationId: orgId, ...patch, updatedAt: now })
+      .onConflictDoUpdate({ target: inboxReadState.userId, set: { ...patch, updatedAt: now } });
+    res.json({ data: { ok: true } });
   }),
 );
 
