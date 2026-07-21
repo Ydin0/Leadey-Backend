@@ -14,6 +14,7 @@ import { getBusyIntervals, computeSlots, localDateInTz } from "../lib/availabili
 import { getRoundRobinPool } from "./booking-pages";
 import { getPageHosts, offeringHosts, fairPick, resolveHostAccounts, busyForHost } from "../lib/booking-service";
 import { createMeetingEvent, cancelMeetingEvent, type MeetingAttendee } from "../lib/meeting-scheduler";
+import { sendGuestMeetingInvite } from "../lib/meeting-invite";
 
 type Account = typeof emailAccounts.$inferSelect;
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
@@ -167,6 +168,24 @@ router.post(
       joinUrl: created.joinUrl, location: location || null, attendees,
       status: "confirmed", createdBy: userId, createdAt: new Date(), updatedAt: new Date(),
     });
+
+    // Email each guest their confirmation + .ics (the provider's native invite
+    // doesn't reliably reach external guests).
+    for (const a of attendees) {
+      void sendGuestMeetingInvite({
+        uid: created.providerEventId,
+        title,
+        description,
+        startISO: start.toISOString(),
+        endISO: end.toISOString(),
+        organizerName: account.fromName || account.email,
+        organizerEmail: account.email,
+        attendeeEmail: a.email,
+        attendeeName: a.name ?? null,
+        joinUrl: created.joinUrl,
+        location,
+      });
+    }
 
     // Timeline event + workflow triggers + notification (mirrors the Calendly path).
     await db.insert(leadEvents).values({

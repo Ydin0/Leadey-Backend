@@ -19,6 +19,8 @@ export interface SendEmailInput {
   replyTo?: string;
   /** Optional override of the From header */
   from?: string;
+  /** File attachments (e.g. a calendar .ics invite). */
+  attachments?: { filename: string; content: string | Buffer; contentType?: string }[];
 }
 
 export interface SendEmailResult {
@@ -40,6 +42,15 @@ export async function sendEmail(input: SendEmailInput): Promise<SendEmailResult>
     html: input.html,
     text: input.text,
     replyTo: input.replyTo,
+    ...(input.attachments?.length
+      ? {
+          attachments: input.attachments.map((a) => ({
+            filename: a.filename,
+            content: typeof a.content === "string" ? Buffer.from(a.content).toString("base64") : a.content.toString("base64"),
+            contentType: a.contentType,
+          })),
+        }
+      : {}),
   });
 
   if (result.error) {

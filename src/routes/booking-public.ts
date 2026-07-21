@@ -8,6 +8,7 @@ import { funnels } from "../db/schema/funnels";
 import { createId } from "../lib/helpers";
 import { getPageHosts, getPageMemberIds, offeringHosts, computePageAvailability, fairPick } from "../lib/booking-service";
 import { createMeetingEvent } from "../lib/meeting-scheduler";
+import { sendGuestMeetingInvite } from "../lib/meeting-invite";
 import { scheduledMeetings } from "../db/schema/scheduled-meetings";
 import { notifyWorkflowEvent, fireTriggerForLead } from "../services/workflow-engine";
 
@@ -138,6 +139,23 @@ bookingPublicRouter.post(
       joinUrl: created.joinUrl, location: null, attendees,
       status: "confirmed", createdBy: null, createdAt: new Date(), updatedAt: new Date(),
     });
+
+    // Email every guest their own confirmation + .ics — the calendar provider's
+    // native invite doesn't reliably reach external guests, so we send our own.
+    for (const a of attendees) {
+      void sendGuestMeetingInvite({
+        uid: created.providerEventId,
+        title: page.name,
+        description: notes,
+        startISO: start.toISOString(),
+        endISO: end.toISOString(),
+        organizerName: account.fromName || account.email,
+        organizerEmail: account.email,
+        attendeeEmail: a.email,
+        attendeeName: a.name ?? null,
+        joinUrl: created.joinUrl,
+      });
+    }
 
     if (matchedLead) {
       await db.insert(leadEvents).values({
