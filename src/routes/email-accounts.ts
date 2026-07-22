@@ -541,6 +541,23 @@ router.post(
   }),
 );
 
+// POST /api/email/signatures/analyze — AI-tokenize a pasted signature.
+// Takes raw HTML with one person's hardcoded details and returns it with the
+// {{sender_*}} merge tokens inserted where they belong, so one template serves
+// the whole team.
+router.post(
+  "/email/signatures/analyze",
+  asyncHandler(async (req, res) => {
+    const html = String(req.body?.html ?? req.body?.contentHtml ?? "");
+    if (!html.trim()) throw new ApiError(400, "Paste a signature first.");
+    if (html.length > 50_000) throw new ApiError(400, "Signature is too long (max 50,000 characters)");
+    const { tokenizeSignature } = await import("../lib/signature-ai");
+    const out = await tokenizeSignature(html);
+    if (out == null) throw new ApiError(503, "AI is unavailable right now — please add the variables manually.");
+    res.json({ data: { html: out } });
+  }),
+);
+
 // PATCH /api/email/signatures/:id
 router.patch(
   "/email/signatures/:id",
