@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { and, eq, asc, inArray, or } from "drizzle-orm";
 import { getAuth } from "@clerk/express";
 import { db } from "../db/index";
-import { bookingPages, bookingPageMembers, DEFAULT_AVAILABILITY, type WeeklyAvailability } from "../db/schema/booking-pages";
+import { bookingPages, bookingPageMembers, type WeeklyAvailability } from "../db/schema/booking-pages";
 import { emailAccounts } from "../db/schema/email-accounts";
 import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
@@ -80,30 +80,20 @@ async function syncMembers(pageId: string, ownerId: string, members: unknown, pr
 
 const router = Router();
 
-// ─── GET /booking-pages — the caller's own pages (creates a default) ─────
+// ─── GET /booking-pages — the caller's own pages ────────────────────────
 router.get(
   "/booking-pages",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || "";
-    // Pages the user owns (auto-seed a default the first time they have none).
-    let owned = await db
+    // Pages the user owns. No default is auto-created — reps build one from
+    // scratch (the UI shows an empty state + a create form), so connecting a
+    // calendar no longer clogs the org with a throwaway "30 Minute Meeting".
+    const owned = await db
       .select()
       .from(bookingPages)
       .where(and(eq(bookingPages.organizationId, orgId), eq(bookingPages.userId, userId)))
       .orderBy(asc(bookingPages.createdAt));
-    if (owned.length === 0 && userId) {
-      const now = new Date();
-      const row = {
-        id: createId("bpage"), organizationId: orgId, userId,
-        name: "30 Minute Meeting", durationMin: 30, video: true, timezone: "UTC",
-        availability: DEFAULT_AVAILABILITY, respectCalendar: true,
-        bufferBeforeMin: 0, bufferAfterMin: 0, minNoticeMin: 240, maxDaysAhead: 60,
-        isActive: true, isDefault: true, createdAt: now, updatedAt: now,
-      };
-      await db.insert(bookingPages).values(row);
-      owned = [row as Page];
-    }
     // Pages this user is assigned to as a host (round-robin) — visible on their side too.
     const ownedIds = new Set(owned.map((p) => p.id));
     const memberPageIds = (
