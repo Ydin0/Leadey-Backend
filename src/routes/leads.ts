@@ -10,7 +10,7 @@ import { ApiError, createId, dedupeKey } from "../lib/helpers";
 import { buildLeadFilterWhere, decodeFilterParam } from "../lib/lead-filter";
 import { getPerms, getVisibleFunnelIds, leadVisibilityCondition, requirePerm } from "../lib/permission-service";
 import { createTtlCache } from "../lib/ttl-cache";
-import { getCustomFieldsForLeads, type LeadCustomField } from "../lib/custom-fields-service";
+import { getCustomFieldsForLeads, listFieldDefinitions, type LeadCustomField } from "../lib/custom-fields-service";
 
 const router = Router();
 
@@ -209,115 +209,246 @@ router.get(
 // no key list to scope by) and cached for 60s per org.
 const orgActivityCache = createTtlCache<Record<string, { calls: number; emails: number }>>(60_000);
 
+/** Per-lead call/email totals across the whole org (rolled up per person by
+ *  phone/email), cached 60s. Shared by the activity-counts endpoint + CSV
+ *  export so exported Calls/Emails columns are the real numbers. */
+async function orgActivityCounts(orgId: string): Promise<Record<string, { calls: number; emails: number }>> {
+  const cached = orgActivityCache.get(orgId);
+  if (cached) return cached;
+
+  const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
+  const toDigits = sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`;
+  const fromDigits = sql`regexp_replace(${callRecords.fromNumber}, '[^0-9]', '', 'g')`;
+
+  const [orgLeads, outRows, inRows, eventRows] = await Promise.all([
+    db
+      .select({ id: leads.id, phone: leads.phone, email: leads.email })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(eq(funnels.organizationId, orgId)),
+    db
+      .select({ phone: sql<string>`${toDigits}`, n: sql<number>`count(*)::int` })
+      .from(callRecords)
+      .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
+      .groupBy(toDigits),
+    db
+      .select({ phone: sql<string>`${fromDigits}`, n: sql<number>`count(*)::int` })
+      .from(callRecords)
+      .where(and(eq(callRecords.organizationId, orgId), sql`${callRecords.direction} <> 'outbound'`))
+      .groupBy(fromDigits),
+    db
+      .select({
+        leadId: leadEvents.leadId,
+        calls: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
+        emails: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
+      })
+      .from(leadEvents)
+      .innerJoin(leads, eq(leadEvents.leadId, leads.id))
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(eq(funnels.organizationId, orgId))
+      .groupBy(leadEvents.leadId),
+  ]);
+
+  const callsByPhone = new Map<string, number>();
+  for (const r of [...outRows, ...inRows]) {
+    if (r.phone) callsByPhone.set(r.phone, (callsByPhone.get(r.phone) ?? 0) + Number(r.n));
+  }
+  const evByLead = new Map(eventRows.map((r) => [r.leadId, r]));
+  const evCallsByPhone = new Map<string, number>();
+  const evEmailsByAddr = new Map<string, number>();
+  for (const l of orgLeads) {
+    const ev = evByLead.get(l.id);
+    if (!ev) continue;
+    const p = normPhone(l.phone);
+    const e = (l.email || "").toLowerCase();
+    if (p.length > 5) evCallsByPhone.set(p, (evCallsByPhone.get(p) ?? 0) + ev.calls);
+    if (e) evEmailsByAddr.set(e, (evEmailsByAddr.get(e) ?? 0) + ev.emails);
+  }
+  const counts: Record<string, { calls: number; emails: number }> = {};
+  for (const l of orgLeads) {
+    const p = normPhone(l.phone);
+    const e = (l.email || "").toLowerCase();
+    const calls = Math.max(p.length > 5 ? callsByPhone.get(p) ?? 0 : 0, evCallsByPhone.get(p) ?? 0);
+    const emails = evEmailsByAddr.get(e) ?? 0;
+    if (calls || emails) counts[l.id] = { calls, emails };
+  }
+  orgActivityCache.set(orgId, counts);
+  return counts;
+}
+
 router.get(
   "/leads/activity-counts",
   asyncHandler(async (req, res) => {
-    const orgId = getOrgId(req);
-    const cached = orgActivityCache.get(orgId);
-    if (cached) {
-      res.json({ data: { counts: cached } });
-      return;
-    }
-
-    const normPhone = (p: string | null | undefined) => (p || "").replace(/[^0-9]/g, "");
-    const toDigits = sql`regexp_replace(${callRecords.toNumber}, '[^0-9]', '', 'g')`;
-    const fromDigits = sql`regexp_replace(${callRecords.fromNumber}, '[^0-9]', '', 'g')`;
-
-    const [orgLeads, outRows, inRows, eventRows] = await Promise.all([
-      db
-        .select({ id: leads.id, phone: leads.phone, email: leads.email })
-        .from(leads)
-        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-        .where(eq(funnels.organizationId, orgId)),
-      db
-        .select({ phone: sql<string>`${toDigits}`, n: sql<number>`count(*)::int` })
-        .from(callRecords)
-        .where(and(eq(callRecords.organizationId, orgId), eq(callRecords.direction, "outbound")))
-        .groupBy(toDigits),
-      db
-        .select({ phone: sql<string>`${fromDigits}`, n: sql<number>`count(*)::int` })
-        .from(callRecords)
-        .where(and(eq(callRecords.organizationId, orgId), sql`${callRecords.direction} <> 'outbound'`))
-        .groupBy(fromDigits),
-      db
-        .select({
-          leadId: leadEvents.leadId,
-          calls: sql<number>`count(*) filter (where ${leadEvents.type} = 'call' OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'call') OR ${leadEvents.outcome} = 'call_completed')::int`,
-          emails: sql<number>`count(*) filter (where ${leadEvents.type} IN ('smartlead_webhook','email_sent','reply_handled') OR (${leadEvents.type} = 'step_outcome' AND ${leadEvents.meta} ->> 'channel' = 'email'))::int`,
-        })
-        .from(leadEvents)
-        .innerJoin(leads, eq(leadEvents.leadId, leads.id))
-        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-        .where(eq(funnels.organizationId, orgId))
-        .groupBy(leadEvents.leadId),
-    ]);
-
-    const callsByPhone = new Map<string, number>();
-    for (const r of [...outRows, ...inRows]) {
-      if (r.phone) callsByPhone.set(r.phone, (callsByPhone.get(r.phone) ?? 0) + Number(r.n));
-    }
-
-    // Event totals per person key: the same person appears in several
-    // campaigns, so counts roll up by phone/email across all their rows.
-    const evByLead = new Map(eventRows.map((r) => [r.leadId, r]));
-    const evCallsByPhone = new Map<string, number>();
-    const evEmailsByAddr = new Map<string, number>();
-    for (const l of orgLeads) {
-      const ev = evByLead.get(l.id);
-      if (!ev) continue;
-      const p = normPhone(l.phone);
-      const e = (l.email || "").toLowerCase();
-      if (p.length > 5) evCallsByPhone.set(p, (evCallsByPhone.get(p) ?? 0) + ev.calls);
-      if (e) evEmailsByAddr.set(e, (evEmailsByAddr.get(e) ?? 0) + ev.emails);
-    }
-
-    const counts: Record<string, { calls: number; emails: number }> = {};
-    for (const l of orgLeads) {
-      const p = normPhone(l.phone);
-      const e = (l.email || "").toLowerCase();
-      const calls = Math.max(p.length > 5 ? callsByPhone.get(p) ?? 0 : 0, evCallsByPhone.get(p) ?? 0);
-      const emails = evEmailsByAddr.get(e) ?? 0;
-      if (calls || emails) counts[l.id] = { calls, emails };
-    }
-
-    orgActivityCache.set(orgId, counts);
+    const counts = await orgActivityCounts(getOrgId(req));
     res.json({ data: { counts } });
   }),
 );
+
+// ─── Lead CSV export (shared builder) ───────────────────────────────────────
+type ExportRow = { lead: typeof leads.$inferSelect; funnelName: string | null };
+
+const csvEsc = (v: unknown) => {
+  const s = v == null ? "" : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const joinExtras = (arr: { label: string; value: string }[] | null | undefined) =>
+  (arr ?? []).filter((x) => x?.value).map((x) => (x.label ? `${x.label}: ${x.value}` : x.value)).join("; ");
+
+/** The full "top CRM" column set. `key` is the frontend column key (so the UI can
+ *  restrict/order to the visible columns); `value(row, ctx)` returns the raw cell. */
+interface CsvCol {
+  key: string;
+  label: string;
+  value: (row: ExportRow, ctx: { calls: number; emails: number; custom: Map<string, string> }) => unknown;
+}
+const BASE_COLS: CsvCol[] = [
+  { key: "name", label: "Name", value: (r) => r.lead.name },
+  { key: "firstName", label: "First Name", value: (r) => r.lead.firstName },
+  { key: "lastName", label: "Last Name", value: (r) => r.lead.lastName },
+  { key: "title", label: "Title", value: (r) => r.lead.title },
+  { key: "company", label: "Company", value: (r) => r.lead.company },
+  { key: "email", label: "Email", value: (r) => r.lead.email },
+  { key: "extraEmails", label: "Extra Emails", value: (r) => joinExtras(r.lead.extraEmails) },
+  { key: "phone", label: "Phone", value: (r) => r.lead.phone },
+  { key: "extraPhones", label: "Extra Phones", value: (r) => joinExtras(r.lead.extraPhones) },
+  { key: "linkedin", label: "LinkedIn", value: (r) => r.lead.linkedinUrl },
+  { key: "status", label: "Status", value: (r) => r.lead.status },
+  { key: "source", label: "Source", value: (r) => r.lead.source },
+  { key: "score", label: "Score", value: (r) => r.lead.score },
+  { key: "doNotCall", label: "Do Not Call", value: (r) => (r.lead.doNotCall ? "Yes" : "") },
+  { key: "step", label: "Step", value: (r) => r.lead.currentStep },
+  { key: "totalSteps", label: "Total Steps", value: (r) => r.lead.totalSteps },
+  { key: "nextAction", label: "Next Action", value: (r) => r.lead.nextAction },
+  { key: "nextDue", label: "Next Due", value: (r) => r.lead.nextDate?.toISOString() ?? "" },
+  { key: "domain", label: "Domain", value: (r) => r.lead.companyDomain },
+  { key: "industry", label: "Industry", value: (r) => r.lead.companyIndustry },
+  { key: "employees", label: "Employees", value: (r) => r.lead.companyEmployeeCount },
+  { key: "location", label: "Location", value: (r) => r.lead.companyLocation },
+  { key: "revenue", label: "Annual Revenue", value: (r) => r.lead.companyAnnualRevenue },
+  { key: "hiringRoles", label: "Hiring Roles", value: (r) => (r.lead.companyHiringRoles ?? []).join("; ") },
+  { key: "tags", label: "Tags", value: (r) => (r.lead.tags ?? []).join("; ") },
+  { key: "campaign", label: "Campaign", value: (r) => r.funnelName },
+  { key: "calls", label: "Calls", value: (_r, c) => c.calls },
+  { key: "emails", label: "Emails", value: (_r, c) => c.emails },
+  { key: "created", label: "Created", value: (r) => r.lead.createdAt?.toISOString() ?? "" },
+  { key: "updated", label: "Updated", value: (r) => r.lead.updatedAt?.toISOString() ?? "" },
+  { key: "contact", label: "Name", value: (r) => r.lead.name }, // "contact" composite column → name
+];
+
+/** Build the enriched CSV (with a UTF-8 BOM so Excel reads it correctly) for a
+ *  set of already-fetched lead rows. Honors an optional visible-column subset. */
+async function buildLeadsCsv(orgId: string, rows: ExportRow[], columnKeys?: string[]): Promise<string> {
+  const ids = rows.map((r) => r.lead.id);
+  const [defs, customByLead, activity] = await Promise.all([
+    listFieldDefinitions(orgId),
+    getCustomFieldsForLeads(ids),
+    orgActivityCounts(orgId),
+  ]);
+
+  // Choose columns: the requested visible subset (mapped, de-duped, keeping the
+  // frontend's order) or the full set. "custom:<key>" columns map to defs.
+  const baseByKey = new Map(BASE_COLS.map((c) => [c.key, c]));
+  let stdCols: CsvCol[];
+  let customCols: { key: string; label: string }[];
+  if (columnKeys && columnKeys.length) {
+    const seen = new Set<string>();
+    stdCols = [];
+    customCols = [];
+    for (const k of columnKeys) {
+      if (k.startsWith("custom:")) {
+        const def = defs.find((d) => `custom:${d.key}` === k);
+        if (def && !seen.has(k)) { customCols.push({ key: def.key, label: def.label }); seen.add(k); }
+      } else {
+        const col = baseByKey.get(k);
+        if (col && !seen.has(col.label)) { stdCols.push(col); seen.add(col.label); }
+      }
+    }
+    if (stdCols.length === 0 && customCols.length === 0) stdCols = BASE_COLS.filter((c) => c.key !== "contact");
+  } else {
+    stdCols = BASE_COLS.filter((c) => c.key !== "contact"); // "contact" duplicates name
+    customCols = defs.map((d) => ({ key: d.key, label: d.label }));
+  }
+
+  const header = [...stdCols.map((c) => c.label), ...customCols.map((c) => c.label)].map(csvEsc).join(",");
+  const lines = [header];
+  for (const row of rows) {
+    const ctx = { ...(activity[row.lead.id] ?? { calls: 0, emails: 0 }), custom: new Map<string, string>() };
+    for (const cf of customByLead.get(row.lead.id) ?? []) ctx.custom.set(cf.key, cf.value);
+    const cells = [
+      ...stdCols.map((c) => csvEsc(c.value(row, ctx))),
+      ...customCols.map((c) => csvEsc(ctx.custom.get(c.key) ?? "")),
+    ];
+    lines.push(cells.join(","));
+  }
+  return "﻿" + lines.join("\r\n");
+}
+
+function sendCsv(res: Response, csv: string, filename: string) {
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}"`);
+  res.send(csv);
+}
+
+/** Fetch export rows either by an explicit lead-id set (WYSIWYG selection,
+ *  order preserved) or by the query-param filter/Smart View. Always org-scoped
+ *  + visibility-gated; capped at 50k. */
+async function fetchExportRows(req: Request, leadIds: string[] | null): Promise<ExportRow[]> {
+  const orgId = getOrgId(req);
+  const vis = await leadVisibilityForReq(req);
+  if (leadIds && leadIds.length) {
+    const capped = leadIds.slice(0, 50000);
+    const rows: ExportRow[] = [];
+    for (let i = 0; i < capped.length; i += 5000) {
+      const chunk = capped.slice(i, i + 5000);
+      const conds: SQL[] = [eq(funnels.organizationId, orgId), inArray(leads.id, chunk)];
+      if (vis) conds.push(vis);
+      const found = await db
+        .select({ lead: leads, funnelName: funnels.name })
+        .from(leads)
+        .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+        .where(and(...conds));
+      rows.push(...found);
+    }
+    // Preserve the caller's order (what the user saw on screen).
+    const byId = new Map(rows.map((r) => [r.lead.id, r]));
+    return capped.map((id) => byId.get(id)).filter((r): r is ExportRow => !!r);
+  }
+  const conds = buildLeadConditions(orgId, (req.method === "POST" ? req.body : req.query) as Record<string, unknown>);
+  if (vis) conds.push(vis);
+  return db
+    .select({ lead: leads, funnelName: funnels.name })
+    .from(leads)
+    .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+    .where(and(...conds))
+    .orderBy(sql`lower(${leads.company})`, desc(leads.createdAt))
+    .limit(50000);
+}
 
 // ─── GET /leads/export — CSV of every lead matching the (Smart View) filter ──
 router.get(
   "/leads/export",
   requirePerm("leads.export"),
   asyncHandler(async (req, res) => {
-    const orgId = getOrgId(req);
-    const conds = buildLeadConditions(orgId, req.query as Record<string, unknown>);
-    const vis = await leadVisibilityForReq(req);
-    if (vis) conds.push(vis);
-    const rows = await db
-      .select({ lead: leads, funnelName: funnels.name })
-      .from(leads)
-      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
-      .where(and(...conds))
-      .orderBy(sql`lower(${leads.company})`, desc(leads.createdAt))
-      .limit(50000);
+    const rows = await fetchExportRows(req, null);
+    const csv = await buildLeadsCsv(getOrgId(req), rows);
+    sendCsv(res, csv, "leads-export.csv");
+  }),
+);
 
-    const headers = ["Name", "First Name", "Last Name", "Title", "Company", "Email", "Phone", "LinkedIn", "Status", "Source", "Score", "Domain", "Industry", "Employees", "Location", "Campaign", "Created"];
-    const esc = (v: unknown) => {
-      const s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const lines = [headers.join(",")];
-    for (const { lead: l, funnelName } of rows) {
-      lines.push([
-        l.name, l.firstName, l.lastName, l.title, l.company, l.email, l.phone, l.linkedinUrl,
-        l.status, l.source, l.score, l.companyDomain, l.companyIndustry, l.companyEmployeeCount,
-        l.companyLocation, funnelName, l.createdAt?.toISOString(),
-      ].map(esc).join(","));
-    }
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", 'attachment; filename="leads-export.csv"');
-    res.send(lines.join("\n"));
+// ─── POST /leads/export — rich CSV for an explicit contact selection (leadIds)
+// or the current filter. Body: { leadIds?, funnelId?, filter?, search?, columns?,
+// filename? }. This is what the campaign Leads table's Export button calls. ─────
+router.post(
+  "/leads/export",
+  requirePerm("leads.export"),
+  asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const leadIds = Array.isArray(body.leadIds) ? body.leadIds.map(String).filter(Boolean) : null;
+    const columns = Array.isArray(body.columns) ? body.columns.map(String) : undefined;
+    const rows = await fetchExportRows(req, leadIds);
+    const csv = await buildLeadsCsv(getOrgId(req), rows, columns);
+    const filename = typeof body.filename === "string" && body.filename.trim() ? body.filename.trim() : "leads-export.csv";
+    sendCsv(res, csv, filename.endsWith(".csv") ? filename : `${filename}.csv`);
   }),
 );
 
