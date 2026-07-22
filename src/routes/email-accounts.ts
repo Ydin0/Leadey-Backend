@@ -8,6 +8,7 @@ import { calendarEvents } from "../db/schema/calendar";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
 import { users, organizations } from "../db/schema/organizations";
+import { memberSignatureDetails } from "../db/schema/member-signature-details";
 import { templateAttachments } from "../db/schema/template-attachments";
 import { getOrgId } from "../lib/auth";
 import { getPerms } from "../lib/permission-service";
@@ -604,26 +605,29 @@ router.get(
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     const orgId = getOrgId(req);
+    // Identity defaults (real name/email/phone) are global (users row); the
+    // signature settings themselves are PER ORG (member_signature_details), so
+    // switching orgs shows that org's own details, not another org's.
     const [u] = await db
-      .select({
-        firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title,
-        signatureName: users.signatureName, signatureEmail: users.signatureEmail, signaturePhone: users.signaturePhone, signatureCompany: users.signatureCompany,
-        signatureFields: users.signatureFields, defaultSignatureId: users.defaultSignatureId,
-      })
+      .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone })
       .from(users)
       .where(eq(users.id, userId));
     const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
+    const [sd] = await db
+      .select()
+      .from(memberSignatureDetails)
+      .where(and(eq(memberSignatureDetails.organizationId, orgId), eq(memberSignatureDetails.userId, userId)));
     res.json({
       data: {
         // Profile/org defaults — shown as placeholders when no override is set.
         firstName: u?.firstName ?? "", lastName: u?.lastName ?? "", email: u?.email ?? "",
         phone: u?.phone ?? "", companyName: org?.name ?? "",
-        title: u?.title ?? "",
-        // Signature-display overrides (null ⇒ use the default above).
-        signatureName: u?.signatureName ?? null, signatureEmail: u?.signatureEmail ?? null,
-        signaturePhone: u?.signaturePhone ?? null, signatureCompany: u?.signatureCompany ?? null,
-        signatureFields: u?.signatureFields ?? {},
-        defaultSignatureId: u?.defaultSignatureId ?? null,
+        title: sd?.title ?? "",
+        // Signature-display overrides for THIS org (null ⇒ use the default above).
+        signatureName: sd?.signatureName ?? null, signatureEmail: sd?.signatureEmail ?? null,
+        signaturePhone: sd?.signaturePhone ?? null, signatureCompany: sd?.signatureCompany ?? null,
+        signatureFields: sd?.signatureFields ?? {},
+        defaultSignatureId: sd?.defaultSignatureId ?? null,
       },
     });
   }),
@@ -635,6 +639,8 @@ router.patch(
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     if (!userId) throw new ApiError(401, "Not authenticated");
+    const orgId = getOrgId(req);
+    // Signature settings are PER ORG — upsert the (orgId, userId) row.
     const patch: Partial<{
       title: string | null; signatureName: string | null; signatureEmail: string | null;
       signaturePhone: string | null; signatureCompany: string | null;
@@ -649,7 +655,6 @@ router.patch(
     if (req.body?.signaturePhone !== undefined) patch.signaturePhone = trimOverride(req.body.signaturePhone, 60);
     if (req.body?.signatureCompany !== undefined) patch.signatureCompany = trimOverride(req.body.signatureCompany, 160);
     if (req.body?.defaultSignatureId !== undefined) {
-      const orgId = getOrgId(req);
       const id = req.body.defaultSignatureId ? String(req.body.defaultSignatureId) : null;
       if (id) {
         // Only allow marking a signature that actually exists in this org.
@@ -667,7 +672,10 @@ router.patch(
       }
       patch.signatureFields = clean;
     }
-    await db.update(users).set(patch).where(eq(users.id, userId));
+    await db
+      .insert(memberSignatureDetails)
+      .values({ id: createId("msig"), organizationId: orgId, userId, ...patch })
+      .onConflictDoUpdate({ target: [memberSignatureDetails.organizationId, memberSignatureDetails.userId], set: patch });
     res.json({ data: { ok: true } });
   }),
 );

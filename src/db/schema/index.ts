@@ -94,3 +94,5 @@ export { dismissedPotentialContacts } from "./dismissed-potential-contacts";
 export { emailSignatures } from "./email-signatures";
 
 export { inboxReadState } from "./inbox-read-state";
+
+export { memberSignatureDetails } from "./member-signature-details";

@@ -2,6 +2,25 @@ import { eq, and } from "drizzle-orm";
 import { db } from "../db";
 import { emailSignatures } from "../db/schema/email-signatures";
 import { users, organizations } from "../db/schema/organizations";
+import { memberSignatureDetails } from "../db/schema/member-signature-details";
+
+/** Load a rep's PER-ORG signature overrides (title + {{sender_*}} overrides +
+ *  custom fields), or nulls when they haven't set any in this org. */
+async function orgSignatureOverrides(organizationId: string, userId: string) {
+  const [row] = await db
+    .select({
+      title: memberSignatureDetails.title,
+      signatureName: memberSignatureDetails.signatureName,
+      signatureEmail: memberSignatureDetails.signatureEmail,
+      signaturePhone: memberSignatureDetails.signaturePhone,
+      signatureCompany: memberSignatureDetails.signatureCompany,
+      signatureFields: memberSignatureDetails.signatureFields,
+      defaultSignatureId: memberSignatureDetails.defaultSignatureId,
+    })
+    .from(memberSignatureDetails)
+    .where(and(eq(memberSignatureDetails.organizationId, organizationId), eq(memberSignatureDetails.userId, userId)));
+  return row ?? null;
+}
 
 /** Fixed + custom sender variables for a rep, used to fill {{sender_*}} tokens
  *  in a shared signature at send time. */
@@ -63,20 +82,25 @@ export async function resolveAccountSignature(account: {
       .from(emailSignatures)
       .where(and(eq(emailSignatures.id, account.signatureId), eq(emailSignatures.organizationId, account.organizationId)));
     if (sig) {
-      const [user] = await db
-        .select({
-          firstName: users.firstName, lastName: users.lastName, email: users.email,
-          phone: users.phone, title: users.title, signatureFields: users.signatureFields,
-          signatureName: users.signatureName, signatureEmail: users.signatureEmail,
-          signaturePhone: users.signaturePhone, signatureCompany: users.signatureCompany,
-        })
+      // Identity fallbacks (real name/email/phone) come from the global users
+      // row; the signature OVERRIDES + title + custom fields are PER-ORG.
+      const [identity] = await db
+        .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone })
         .from(users)
         .where(eq(users.id, account.userId));
+      const ov = await orgSignatureOverrides(account.organizationId, account.userId);
       const [org] = await db
         .select({ name: organizations.name })
         .from(organizations)
         .where(eq(organizations.id, account.organizationId));
-      return renderSenderTokens(sig.contentHtml, senderTokenMap(user ?? null, org?.name ?? null));
+      const user = {
+        firstName: identity?.firstName ?? null, lastName: identity?.lastName ?? null,
+        email: identity?.email ?? "", phone: identity?.phone ?? null,
+        title: ov?.title ?? null, signatureFields: ov?.signatureFields ?? null,
+        signatureName: ov?.signatureName ?? null, signatureEmail: ov?.signatureEmail ?? null,
+        signaturePhone: ov?.signaturePhone ?? null, signatureCompany: ov?.signatureCompany ?? null,
+      };
+      return renderSenderTokens(sig.contentHtml, senderTokenMap(user, org?.name ?? null));
     }
     // Chosen signature was deleted → fall through to raw/none.
   }
@@ -96,14 +120,11 @@ export async function resolveSignatureChoice(
 ): Promise<string | null> {
   if (choice === "none") return null;
   if (choice == null || choice === "default") {
-    // A per-user default signature (set by the rep) wins over the mailbox's own
-    // configured signature, so "Default signature" honours their preference.
-    const [u] = await db
-      .select({ defaultSignatureId: users.defaultSignatureId })
-      .from(users)
-      .where(eq(users.id, account.userId));
-    if (u?.defaultSignatureId) {
-      return resolveAccountSignature({ ...account, signatureId: u.defaultSignatureId, signature: null });
+    // A per-user default signature (set by the rep, PER ORG) wins over the
+    // mailbox's own configured signature, so "Default signature" honours it.
+    const ov = await orgSignatureOverrides(account.organizationId, account.userId);
+    if (ov?.defaultSignatureId) {
+      return resolveAccountSignature({ ...account, signatureId: ov.defaultSignatureId, signature: null });
     }
     return resolveAccountSignature(account);
   }

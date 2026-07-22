@@ -771,6 +771,13 @@
       "when": 1784733559198,
       "tag": "0109_signature_overrides",
       "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1784736728236,
+      "tag": "0110_member_signature_details",
+      "breakpoints": true
     }
   ]
 }
