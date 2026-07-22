@@ -7,7 +7,7 @@ import { emailSignatures } from "../db/schema/email-signatures";
 import { calendarEvents } from "../db/schema/calendar";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
-import { users } from "../db/schema/organizations";
+import { users, organizations } from "../db/schema/organizations";
 import { templateAttachments } from "../db/schema/template-attachments";
 import { getOrgId } from "../lib/auth";
 import { getPerms } from "../lib/permission-service";
@@ -586,14 +586,26 @@ router.get(
   "/me/signature-details",
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
+    const orgId = getOrgId(req);
     const [u] = await db
-      .select({ firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title, signatureFields: users.signatureFields, defaultSignatureId: users.defaultSignatureId })
+      .select({
+        firstName: users.firstName, lastName: users.lastName, email: users.email, phone: users.phone, title: users.title,
+        signatureName: users.signatureName, signatureEmail: users.signatureEmail, signaturePhone: users.signaturePhone, signatureCompany: users.signatureCompany,
+        signatureFields: users.signatureFields, defaultSignatureId: users.defaultSignatureId,
+      })
       .from(users)
       .where(eq(users.id, userId));
+    const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
     res.json({
       data: {
+        // Profile/org defaults — shown as placeholders when no override is set.
         firstName: u?.firstName ?? "", lastName: u?.lastName ?? "", email: u?.email ?? "",
-        phone: u?.phone ?? "", title: u?.title ?? "", signatureFields: u?.signatureFields ?? {},
+        phone: u?.phone ?? "", companyName: org?.name ?? "",
+        title: u?.title ?? "",
+        // Signature-display overrides (null ⇒ use the default above).
+        signatureName: u?.signatureName ?? null, signatureEmail: u?.signatureEmail ?? null,
+        signaturePhone: u?.signaturePhone ?? null, signatureCompany: u?.signatureCompany ?? null,
+        signatureFields: u?.signatureFields ?? {},
         defaultSignatureId: u?.defaultSignatureId ?? null,
       },
     });
@@ -606,8 +618,19 @@ router.patch(
   asyncHandler(async (req, res) => {
     const userId = getAuth(req)?.userId || "";
     if (!userId) throw new ApiError(401, "Not authenticated");
-    const patch: Partial<{ title: string | null; signatureFields: Record<string, string>; defaultSignatureId: string | null; updatedAt: Date }> = { updatedAt: new Date() };
+    const patch: Partial<{
+      title: string | null; signatureName: string | null; signatureEmail: string | null;
+      signaturePhone: string | null; signatureCompany: string | null;
+      signatureFields: Record<string, string>; defaultSignatureId: string | null; updatedAt: Date;
+    }> = { updatedAt: new Date() };
     if (req.body?.title !== undefined) patch.title = String(req.body.title || "").slice(0, 160) || null;
+    // Signature-display overrides — a blank string clears the override (⇒ fall
+    // back to the profile/org default). Never touches the login identity email.
+    const trimOverride = (v: unknown, max: number) => { const s = String(v ?? "").trim().slice(0, max); return s || null; };
+    if (req.body?.signatureName !== undefined) patch.signatureName = trimOverride(req.body.signatureName, 160);
+    if (req.body?.signatureEmail !== undefined) patch.signatureEmail = trimOverride(req.body.signatureEmail, 200);
+    if (req.body?.signaturePhone !== undefined) patch.signaturePhone = trimOverride(req.body.signaturePhone, 60);
+    if (req.body?.signatureCompany !== undefined) patch.signatureCompany = trimOverride(req.body.signatureCompany, 160);
     if (req.body?.defaultSignatureId !== undefined) {
       const orgId = getOrgId(req);
       const id = req.body.defaultSignatureId ? String(req.body.defaultSignatureId) : null;

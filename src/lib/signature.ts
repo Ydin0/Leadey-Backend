@@ -6,19 +6,28 @@ import { users, organizations } from "../db/schema/organizations";
 /** Fixed + custom sender variables for a rep, used to fill {{sender_*}} tokens
  *  in a shared signature at send time. */
 export function senderTokenMap(
-  user: { firstName: string | null; lastName: string | null; email: string; phone: string | null; title: string | null; signatureFields: Record<string, string> | null } | null,
+  user:
+    | {
+        firstName: string | null; lastName: string | null; email: string; phone: string | null; title: string | null;
+        signatureFields: Record<string, string> | null;
+        /** Optional signature-display overrides — win over the profile/org value. */
+        signatureName?: string | null; signatureEmail?: string | null; signaturePhone?: string | null; signatureCompany?: string | null;
+      }
+    | null,
   orgName: string | null,
 ): Record<string, string> {
-  const first = user?.firstName || "";
-  const last = user?.lastName || "";
+  // A name override fills the full name and is split for first/last tokens.
+  const nameOverride = (user?.signatureName || "").trim();
+  const first = nameOverride ? nameOverride.split(/\s+/)[0] : (user?.firstName || "");
+  const last = nameOverride ? nameOverride.split(/\s+/).slice(1).join(" ") : (user?.lastName || "");
   const map: Record<string, string> = {
     sender_first_name: first,
     sender_last_name: last,
-    sender_full_name: [first, last].filter(Boolean).join(" "),
-    sender_email: user?.email || "",
-    sender_phone: user?.phone || "",
+    sender_full_name: nameOverride || [first, last].filter(Boolean).join(" "),
+    sender_email: user?.signatureEmail || user?.email || "",
+    sender_phone: user?.signaturePhone || user?.phone || "",
     sender_title: user?.title || "",
-    sender_company: orgName || "",
+    sender_company: user?.signatureCompany || orgName || "",
   };
   // Custom fields → {{sender_<key>}}.
   for (const [k, v] of Object.entries(user?.signatureFields || {})) {
@@ -58,6 +67,8 @@ export async function resolveAccountSignature(account: {
         .select({
           firstName: users.firstName, lastName: users.lastName, email: users.email,
           phone: users.phone, title: users.title, signatureFields: users.signatureFields,
+          signatureName: users.signatureName, signatureEmail: users.signatureEmail,
+          signaturePhone: users.signaturePhone, signatureCompany: users.signatureCompany,
         })
         .from(users)
         .where(eq(users.id, account.userId));

@@ -91,6 +91,14 @@ export const users = pgTable("users", {
   phone: text("phone"),
   /** Job title — used for the {{sender_title}} signature variable. */
   title: text("title"),
+  /** Signature-display overrides for the built-in {{sender_*}} variables. These
+   *  let a rep put a different name / work email / personal number / company on
+   *  their email signature WITHOUT touching their login identity (users.email
+   *  stays the Clerk-synced login). Null ⇒ fall back to the profile / org value. */
+  signatureName: text("signature_name"),
+  signatureEmail: text("signature_email"),
+  signaturePhone: text("signature_phone"),
+  signatureCompany: text("signature_company"),
   /** Free-form extra fields for signature variables (e.g. booking_link,
    *  pronouns) → resolved as {{sender_<key>}} at send time. */
   signatureFields: jsonb("signature_fields").$type<Record<string, string>>(),
