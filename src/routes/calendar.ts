@@ -9,6 +9,7 @@ import { emailAccounts } from "../db/schema/email-accounts";
 import { getEventStatus } from "../lib/meeting-scheduler";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
+import { users } from "../db/schema/organizations";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { encryptSecret, signState, verifyState } from "../lib/crypto";
@@ -22,6 +23,28 @@ function asyncHandler(handler: (req: Request, res: Response, next: NextFunction)
   return (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(handler(req, res, next)).catch(next);
   };
+}
+
+/** The rep credited with booking a Leadey meeting — the stored booker, falling
+ *  back to createdBy then the host. */
+function meetingBookerId(m: { bookedByUserId?: string | null; createdBy?: string | null; hostUserId?: string | null }): string | null {
+  return m.bookedByUserId || m.createdBy || m.hostUserId || null;
+}
+
+/** Batch-resolve user ids → display names (for "Booked by <rep>" labels). */
+async function resolveUserNames(ids: (string | null | undefined)[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const uniq = [...new Set(ids.filter((x): x is string => !!x))];
+  if (!uniq.length) return out;
+  const rows = await db
+    .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email })
+    .from(users)
+    .where(inArray(users.id, uniq));
+  for (const r of rows) {
+    const name = [r.firstName, r.lastName].filter(Boolean).join(" ").trim() || r.email || "";
+    if (name) out.set(r.id, name);
+  }
+  return out;
 }
 
 // ── OAuth provider config (reuses the email-account Google/Microsoft apps) ──
@@ -175,6 +198,7 @@ router.get(
       joinUrl: string | null; location: string | null; organizerEmail: string | null;
       responseStatus: "accepted" | "declined" | "tentative" | "needsAction" | null;
       disposition: Disposition | null;
+      bookedByUserId?: string | null; bookedByName?: string | null; selfBooked?: boolean;
     };
     const meetings: Meeting[] = [];
     const leadEmail = (lead.email || "").trim().toLowerCase();
@@ -292,7 +316,9 @@ router.get(
     }
 
     // Leadey-booked meetings for this lead.
+    const leadBookerNames = await resolveUserNames(booked.map(meetingBookerId));
     for (const m of booked) {
+      const bookedByUserId = meetingBookerId(m);
       meetings.push({
         id: m.id,
         source: "leadey",
@@ -304,6 +330,9 @@ router.get(
         organizerEmail: m.hostEmail,
         responseStatus: null,
         disposition: null,
+        bookedByUserId,
+        bookedByName: bookedByUserId ? leadBookerNames.get(bookedByUserId) ?? null : null,
+        selfBooked: m.createdBy == null,
       });
     }
 
@@ -373,6 +402,8 @@ router.get(
       leadId: string | null; funnelId: string | null; leadName: string | null; company: string | null;
       /** Owner rep (whose calendar/Calendly this meeting belongs to). */
       userId: string | null;
+      /** The rep credited with booking (Leadey-booked meetings only). */
+      bookedByUserId?: string | null; bookedByName?: string | null; selfBooked?: boolean;
     };
     const meetings: OrgMeeting[] = [];
     const seen = new Set<string>(); // title|startTime + joinUrl dedupe across sources/reps
@@ -433,6 +464,7 @@ router.get(
         lte(scheduledMeetings.startTime, to),
         ...(scope === "mine" ? [eq(scheduledMeetings.hostUserId, userId)] : []),
       ));
+    const orgBookerNames = await resolveUserNames(schedRows.map(meetingBookerId));
     for (const m of schedRows) {
       let lead = m.leadId ? leadById.get(m.leadId) : undefined;
       if (!lead) {
@@ -464,6 +496,9 @@ router.get(
         leadName: lead.name,
         company: lead.company,
         userId: m.hostUserId ?? null,
+        bookedByUserId: meetingBookerId(m),
+        bookedByName: (() => { const b = meetingBookerId(m); return b ? orgBookerNames.get(b) ?? null : null; })(),
+        selfBooked: m.createdBy == null,
       });
     }
 

@@ -134,6 +134,9 @@ bookingPublicRouter.post(
     await db.insert(scheduledMeetings).values({
       id, organizationId: orgId, leadId: matchedLead?.id ?? null, funnelId: matchedLead?.funnelId ?? null,
       hostUserId: account.userId, hostAccountId: account.id, hostEmail: account.email,
+      // Self-serve booking — credit the assigned host; createdBy stays null so
+      // downstream can flag it as inbound.
+      bookedByUserId: account.userId,
       provider: created.provider, providerEventId: created.providerEventId,
       title: page.name, description: notes || null, startTime: start, endTime: end,
       joinUrl: created.joinUrl, location: null, attendees,

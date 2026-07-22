@@ -23,6 +23,10 @@ export const scheduledMeetings = pgTable(
     hostUserId: text("host_user_id"),
     hostAccountId: text("host_account_id"),
     hostEmail: text("host_email"),
+    /** The rep CREDITED with booking this meeting — drives per-rep booking
+     *  leaderboards + sit rate. In-app "Book meeting" ⇒ the rep who clicked it;
+     *  public self-booking ⇒ the assigned host (with createdBy null ⇒ inbound). */
+    bookedByUserId: text("booked_by_user_id"),
     provider: text("provider").notNull(), // google | microsoft
     /** External calendar event id — dedupes against the calendar-sync feed. */
     providerEventId: text("provider_event_id").notNull(),
@@ -41,6 +45,7 @@ export const scheduledMeetings = pgTable(
   (t) => [
     index("scheduled_meetings_org_lead_idx").on(t.organizationId, t.leadId),
     index("scheduled_meetings_org_start_idx").on(t.organizationId, t.startTime),
+    index("scheduled_meetings_org_booked_idx").on(t.organizationId, t.bookedByUserId),
     uniqueIndex("scheduled_meetings_event_uq").on(t.providerEventId),
   ],
 );

@@ -163,6 +163,8 @@ router.post(
     await db.insert(scheduledMeetings).values({
       id, organizationId: orgId, leadId: lead.id, funnelId,
       hostUserId: account.userId, hostAccountId: account.id, hostEmail: account.email,
+      // The rep who clicked "Book" gets booking credit (host as a fallback).
+      bookedByUserId: userId ?? account.userId,
       provider: created.provider, providerEventId: created.providerEventId,
       title, description: description || null, startTime: start, endTime: end,
       joinUrl: created.joinUrl, location: location || null, attendees,

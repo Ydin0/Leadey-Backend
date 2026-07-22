@@ -7,6 +7,8 @@ import { callRecords } from "../db/schema/call-records";
 import { emailMessages } from "../db/schema/email-accounts";
 import { smsMessages } from "../db/schema/sms";
 import { opportunities } from "../db/schema/opportunities";
+import { scheduledMeetings } from "../db/schema/scheduled-meetings";
+import { meetingDispositions } from "../db/schema/meeting-dispositions";
 import { getOrgId } from "../lib/auth";
 import { ApiError, createId } from "../lib/helpers";
 import { getAuth } from "@clerk/express";
@@ -923,6 +925,48 @@ router.get(
       .where(and(eq(opportunities.organizationId, orgId), gte(opportunities.createdAt, startUtc)))
       .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
 
+    // Per-rep MEETINGS BOOKED through the Leadey booking flow, credited to the
+    // booker (COALESCE(created_by, host_user_id)), bucketed by the day it was
+    // booked. Only confirmed bookings count.
+    const booker = sql<string>`coalesce(${scheduledMeetings.createdBy}, ${scheduledMeetings.hostUserId})`;
+    const bookedRows = await db
+      .select({
+        userId: booker,
+        day: sql<string>`to_char(date_trunc('day', ${scheduledMeetings.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        c: count(),
+      })
+      .from(scheduledMeetings)
+      .where(and(
+        eq(scheduledMeetings.organizationId, orgId),
+        eq(scheduledMeetings.status, "confirmed"),
+        gte(scheduledMeetings.createdAt, startUtc),
+      ))
+      .groupBy(booker, sql`date_trunc('day', ${scheduledMeetings.createdAt} AT TIME ZONE 'UTC')`);
+
+    // Per-rep SIT OUTCOMES on the meetings they booked — attended vs no-show
+    // from meeting_dispositions (key `leadey:<meetingId>`), bucketed by the day
+    // the meeting occurred. Only dispositioned meetings contribute to sit rate.
+    const sitRows = await db
+      .select({
+        userId: booker,
+        day: sql<string>`to_char(date_trunc('day', ${scheduledMeetings.startTime} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+        attended: sql<number>`coalesce(count(*) filter (where ${meetingDispositions.disposition} = 'attended'), 0)`,
+        noShow: sql<number>`coalesce(count(*) filter (where ${meetingDispositions.disposition} = 'no_show'), 0)`,
+      })
+      .from(scheduledMeetings)
+      .innerJoin(
+        meetingDispositions,
+        and(
+          eq(meetingDispositions.organizationId, scheduledMeetings.organizationId),
+          eq(meetingDispositions.meetingKey, sql`'leadey:' || ${scheduledMeetings.id}`),
+        ),
+      )
+      .where(and(
+        eq(scheduledMeetings.organizationId, orgId),
+        gte(scheduledMeetings.startTime, startUtc),
+      ))
+      .groupBy(booker, sql`date_trunc('day', ${scheduledMeetings.startTime} AT TIME ZONE 'UTC')`);
+
     // Per-rep emails (sent + received) by UTC day, split by direction.
     const emailRows = await db
       .select({
@@ -958,11 +1002,13 @@ router.get(
       emails: number; emailsInbound: number; emailsOutbound: number;
       sms: number; smsInbound: number; smsOutbound: number;
       meetings: number;
+      meetingsBooked: number; meetingsAttended: number; meetingsNoShow: number;
     };
     const zero = (): DayAgg => ({
       calls: 0, callsInbound: 0, callsOutbound: 0, connectedCalls: 0, voicemailCalls: 0,
       talkTime: 0, talkTimeInbound: 0, talkTimeOutbound: 0,
       emails: 0, emailsInbound: 0, emailsOutbound: 0, sms: 0, smsInbound: 0, smsOutbound: 0, meetings: 0,
+      meetingsBooked: 0, meetingsAttended: 0, meetingsNoShow: 0,
     });
     const agg = new Map<string, Map<string, DayAgg>>();
     const bucket = (userId: string, day: string): DayAgg => {
@@ -992,6 +1038,16 @@ router.get(
     for (const r of meetingRows) {
       if (!r.ownerId) continue;
       bucket(r.ownerId, r.day).meetings = Number(r.c);
+    }
+    for (const r of bookedRows) {
+      if (!r.userId) continue;
+      bucket(r.userId, r.day).meetingsBooked = Number(r.c);
+    }
+    for (const r of sitRows) {
+      if (!r.userId) continue;
+      const d = bucket(r.userId, r.day);
+      d.meetingsAttended = Number(r.attended);
+      d.meetingsNoShow = Number(r.noShow);
     }
 
     // Dense list of UTC day strings for the window.
@@ -1026,6 +1082,9 @@ router.get(
             smsOutbound: d?.smsOutbound ?? 0,
             linkedin: 0,
             meetings: d?.meetings ?? 0,
+            meetingsBooked: d?.meetingsBooked ?? 0,
+            meetingsAttended: d?.meetingsAttended ?? 0,
+            meetingsNoShow: d?.meetingsNoShow ?? 0,
             replies: (d?.emailsInbound ?? 0) + (d?.smsInbound ?? 0),
           };
         }),
