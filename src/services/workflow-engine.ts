@@ -217,11 +217,32 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         accounts.find((a) => a.isDefault) || accounts[0];
       // "Send as the user who triggered": prefer the actor's own mailbox;
       // fall back to the configured/default account when they have none.
+      let senderUserId: string | null = null;
       const actorSender = d.senderMode === "actor" && !!enr.triggeredBy;
       if (actorSender) {
         const own = accounts.filter((a) => a.userId === enr.triggeredBy);
         const actorAcc = own.find((a) => a.isDefault) || own[0];
-        if (actorAcc) account = actorAcc;
+        if (actorAcc) { account = actorAcc; senderUserId = enr.triggeredBy; }
+      }
+      // "Send as the host of the meeting": for meeting-triggered workflows (the
+      // enrollment carries context.meetingId), send from the rep who hosts that
+      // meeting — their host mailbox first, else any mailbox they own. Falls back
+      // to the configured/default account when there's no linked host mailbox.
+      if (d.senderMode === "meeting_host") {
+        const meetingId = (enr.context as Record<string, unknown> | null)?.meetingId;
+        if (typeof meetingId === "string" && meetingId) {
+          const [mtg] = await db
+            .select({ hostAccountId: scheduledMeetings.hostAccountId, hostUserId: scheduledMeetings.hostUserId })
+            .from(scheduledMeetings)
+            .where(eq(scheduledMeetings.id, meetingId));
+          if (mtg) {
+            const own = mtg.hostUserId ? accounts.filter((a) => a.userId === mtg.hostUserId) : [];
+            const hostAcc =
+              (mtg.hostAccountId ? accounts.find((a) => a.id === mtg.hostAccountId) : undefined) ||
+              own.find((a) => a.isDefault) || own[0];
+            if (hostAcc) { account = hostAcc; senderUserId = mtg.hostUserId ?? hostAcc.userId ?? null; }
+          }
+        }
       }
       try {
         if (account) {
@@ -233,7 +254,7 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
           const res = await sendEmailVia(account, { to: lead.email, subject, html: htmlWithSig, attachments });
           await db.insert(emailMessages).values({
             id: createId("em"), organizationId: orgId, accountId: account.id, leadId: lead.id,
-            funnelId: lead.funnelId, userId: actorSender ? enr.triggeredBy : null, direction: "outbound", fromEmail: account.email,
+            funnelId: lead.funnelId, userId: senderUserId, direction: "outbound", fromEmail: account.email,
             fromName: account.fromName || "", toEmail: lead.email, subject, bodyHtml: htmlWithSig,
             providerMessageId: res.providerMessageId, providerThreadId: res.providerThreadId,
             messageIdHeader: res.messageIdHeader, status: "sent", attachments: attachmentRefs, createdAt: new Date(),
