@@ -124,7 +124,7 @@ bookingPublicRouter.post(
 
     // Best-effort: attach to an existing lead by the booker's email.
     const [matchedLead] = await db
-      .select({ id: leads.id, funnelId: leads.funnelId })
+      .select({ id: leads.id, funnelId: leads.funnelId, ownerId: leads.ownerId })
       .from(leads)
       .innerJoin(funnels, eq(leads.funnelId, funnels.id))
       .where(and(eq(funnels.organizationId, orgId), sql`lower(${leads.email}) = ${email}`))
@@ -134,9 +134,10 @@ bookingPublicRouter.post(
     await db.insert(scheduledMeetings).values({
       id, organizationId: orgId, leadId: matchedLead?.id ?? null, funnelId: matchedLead?.funnelId ?? null,
       hostUserId: account.userId, hostAccountId: account.id, hostEmail: account.email,
-      // Self-serve booking — credit the assigned host; createdBy stays null so
-      // downstream can flag it as inbound.
-      bookedByUserId: account.userId,
+      // Self-serve booking — credit the REP WHO OWNS THE LEAD (the one who drove
+      // it) when known, else the assigned host. createdBy stays null so downstream
+      // can flag it as inbound.
+      bookedByUserId: matchedLead?.ownerId ?? account.userId,
       provider: created.provider, providerEventId: created.providerEventId,
       title: page.name, description: notes || null, startTime: start, endTime: end,
       joinUrl: created.joinUrl, location: null, attendees,

@@ -926,9 +926,10 @@ router.get(
       .groupBy(opportunities.ownerId, sql`date_trunc('day', ${opportunities.createdAt} AT TIME ZONE 'UTC')`);
 
     // Per-rep MEETINGS BOOKED through the Leadey booking flow, credited to the
-    // booker (COALESCE(created_by, host_user_id)), bucketed by the day it was
+    // booker — the canonical credited rep (booked_by_user_id), falling back to
+    // created_by / host for legacy rows; bucketed by the day it was
     // booked. Only confirmed bookings count.
-    const booker = sql<string>`coalesce(${scheduledMeetings.createdBy}, ${scheduledMeetings.hostUserId})`;
+    const booker = sql<string>`coalesce(${scheduledMeetings.bookedByUserId}, ${scheduledMeetings.createdBy}, ${scheduledMeetings.hostUserId})`;
     const bookedRows = await db
       .select({
         userId: booker,
