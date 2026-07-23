@@ -36,6 +36,7 @@ import {
 const KPI_CONFIG_KEY = "team_kpi_config";
 const DEPARTMENTS_KEY = "team_departments";
 const ANALYTICS_CARDS_KEY = "team_analytics_cards";
+const LEADERBOARD_COLS_KEY = "team_leaderboard_columns";
 
 // Seeded for orgs that haven't customised yet — mirrors the legacy "pods" so
 // existing member assignments keep resolving.
@@ -845,6 +846,46 @@ router.put(
     const cards = (body.cards as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 40);
     await upsertSetting(orgId, ANALYTICS_CARDS_KEY, JSON.stringify(cards));
     res.json({ data: { cards } });
+  }),
+);
+
+// ─── GET /team/leaderboard-columns ──────────────────────────────────
+// Org-wide leaderboard column layout ({ order, hidden }). Empty/absent → the
+// client falls back to its default column set.
+router.get(
+  "/team/leaderboard-columns",
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const raw = await getSetting(orgId, LEADERBOARD_COLS_KEY);
+    let prefs: { order: string[]; hidden: string[] } | null = null;
+    if (raw) {
+      try {
+        const p = JSON.parse(raw);
+        if (Array.isArray(p?.order) && Array.isArray(p?.hidden)) {
+          prefs = {
+            order: p.order.filter((x: unknown): x is string => typeof x === "string"),
+            hidden: p.hidden.filter((x: unknown): x is string => typeof x === "string"),
+          };
+        }
+      } catch { /* ignore malformed */ }
+    }
+    res.json({ data: { prefs } });
+  }),
+);
+
+// ─── PUT /team/leaderboard-columns ──────────────────────────────────
+// Replace the org-wide leaderboard layout (managers/admins only).
+router.put(
+  "/team/leaderboard-columns",
+  requirePerm("settings.manageTeam"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const body = req.body || {};
+    const order = Array.isArray(body.order) ? (body.order as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 60) : [];
+    const hidden = Array.isArray(body.hidden) ? (body.hidden as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 60) : [];
+    const prefs = { order, hidden };
+    await upsertSetting(orgId, LEADERBOARD_COLS_KEY, JSON.stringify(prefs));
+    res.json({ data: { prefs } });
   }),
 );
 
