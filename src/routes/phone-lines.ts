@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
-import { eq, and, desc, sql, ilike, isNotNull, gte, lte, or, count, inArray } from "drizzle-orm";
+import { eq, and, desc, sql, ilike, isNotNull, isNull, gte, lte, or, count, inArray } from "drizzle-orm";
 import multer from "multer";
 import { getAuth } from "@clerk/express";
 import twilioSdk from "twilio";
@@ -584,6 +584,7 @@ router.get(
     const hasRecording = req.query.hasRecording as string | undefined;
     const search = req.query.search as string | undefined;
     const disposition = req.query.disposition as string | undefined;
+    const outcome = req.query.outcome as string | undefined;
     const leadIdParam = req.query.leadId as string | undefined;
     const leadIdsParam = (req.query.leadIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
     const minDuration = req.query.minDuration ? parseInt(req.query.minDuration as string) : undefined;
@@ -608,6 +609,10 @@ router.get(
     if (recScope === "own") conditions.push(eq(callRecords.userId, meId));
     else if (userId) conditions.push(eq(callRecords.userId, userId));
     if (disposition) conditions.push(eq(callRecords.disposition, disposition));
+    if (outcome) {
+      // "none" → calls with no sales outcome set yet; else match the outcome key.
+      conditions.push(outcome === "none" ? isNull(callRecords.outcome) : eq(callRecords.outcome, outcome));
+    }
     if (hasRecording === "true") conditions.push(isNotNull(callRecords.recordingUrl));
     if (minDuration !== undefined && !Number.isNaN(minDuration)) conditions.push(gte(callRecords.duration, minDuration));
     if (maxDuration !== undefined && !Number.isNaN(maxDuration)) conditions.push(lte(callRecords.duration, maxDuration));
