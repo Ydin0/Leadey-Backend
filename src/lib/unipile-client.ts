@@ -1,6 +1,23 @@
 const RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 
+/** Extract a LinkedIn PUBLIC IDENTIFIER (the /in/<slug>) from a profile URL, so
+ *  it can be passed to Unipile's /users/{identifier} endpoint. A full URL is
+ *  rejected by Unipile (422 invalid_recipient). Tolerant of http/https, www,
+ *  trailing slashes, query strings, and already-bare identifiers/provider ids. */
+export function linkedinPublicIdentifier(input: string): string {
+  const s = (input || "").trim();
+  if (!s) return s;
+  const m = s.match(/\/in\/([^/?#]+)/i);
+  if (m) return decodeURIComponent(m[1]);
+  // Fall back to the last non-empty path segment for other /pub//profile forms.
+  if (/linkedin\.com/i.test(s)) {
+    const seg = s.replace(/[?#].*$/, "").replace(/\/+$/, "").split("/").filter(Boolean).pop();
+    if (seg && !/^(www\.)?linkedin\.com$/i.test(seg)) return decodeURIComponent(seg);
+  }
+  return s; // already a public identifier or provider id
+}
+
 export interface UnipileAccount {
   id: string;
   name: string;
@@ -127,9 +144,13 @@ export class UnipileClient {
 
   async resolveProfile(
     accountId: string,
-    linkedinUrl: string,
+    linkedinUrlOrId: string,
   ): Promise<UnipileProfile> {
-    const encoded = encodeURIComponent(linkedinUrl);
+    // Unipile's /users/{identifier} expects the LinkedIn PUBLIC IDENTIFIER (the
+    // /in/<slug> part) or a provider id — NOT a full profile URL. Passing the
+    // whole URL 422s ("invalid_recipient"), so extract the slug first.
+    const identifier = linkedinPublicIdentifier(linkedinUrlOrId);
+    const encoded = encodeURIComponent(identifier);
     return this.request<UnipileProfile>(
       "GET",
       `/users/${encoded}?account_id=${encodeURIComponent(accountId)}`,
