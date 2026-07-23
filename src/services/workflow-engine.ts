@@ -557,7 +557,15 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         await logRun(enr, node, "done", { action });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        await db.update(linkedinAccounts).set({ status: "error", lastError: msg.slice(0, 500), updatedAt: new Date() }).where(eq(linkedinAccounts.id, account.id));
+        // A PER-RECIPIENT failure (e.g. 422 invalid_recipient — a locked/invalid
+        // profile) must NOT take the whole account offline; only a genuine
+        // account/session failure (auth dead, checkpoint, disconnected) marks the
+        // account "error" (which reconnection clears). Otherwise just fail the step
+        // so the next lead still sends.
+        const accountLevel = /\b(401|403)\b|unauthorized|disconnected|checkpoint|credential|reconnect|session (expired|invalid)|account.*(not connected|disconnected|expired)/i.test(msg);
+        if (accountLevel) {
+          await db.update(linkedinAccounts).set({ status: "error", lastError: msg.slice(0, 500), updatedAt: new Date() }).where(eq(linkedinAccounts.id, account.id));
+        }
         await logRun(enr, node, "failed", { error: msg });
       }
       return;
