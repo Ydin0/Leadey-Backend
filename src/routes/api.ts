@@ -653,6 +653,48 @@ router.get(
   }),
 );
 
+// ─── GET /funnels/:funnelId/leads/:leadId/timeline ───────────────────────
+// The focused lead's activity timeline — the lead + its company's contacts'
+// events, keyed by leadId. Lightweight (one indexed events query); replaces the
+// old pattern of reloading the ENTIRE funnel (all leads) just to get one lead's
+// events. The leads-list payload the profile already has supplies everything
+// else; this only fills in the events.
+router.get(
+  "/funnels/:funnelId/leads/:leadId/timeline",
+  asyncHandler<LeadAdvanceParams>(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [lead] = await db
+      .select({ id: leads.id, company: leads.company, funnelId: leads.funnelId })
+      .from(leads)
+      .innerJoin(funnels, eq(leads.funnelId, funnels.id))
+      .where(and(eq(leads.id, req.params.leadId), eq(funnels.id, req.params.funnelId), eq(funnels.organizationId, orgId)));
+    if (!lead) throw new ApiError(404, "Lead not found");
+
+    // The lead-profile timeline aggregates the whole company, so gather every
+    // contact of the same company in this funnel, then their events in one query.
+    const companyKey = (lead.company || "").trim().toLowerCase();
+    const groupRows = companyKey
+      ? await db.select({ id: leads.id }).from(leads).where(and(eq(leads.funnelId, lead.funnelId), sql`lower(${leads.company}) = ${companyKey}`))
+      : [{ id: lead.id }];
+    const groupIds = groupRows.map((r) => r.id);
+
+    const evRows = await db
+      .select()
+      .from(leadEvents)
+      .where(inArray(leadEvents.leadId, groupIds))
+      .orderBy(asc(leadEvents.timestamp));
+
+    const byLead: Record<string, unknown[]> = {};
+    for (const e of evRows) {
+      (byLead[e.leadId] ??= []).push({
+        id: e.id, type: e.type, outcome: e.outcome, stepIndex: e.stepIndex,
+        meta: e.meta, timestamp: e.timestamp.toISOString(),
+      });
+    }
+    res.json({ data: { events: byLead } });
+  }),
+);
+
 // ─── GET /funnels/:funnelId/leads ────────────────────────────────────────
 
 router.get(
