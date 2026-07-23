@@ -42,7 +42,7 @@ export type TriggerType =
   // Org-level triggers (workflows with funnelId = null):
   | "meeting_upcoming" | "opportunity_created" | "opportunity_stage_changed" | "opportunity_won" | "opportunity_lost"
   // Sweeper-driven enrollment triggers:
-  | "matches_smart_view" | "date_field";
+  | "matches_smart_view" | "date_field" | "connection_accepted";
 export function triggerTypeFromLabel(label: string): TriggerType {
   switch (label) {
     case "Status changes": return "status_changed";
@@ -56,6 +56,7 @@ export function triggerTypeFromLabel(label: string): TriggerType {
     case "Opportunity lost": return "opportunity_lost";
     case "Matches a smart view": return "matches_smart_view";
     case "Date reaches": return "date_field";
+    case "Connection accepted": return "connection_accepted";
     case "Manually added": return "manual";
     default: return "lead_enters_campaign";
   }
@@ -539,12 +540,22 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         const tokens = await leadTokens(lead, orgId, enr.context as Record<string, unknown>);
         const message = renderTokens(String(d.message || ""), tokens);
 
+        const { recordLinkedinInvitation, recordLinkedinMessage } = await import("../lib/linkedin-store");
         if (action === "visit") {
           await client.resolveProfile(uaId, lead.linkedinUrl);
         } else if (action === "message") {
-          await client.sendMessage(uaId, providerId, message || `Hi ${lead.name.split(" ")[0]}`);
+          const body = message || `Hi ${lead.name.split(" ")[0]}`;
+          const chat = await client.sendMessage(uaId, providerId, body);
+          await recordLinkedinMessage({
+            organizationId: orgId, accountId: account.id, unipileAccountId: uaId, leadId: lead.id,
+            providerId, chatId: chat?.chat_id ?? null, direction: "outbound", text: body,
+          });
         } else {
           await client.sendInvitation(uaId, providerId, message || undefined);
+          await recordLinkedinInvitation({
+            organizationId: orgId, accountId: account.id, unipileAccountId: uaId, userId: account.userId,
+            leadId: lead.id, providerId, name: lead.name, message: message || null,
+          });
         }
         await recordExecution(uaId, rlAction);
         if (account.status === "error") {

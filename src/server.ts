@@ -11,6 +11,8 @@ import { startMeetingWorkflowSweeper } from "./services/meeting-workflow-sweeper
 import { startSmartViewSweeper } from "./services/smartview-sweeper";
 import { startDateFieldSweeper } from "./services/datefield-sweeper";
 import { startDialerCleanup } from "./services/dialer-cleanup";
+import { startLinkedinAcceptSweeper } from "./services/linkedin-accept-sweeper";
+import { startLinkedinSync } from "./services/linkedin-sync";
 
 const PORT = process.env.PORT || 3001;
 
@@ -28,6 +30,8 @@ const server = app.listen(PORT, () => {
   startSmartViewSweeper();
   startDateFieldSweeper();
   startDialerCleanup();
+  startLinkedinAcceptSweeper();
+  startLinkedinSync();
 });
 
 // Keep sockets alive LONGER than Railway's edge proxy idle timeout (~60s):

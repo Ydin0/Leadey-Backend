@@ -313,9 +313,19 @@ router.post(
     } else if (action === "send_connection") {
       const message = step.emailBody || undefined;
       await client.sendInvitation(accountId, providerId, message);
+      const { recordLinkedinInvitation } = await import("../lib/linkedin-store");
+      await recordLinkedinInvitation({
+        organizationId: orgId, unipileAccountId: accountId, leadId: lead.id,
+        providerId, name: lead.name, message: message ?? null,
+      });
     } else if (action === "send_message") {
       const text = step.emailBody || `Hi ${lead.name.split(" ")[0]}, wanted to connect.`;
-      await client.sendMessage(accountId, providerId, text);
+      const chat = await client.sendMessage(accountId, providerId, text);
+      const { recordLinkedinMessage } = await import("../lib/linkedin-store");
+      await recordLinkedinMessage({
+        organizationId: orgId, unipileAccountId: accountId, leadId: lead.id,
+        providerId, chatId: chat?.chat_id ?? null, direction: "outbound", text,
+      });
     }
 
     // 7. Record rate limit

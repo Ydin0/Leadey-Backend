@@ -96,3 +96,7 @@ export { emailSignatures } from "./email-signatures";
 export { inboxReadState } from "./inbox-read-state";
 
 export { memberSignatureDetails } from "./member-signature-details";
+
+export { linkedinMessages } from "./linkedin-messages";
+
+export { linkedinInvitations } from "./linkedin-invitations";

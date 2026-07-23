@@ -31,6 +31,32 @@ export interface UnipileProfile {
   last_name: string;
   headline: string;
   public_identifier: string;
+  /** Relationship to the connected account — used to detect an accepted
+   *  connection request. Unipile returns these on the profile. */
+  is_relationship?: boolean;
+  network_distance?: string; // e.g. "FIRST_DEGREE" | "DISTANCE_1" | "OUT_OF_NETWORK"
+}
+
+/** One LinkedIn chat (conversation) as returned by Unipile's /chats. */
+export interface UnipileChat {
+  id: string;
+  account_id?: string;
+  /** Other party's provider ids on this chat. */
+  attendee_provider_id?: string;
+  attendees?: { provider_id?: string; name?: string }[];
+  name?: string;
+}
+
+/** One message within a chat. */
+export interface UnipileMessage {
+  id: string;
+  chat_id?: string;
+  text?: string;
+  is_sender?: boolean; // true = sent by the connected account
+  sender_id?: string;
+  sender_attendee_id?: string;
+  timestamp?: string;
+  created_at?: string;
 }
 
 export interface UnipileInviteResult {
@@ -182,6 +208,24 @@ export class UnipileClient {
       text,
       attendees_ids: [providerId],
     });
+  }
+
+  /** List the account's chats (conversations), newest first. */
+  async listChats(accountId: string, limit = 50): Promise<UnipileChat[]> {
+    const result = await this.request<{ items?: UnipileChat[] }>(
+      "GET",
+      `/chats?account_id=${encodeURIComponent(accountId)}&limit=${limit}`,
+    );
+    return result.items || [];
+  }
+
+  /** List messages in a chat, newest first. */
+  async listChatMessages(chatId: string, limit = 50): Promise<UnipileMessage[]> {
+    const result = await this.request<{ items?: UnipileMessage[] }>(
+      "GET",
+      `/chats/${encodeURIComponent(chatId)}/messages?limit=${limit}`,
+    );
+    return result.items || [];
   }
 
   async getAccount(accountId: string): Promise<UnipileAccount> {

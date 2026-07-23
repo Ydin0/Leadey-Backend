@@ -5,6 +5,7 @@ import { db } from "../db";
 import { leadTasks } from "../db/schema/lead-tasks";
 import { callRecords } from "../db/schema/call-records";
 import { smsMessages } from "../db/schema/sms";
+import { linkedinMessages } from "../db/schema/linkedin-messages";
 import { inboxReadState } from "../db/schema/inbox-read-state";
 import { leads, leadEvents } from "../db/schema/leads";
 import { funnels } from "../db/schema/funnels";
@@ -93,13 +94,30 @@ async function needsReplySms(orgId: string, lineIds?: string[]) {
   return [...seen.values()].filter((r) => r.msg.direction === "inbound");
 }
 
+/** LinkedIn conversations (last 30d) whose most-recent message is inbound →
+ *  awaiting a reply. Grouped by the counterparty provider id. */
+async function linkedinNeedsReply(orgId: string): Promise<number> {
+  const since = new Date(Date.now() - 30 * DAY);
+  const rows = await db
+    .select({ providerId: linkedinMessages.providerId, direction: linkedinMessages.direction })
+    .from(linkedinMessages)
+    .where(and(eq(linkedinMessages.organizationId, orgId), gte(linkedinMessages.createdAt, since)))
+    .orderBy(desc(linkedinMessages.createdAt))
+    .limit(4000);
+  const latest = new Map<string, string>(); // providerId → latest direction
+  for (const r of rows) if (!latest.has(r.providerId)) latest.set(r.providerId, r.direction);
+  let n = 0;
+  for (const dir of latest.values()) if (dir === "inbound") n++;
+  return n;
+}
+
 // ─── GET /inbox/counts ──────────────────────────────────────────────
 router.get(
   "/inbox/counts",
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const userId = getAuth(req)?.userId || null;
-    if (!userId) { res.json({ data: { tasks: 0, reminders: 0, calls: 0, messages: 0, emails: 0, potential: 0, total: 0 } }); return; }
+    if (!userId) { res.json({ data: { tasks: 0, reminders: 0, calls: 0, messages: 0, linkedin: 0, emails: 0, potential: 0, total: 0 } }); return; }
     // Optional line filter — scopes the calls + messages counts (not tasks/emails)
     // so the Missed Calls / Messages tab badges track the inbox's Numbers filter.
     const lineIds = (req.query.lineIds as string | undefined)?.split(",").map((s) => s.trim()).filter(Boolean);
@@ -111,12 +129,13 @@ router.get(
       .from(inboxReadState)
       .where(eq(inboxReadState.userId, userId));
 
-    const [tasks, calls, sms, potential, emails] = await Promise.all([
+    const [tasks, calls, sms, potential, emails, linkedin] = await Promise.all([
       dueTasksForUser(orgId, userId),
       callbacksForOrg(orgId, lineIds, readState?.callsSeenAt ?? null),
       needsReplySms(orgId, lineIds),
       potentialContacts(orgId),
       unreadEmailThreadCount(orgId),
+      linkedinNeedsReply(orgId),
     ]);
     const reminders = tasks.filter((t) => t.task.category === "reminder").length;
     const counts = {
@@ -124,9 +143,10 @@ router.get(
       reminders,
       calls: calls.length,
       messages: sms.length,
+      linkedin,
       emails,
       potential: potential.length,
-      total: tasks.length + calls.length + sms.length + potential.length + emails,
+      total: tasks.length + calls.length + sms.length + potential.length + emails + linkedin,
     };
     res.json({ data: counts });
   }),
