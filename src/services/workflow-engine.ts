@@ -358,7 +358,8 @@ async function runAction(enr: Enrollment, node: WorkflowNode, lead: Lead): Promi
         stepIndex: 0, meta: { source: "workflow", from: lead.status }, timestamp: new Date(),
       });
       await logRun(enr, node, "done", { status: key });
-      void fireTriggerForLead(lead.id, "status_changed", { status: key, actorUserId: enr.triggeredBy }); // chain status-change workflows
+      void fireTriggerForLead(lead.id, "status_changed", { status: key, actorUserId: enr.triggeredBy }); // chain campaign status-change workflows
+      void fireOrgTrigger(orgId, lead.id, "status_changed", { status: key, actorUserId: enr.triggeredBy }); // + org-level ones
       return;
     }
     case "tag": {
@@ -796,6 +797,12 @@ export async function fireOrgTrigger(
           const wantStage = String(tdata.toStageId || "").trim();
           if (wantStage && ctx?.stageId !== wantStage) continue;
         }
+      }
+      // Status-change trigger: only enroll when the lead moved to the configured
+      // status (empty = any status change).
+      if (type === "status_changed") {
+        const want = String(tdata.statusTo || "").trim();
+        if (want && ctx?.status !== want) continue;
       }
       await enrollInto(wf, ids, ctx?.actorUserId ?? null, ctx?.context);
     }

@@ -95,7 +95,7 @@ import { getSetting, getSmartleadApiKey } from "../lib/settings-service";
 import { getMergedLeadStatuses } from "../lib/lead-status-config";
 import { getCustomFieldsForLeads, setLeadCustomFields, setLeadCustomFieldsBatch, ensureFieldDefinition } from "../lib/custom-fields-service";
 import { createTtlCache } from "../lib/ttl-cache";
-import { fireTrigger } from "../services/workflow-engine";
+import { fireTrigger, fireOrgTrigger } from "../services/workflow-engine";
 import { getOrgId } from "../lib/auth";
 import { flagDoNotCall } from "../lib/dnc";
 import { TheirStackClient, type TheirStackJob, type TheirStackCompanyRecord } from "../lib/theirstack-client";
@@ -1796,7 +1796,10 @@ router.patch(
 
     // Enroll into any active "status changes" workflows (fire-and-forget) —
     // pass the new status so a "changes to X" trigger only fires on a match.
-    void fireTrigger(orgId, funnel.id, lead.id, "status_changed", { status, actorUserId: getAuth(req as unknown as Request)?.userId ?? null });
+    // Fire both campaign-scoped and org-level workflows for this lead.
+    const statusActor = getAuth(req as unknown as Request)?.userId ?? null;
+    void fireTrigger(orgId, funnel.id, lead.id, "status_changed", { status, actorUserId: statusActor });
+    void fireOrgTrigger(orgId, lead.id, "status_changed", { status, actorUserId: statusActor });
 
     res.json({ data: { id: lead.id, status, company: lead.company } });
   }),
