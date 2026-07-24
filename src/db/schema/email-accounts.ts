@@ -52,6 +52,10 @@ export const emailAccounts = pgTable(
     imapUid: integer("imap_uid"),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
     lastError: text("last_error"),
+    /** Consecutive poll failures. Reset to 0 on any successful sync; once it
+     *  crosses the auth-failure threshold the poller flips status to
+     *  "disconnected" so it stops retrying a dead token every cycle. */
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

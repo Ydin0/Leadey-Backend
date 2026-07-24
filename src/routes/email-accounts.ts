@@ -86,6 +86,9 @@ function serializeAccount(a: typeof emailAccounts.$inferSelect) {
     signature: a.signature ?? null,
     signatureId: a.signatureId ?? null,
     status: a.status,
+    /** Reason surfaced to the UI when status isn't "active" (drives the
+     *  reconnect prompt). Null when healthy. */
+    lastError: a.status === "active" ? null : a.lastError ?? null,
     isDefault: a.isDefault,
     /** True when this account's token can create calendar events (host a
      *  meeting). Older send-only connections are false until reconnected. */
@@ -752,7 +755,7 @@ publicRouter.get(
       if (existing[0]) {
         await db
           .update(emailAccounts)
-          .set({ provider: cfg.providerKey, fromName: name || existing[0].fromName, status: "active", encryptedTokens: tokens, lastError: null, updatedAt: new Date() })
+          .set({ provider: cfg.providerKey, fromName: name || existing[0].fromName, status: "active", encryptedTokens: tokens, lastError: null, consecutiveFailures: 0, updatedAt: new Date() })
           .where(eq(emailAccounts.id, existing[0].id));
         // Re-arm the disconnect alert for a future auth failure.
         const { clearEmailClaim } = await import("../lib/system-emails");

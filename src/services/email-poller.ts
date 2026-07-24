@@ -2,6 +2,7 @@ import { eq, and, or, inArray, desc, sql } from "drizzle-orm";
 import { db } from "../db";
 import { emailAccounts, emailMessages } from "../db/schema/email-accounts";
 import { leadEvents, leads } from "../db/schema/leads";
+import { users } from "../db/schema/organizations";
 import { createId } from "../lib/helpers";
 import { fetchNewMessages, type InboundMessage } from "../lib/email-providers";
 import { suppressEmail } from "../lib/suppression";
@@ -9,6 +10,18 @@ import { createNotification } from "../routes/notifications";
 import { fireTrigger, notifyWorkflowEvent } from "./workflow-engine";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
+
+// Auth failures that will never fix themselves without the user reconnecting
+// (revoked/deleted/expired OAuth token, bad credentials). Retrying these every
+// cycle just spams the logs and wastes work.
+const AUTH_ERROR_RE =
+  /invalid[_ ]?grant|unauthor|token|expired|revoked|deleted|reconnect|\b401\b|invalid credentials|permission|refresh failed/i;
+// Disconnect after this many consecutive AUTH failures (≈ this × 2min to react
+// to a genuinely dead mailbox, while surviving a transient blip or two).
+const AUTH_FAIL_LIMIT = 3;
+// Safety cap: disconnect after this many consecutive failures of ANY kind, so a
+// persistently-broken account can't retry forever.
+const MAX_FAIL_LIMIT = 12;
 
 // A reply asking to stop receiving mail — honored as an unsubscribe.
 const STOP_RE = /\bunsubscribe\b|\bopt[\s.-]?out\b|remove me|(^|\n)\s*stop\b/i;
@@ -179,10 +192,10 @@ async function pollAccount(account: typeof emailAccounts.$inferSelect): Promise<
     }
   }
 
-  // Advance the per-account sync cursor + clear any prior error.
+  // Advance the per-account sync cursor + clear any prior error/failure streak.
   await db
     .update(emailAccounts)
-    .set({ ...cursor, lastSyncedAt: new Date(), status: "active", lastError: null, updatedAt: new Date() })
+    .set({ ...cursor, lastSyncedAt: new Date(), status: "active", lastError: null, consecutiveFailures: 0, updatedAt: new Date() })
     .where(eq(emailAccounts.id, account.id));
 }
 
@@ -198,12 +211,49 @@ async function pollAll(): Promise<void> {
     try {
       await pollAccount(account);
     } catch (err: any) {
-      console.error(`[email-poller] account ${account.email} failed:`, err?.message || err);
+      const msg = String(err?.message || err);
+      const fails = (account.consecutiveFailures ?? 0) + 1;
+      const isAuth = AUTH_ERROR_RE.test(msg);
+      // Disconnect a dead mailbox: repeated auth failures (token revoked/
+      // deleted/expired), or too many failures of any kind. This drops it from
+      // the active poll set so we stop retrying + spamming logs every cycle.
+      const shouldDisconnect = (isAuth && fails >= AUTH_FAIL_LIMIT) || fails >= MAX_FAIL_LIMIT;
+
       await db
         .update(emailAccounts)
-        .set({ lastError: String(err?.message || err), updatedAt: new Date() })
+        .set({
+          lastError: msg,
+          consecutiveFailures: fails,
+          status: shouldDisconnect ? "disconnected" : account.status,
+          updatedAt: new Date(),
+        })
         .where(eq(emailAccounts.id, account.id))
         .catch(() => {});
+
+      if (shouldDisconnect) {
+        console.warn(`[email-poller] disconnected ${account.email} after ${fails} failures: ${msg}`);
+        // Email the mailbox owner a "reconnect" prompt. Idempotent per account
+        // via claimOnce in system-emails; re-armed when they reconnect (OAuth
+        // callback clears the claim), so a future disconnect alerts again.
+        try {
+          const [owner] = await db
+            .select({ email: users.email })
+            .from(users)
+            .where(eq(users.id, account.userId));
+          const { notifyMailboxDisconnected } = await import("../lib/system-emails");
+          await notifyMailboxDisconnected({
+            accountId: account.id,
+            userEmail: owner?.email ?? null,
+            mailbox: account.email,
+            provider: account.provider,
+            lastError: msg,
+          });
+        } catch (notifyErr) {
+          console.error("[email-poller] disconnect notify failed:", notifyErr);
+        }
+      } else {
+        console.error(`[email-poller] account ${account.email} failed (${fails}/${isAuth ? AUTH_FAIL_LIMIT : MAX_FAIL_LIMIT}):`, msg);
+      }
     }
   }
 }

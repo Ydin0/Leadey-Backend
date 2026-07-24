@@ -1,0 +1,1 @@
+ALTER TABLE "email_accounts" ADD COLUMN IF NOT EXISTS "consecutive_failures" integer DEFAULT 0 NOT NULL;
