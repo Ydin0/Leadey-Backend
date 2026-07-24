@@ -310,6 +310,7 @@ router.get(
         return {
           id: pud.user_id || row.id,
           email: pud.identifier || row.email || "",
+          phone: row.phone ?? null,
           firstName: pud.first_name ?? row.firstName ?? null,
           lastName: pud.last_name ?? row.lastName ?? null,
           imageUrl: pud.image_url ?? row.imageUrl ?? null,
