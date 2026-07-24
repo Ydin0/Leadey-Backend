@@ -11,13 +11,19 @@ const EXEMPT_PATHS = ["/api/billing", "/api/admin"];
 
 export function planGuard() {
   return async (req: Request, res: Response, next: NextFunction) => {
+    // Full path incl. the router mount prefix. When this middleware is mounted
+    // via app.use("/api", ...), Express strips "/api" from req.path, so we
+    // rebuild it from baseUrl to match EXEMPT_PATHS reliably (billing checkout
+    // MUST stay reachable — otherwise the payment wall blocks its own checkout).
+    const fullPath = (req.baseUrl || "") + req.path;
+
     // Skip for exempt paths
-    if (EXEMPT_PATHS.some((p) => req.path.startsWith(p))) {
+    if (EXEMPT_PATHS.some((p) => fullPath.startsWith(p))) {
       return next();
     }
 
     // Skip for GET requests to settings (always allow viewing)
-    if (req.method === "GET" && req.path.startsWith("/api/settings")) {
+    if (req.method === "GET" && fullPath.startsWith("/api/settings")) {
       return next();
     }
 
