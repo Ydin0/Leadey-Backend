@@ -51,9 +51,11 @@ router.get(
     // linked), not just trials.
     if (org.stripeCustomerId && !org.stripeSubscriptionId) {
       try {
-        const subs = await stripe.subscriptions.list({ customer: org.stripeCustomerId, status: "active", limit: 1 });
-        if (subs.data.length > 0) {
-          const sub = subs.data[0] as any;
+        // Adopt an active OR trialing subscription (the signup free-trial creates
+        // a `trialing` one) — heals a missed checkout/subscription webhook.
+        const subs = await stripe.subscriptions.list({ customer: org.stripeCustomerId, status: "all", limit: 5 });
+        const sub = subs.data.find((s: any) => s.status === "active" || s.status === "trialing") as any;
+        if (sub) {
           const priceId = sub.items?.data?.[0]?.price?.id || "";
           const plan = getPlanFromPriceId(priceId);
           const planConfig = getPlanConfig(plan);
@@ -64,7 +66,9 @@ router.get(
             stripeSubscriptionId: sub.id,
             stripePriceId: priceId,
             plan,
-            planStatus: "active",
+            planStatus: sub.status === "trialing" ? "trialing" : "active",
+            trialEndsAt: sub.trial_end ? new Date(sub.trial_end * 1000) : org.trialEndsAt,
+            cardSetupRequired: false,
             currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
             seatsIncluded: seats,
             creditsIncluded: planConfig.scraperCredits * seats,
@@ -73,7 +77,7 @@ router.get(
 
           // Re-fetch updated org
           [org] = await db.select().from(organizations).where(eq(organizations.id, orgId));
-          console.log(`[Billing] Auto-synced org ${orgId} to ${plan} plan`);
+          console.log(`[Billing] Auto-synced org ${orgId} to ${plan} plan (${sub.status})`);
         }
       } catch (err) {
         console.error("[Billing] Auto-sync failed:", err);
@@ -95,6 +99,10 @@ router.get(
         currentPeriodEnd: org.currentPeriodEnd?.toISOString() || null,
         stripeCustomerId: org.stripeCustomerId,
         stripeSubscriptionId: org.stripeSubscriptionId,
+        // Signup payment wall: the org must add a card + start a trial sub
+        // before using the app. True only for orgs flagged at creation with
+        // no subscription yet; drives the frontend gate + /start-trial page.
+        needsPaymentSetup: !!org.cardSetupRequired && !org.stripeSubscriptionId,
         discountPct: org.discountPct ?? 0,
         // Limits — use actual org values from DB, not plan defaults
         seatsIncluded: org.seatsIncluded,
@@ -124,7 +132,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const orgId = getOrgId(req);
     const auth = getAuth(req);
-    const { priceId, seats, successUrl, cancelUrl } = req.body;
+    const { priceId, seats, successUrl, cancelUrl, trial } = req.body;
 
     if (!priceId) throw new ApiError(400, "priceId is required");
 
@@ -144,6 +152,14 @@ router.post(
     const config = getPlanConfig(plan);
     const seatCount = seats || config.seats;
 
+    // Signup free trial: capture the card and start a 30-day Stripe trial that
+    // auto-charges at the end. Only the /start-trial wall passes trial:true;
+    // the in-app upgrade buttons omit it → immediate paid subscription.
+    const trialDays = trial ? 30 : undefined;
+    const cancelFallback = trial
+      ? `${appOrigin()}/start-trial`
+      : `${appOrigin()}/dashboard/settings?tab=billing`;
+
     const url = await createCheckoutSession(
       orgId,
       org.name,
@@ -151,8 +167,9 @@ router.post(
       priceId,
       seatCount,
       successUrl || `${appOrigin()}/dashboard/settings/billing-success`,
-      cancelUrl || `${appOrigin()}/dashboard/settings?tab=billing`,
+      cancelUrl || cancelFallback,
       org.discountPct ?? 0,
+      { trialDays },
     );
 
     res.json({ data: { url } });
@@ -561,6 +578,31 @@ router.get(
         billingVat: org.billingVat,
       },
     });
+  }),
+);
+
+// ─── POST /billing/cancel ────────────────────────────────────────────
+// Cancel the org's subscription at the end of the current period. During a
+// trial this means: no charge at day 30, but access continues until then.
+// Stripe emits subscription.updated (cancel_at_period_end) now and
+// subscription.deleted at period end — both handled by the webhook, which
+// writes the org's plan/planStatus. Reversible via the Stripe Billing Portal.
+router.post(
+  "/billing/cancel",
+  requirePerm("settings.manageBilling"),
+  asyncHandler(async (req, res) => {
+    const orgId = getOrgId(req);
+    const [org] = await db.select().from(organizations).where(eq(organizations.id, orgId));
+    if (!org) throw new ApiError(404, "Organization not found");
+    if (!org.stripeSubscriptionId) throw new ApiError(400, "No active subscription to cancel");
+
+    const sub = (await stripe.subscriptions.update(org.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    })) as any;
+
+    // Access-until: the trial end while trialing, otherwise the period end.
+    const endsAtMs = (sub.trial_end || sub.current_period_end || 0) * 1000 || null;
+    res.json({ data: { cancelAtPeriodEnd: true, accessUntil: endsAtMs ? new Date(endsAtMs).toISOString() : null } });
   }),
 );
 

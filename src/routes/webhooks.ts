@@ -481,6 +481,10 @@ router.post("/clerk", async (req: Request, res: Response) => {
           plan: "trial",
           planStatus: "trialing",
           trialEndsAt: new Date(Date.now() + 30 * 86400000), // 30-day trial
+          // New orgs must add a card + start a Stripe trial subscription before
+          // using the app (signup payment wall). Cleared once a subscription is
+          // attached. The trialEndsAt above is just a pre-card display default.
+          cardSetupRequired: true,
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),
         });
@@ -1555,6 +1559,9 @@ router.post("/stripe", async (req: Request, res: Response) => {
             .from(organizations)
             .where(eq(organizations.id, orgId));
           const seats = Math.max(1, quantity + (orgRow?.adj ?? 0));
+          // A signup free-trial checkout creates a `trialing` subscription — keep
+          // it trialing until Stripe charges (day 30), don't force "active".
+          const isTrialing = sub.status === "trialing";
 
           await db
             .update(organizations)
@@ -1563,7 +1570,10 @@ router.post("/stripe", async (req: Request, res: Response) => {
               stripeSubscriptionId: subscriptionId as string,
               stripePriceId: priceId,
               plan,
-              planStatus: "active",
+              planStatus: isTrialing ? "trialing" : "active",
+              trialEndsAt: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+              // Card is now on file → clear the signup payment wall.
+              cardSetupRequired: false,
               currentPeriodEnd: new Date(sub.current_period_end * 1000),
               seatsIncluded: seats,
               creditsIncluded: config.scraperCredits * seats,
@@ -1571,7 +1581,7 @@ router.post("/stripe", async (req: Request, res: Response) => {
             })
             .where(eq(organizations.id, orgId));
 
-          console.log(`[Stripe] Org ${orgId} subscribed to ${plan} with ${quantity} paid seats (effective ${seats})`);
+          console.log(`[Stripe] Org ${orgId} subscribed to ${plan} (${sub.status}) with ${quantity} paid seats (effective ${seats})`);
         }
         break;
       }
@@ -1614,6 +1624,10 @@ router.post("/stripe", async (req: Request, res: Response) => {
             stripePriceId: priceId,
             plan,
             planStatus: statusMap[sub.status] || "active",
+            // trial_end is set while trialing, null once Stripe charges → active.
+            trialEndsAt: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+            // A live subscription exists → the signup payment wall is satisfied.
+            cardSetupRequired: false,
             currentPeriodEnd: new Date(sub.current_period_end * 1000),
             seatsIncluded: seats,
             creditsIncluded: config.scraperCredits * seats,
@@ -1646,7 +1660,13 @@ router.post("/stripe", async (req: Request, res: Response) => {
 
       case "customer.subscription.deleted": {
         const sub = event.data.object;
-        const orgId = sub.metadata?.orgId;
+        let orgId = sub.metadata?.orgId;
+        // Fallback: find org by stripeCustomerId (metadata may be absent).
+        if (!orgId && sub.customer) {
+          const [org] = await db.select({ id: organizations.id }).from(organizations)
+            .where(eq(organizations.stripeCustomerId, sub.customer as string));
+          if (org) orgId = org.id;
+        }
         if (!orgId) break;
 
         await db
@@ -1666,6 +1686,25 @@ router.post("/stripe", async (req: Request, res: Response) => {
           key: sub.id || `${orgId}:${sub.canceled_at || Date.now()}`,
           accessUntilMs: sub.current_period_end ? sub.current_period_end * 1000 : null,
         });
+        break;
+      }
+
+      // Stripe fires this ~3 days before a trial converts to paid. Send the
+      // branded "trial ending" email (belt-and-braces alongside the sweeper;
+      // idempotent via claimOnce in system-emails).
+      case "customer.subscription.trial_will_end": {
+        const sub = event.data.object;
+        let orgId = sub.metadata?.orgId;
+        if (!orgId && sub.customer) {
+          const [org] = await db.select({ id: organizations.id }).from(organizations)
+            .where(eq(organizations.stripeCustomerId, sub.customer as string));
+          if (org) orgId = org.id;
+        }
+        if (!orgId || !sub.trial_end) break;
+        const endMs = sub.trial_end * 1000;
+        const daysLeft = Math.max(1, Math.ceil((endMs - Date.now()) / 86400000));
+        const { notifyTrialEnding } = await import("../lib/system-emails");
+        await notifyTrialEnding({ orgId, daysLeft, endDateMs: endMs });
         break;
       }
 

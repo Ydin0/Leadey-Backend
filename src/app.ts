@@ -132,6 +132,13 @@ app.use("/v1", requireApiKeyAuth, v1Router);
 // it doesn't affect global admin endpoints.)
 app.use("/api", requireAuth(), requireOrgMembership);
 
+// Plan enforcement for every authenticated /api route: blocks mutating requests
+// when the org's trial has expired / payment is overdue / subscription is
+// cancelled, and — for new signups — until a card is on file (signup payment
+// wall, code PAYMENT_SETUP_REQUIRED). GETs stay allowed; /api/billing +
+// /api/admin are exempt internally. A single indexed PK lookup per request.
+app.use("/api", planGuard());
+
 app.use("/api", dashboardRouter);
 app.use("/api", leadsRouter);
 app.use("/api", apiRouter);
@@ -152,8 +159,8 @@ app.use("/api", emailSuppressionsRouter);
 app.use("/api", masterRouter);
 app.use("/api", teamRouter);
 app.use("/api", apiKeysRouter);
-app.use("/api", planGuard(), contactsRouter);
-app.use("/api", planGuard(), templatesRouter);
+app.use("/api", contactsRouter);
+app.use("/api", templatesRouter);
 app.use("/api", dialerRouter);
 app.use("/api", opportunitiesRouter);
 app.use("/api", leadTasksRouter);

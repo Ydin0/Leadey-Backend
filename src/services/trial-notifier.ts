@@ -12,10 +12,18 @@ const DAY_MS = 86_400_000;
 
 async function sweep(): Promise<void> {
   try {
+    // Trials are now Stripe-owned: an org is trialing when it has a trialing
+    // subscription (card on file) with a trial_end (mirrored into trialEndsAt).
+    // Orgs still in the pre-card `plan="trial"` state have no subscription and
+    // are gated by the payment wall, so they're intentionally excluded here.
     const rows = await db
       .select({ id: organizations.id, trialEndsAt: organizations.trialEndsAt })
       .from(organizations)
-      .where(and(eq(organizations.plan, "trial"), isNotNull(organizations.trialEndsAt)));
+      .where(and(
+        eq(organizations.planStatus, "trialing"),
+        isNotNull(organizations.stripeSubscriptionId),
+        isNotNull(organizations.trialEndsAt),
+      ));
 
     const now = Date.now();
     for (const org of rows) {

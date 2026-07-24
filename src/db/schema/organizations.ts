@@ -12,6 +12,12 @@ export const organizations = pgTable("organizations", {
   plan: text("plan").notNull().default("trial"), // trial | starter | growth | scale | cancelled
   planStatus: text("plan_status").notNull().default("trialing"), // active | trialing | past_due | cancelled
   trialEndsAt: timestamp("trial_ends_at", { withTimezone: true }),
+  /** Signup payment wall: TRUE for orgs created after the card-on-file trial
+   *  shipped. While TRUE and there is no stripeSubscriptionId, the org must
+   *  add a card before using the app (see plan-guard + the frontend gate).
+   *  Cleared to FALSE once a Stripe subscription is attached. Existing orgs
+   *  were backfilled FALSE so they are never walled. */
+  cardSetupRequired: boolean("card_setup_required").notNull().default(false),
   currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
   seatsIncluded: integer("seats_included").notNull().default(5),
   /** Platform-admin seat override: a ± delta applied ON TOP of the Stripe

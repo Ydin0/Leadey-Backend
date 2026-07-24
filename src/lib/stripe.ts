@@ -159,21 +159,36 @@ export async function createCheckoutSession(
   successUrl: string,
   cancelUrl: string,
   discountPct = 0,
+  opts: { trialDays?: number } = {},
 ): Promise<string> {
   const customerId = await getOrCreateStripeCustomer(orgId, orgName, email);
 
   const discounts =
     discountPct > 0 ? [{ coupon: await getOrCreateDiscountCoupon(discountPct) }] : undefined;
 
+  // Signup free-trial: capture the card now (payment_method_collection:"always"
+  // forces card entry even though $0 is due today), start a Stripe-managed trial
+  // that auto-charges at the end, and cancel rather than dun if — impossibly,
+  // given we require a card — none is on file when the trial ends.
+  const trial =
+    opts.trialDays && opts.trialDays > 0
+      ? {
+          trial_period_days: opts.trialDays,
+          trial_settings: { end_behavior: { missing_payment_method: "cancel" as const } },
+        }
+      : undefined;
+
   const session = await stripe.checkout.sessions.create({
     customer: customerId,
     mode: "subscription",
     line_items: [{ price: priceId, quantity: seats }],
     ...(discounts ? { discounts } : {}),
+    ...(trial ? { payment_method_collection: "always" as const } : {}),
     success_url: successUrl,
     cancel_url: cancelUrl,
     subscription_data: {
       metadata: { orgId },
+      ...(trial ?? {}),
     },
     metadata: { orgId },
   });

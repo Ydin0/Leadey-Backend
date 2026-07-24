@@ -34,6 +34,8 @@ export function planGuard() {
         planStatus: organizations.planStatus,
         trialEndsAt: organizations.trialEndsAt,
         currentPeriodEnd: organizations.currentPeriodEnd,
+        cardSetupRequired: organizations.cardSetupRequired,
+        stripeSubscriptionId: organizations.stripeSubscriptionId,
       })
       .from(organizations)
       .where(eq(organizations.id, orgId));
@@ -41,6 +43,18 @@ export function planGuard() {
     if (!org) return next();
 
     const now = Date.now();
+
+    // Signup payment wall — org flagged at creation with no subscription yet
+    // must add a card before doing anything mutating. GETs stay allowed so the
+    // app can render and the frontend can redirect to /start-trial.
+    if (org.cardSetupRequired && !org.stripeSubscriptionId) {
+      if (req.method !== "GET") {
+        res.status(403).json({
+          error: { message: "Please add a payment method to start your free trial.", code: "PAYMENT_SETUP_REQUIRED" },
+        });
+        return;
+      }
+    }
 
     // Trial expired check
     if (org.plan === "trial" && org.trialEndsAt && org.trialEndsAt.getTime() < now) {

@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN IF NOT EXISTS "card_setup_required" boolean DEFAULT false NOT NULL;
