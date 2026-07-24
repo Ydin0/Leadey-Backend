@@ -210,6 +210,14 @@ function buildCondition(c: Condition, ctx: FilterCtx): SQL | null {
     return String(c.value) === "true" ? today : sql`not ${today}`;
   }
 
+  // Times called today — count of calls placed to the lead on the current
+  // server day (numeric). Consistent with "Called today" (≥1 ⟺ Yes).
+  if (field === "callsToday") {
+    const callMatch = sql`cr.organization_id = ${ctx.orgId} and (cr.lead_id = ${leads.id} or (${leads.phone} <> '' and regexp_replace(cr.to_number, '[^0-9]', '', 'g') = regexp_replace(${leads.phone}, '[^0-9]', '', 'g')))`;
+    const expr = sql`(select count(*) from call_records cr where ${callMatch} and cr.called_at::date = current_date)`;
+    return applyNum(expr, op, c.value);
+  }
+
   // Campaign membership (org all-leads page). A lead belongs to exactly one
   // funnel; "is any of" matches per enrollment. Ids are org-scoped upstream.
   if (field === "funnelId") {
