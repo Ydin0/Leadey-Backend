@@ -15,9 +15,19 @@ import {
   getPlanFromPriceId,
 } from "../lib/stripe";
 import { ensureOrgMembershipCap } from "../lib/invitations";
+import { userBelongsToAnyOtherOrg } from "../lib/org-membership";
 import { getAuth } from "@clerk/express";
 
 const router = Router();
+
+/** Per-seat price table (GBP pence) surfaced to the plan pickers. */
+function priceTable() {
+  return {
+    starter: { priceId: process.env.STRIPE_STARTER_PRICE_ID || "", amount: 4900 },
+    growth: { priceId: process.env.STRIPE_GROWTH_PRICE_ID || "", amount: 6900 },
+    scale: { priceId: process.env.STRIPE_SCALE_PRICE_ID || "", amount: 9900 },
+  };
+}
 
 type AsyncHandler<P = Record<string, string>> = (
   req: Request<P>,
@@ -43,7 +53,31 @@ router.get(
       .from(organizations)
       .where(eq(organizations.id, orgId));
 
-    if (!org) throw new ApiError(404, "Organization not found");
+    // Org row not synced yet (the Clerk organization.created webhook lands a
+    // second or two after the client creates + switches to a new org). Rather
+    // than 404 — which makes the frontend gate fail OPEN and briefly let an
+    // unpaid org into the app — return a synthetic "needs payment setup" so the
+    // gate redirects to the wall immediately. Trial eligibility is computed from
+    // the caller's Clerk memberships (a brand-new signup has no other org).
+    if (!org) {
+      let trialAllowed = true;
+      try {
+        const userId = getAuth(req)?.userId;
+        if (userId && (await userBelongsToAnyOtherOrg(userId, orgId))) trialAllowed = false;
+      } catch { /* fail-open to trial */ }
+      res.json({
+        data: {
+          plan: "trial", planName: "Trial", planStatus: "trialing",
+          trialEndsAt: null, trialDaysLeft: 0, currentPeriodEnd: null,
+          stripeCustomerId: null, stripeSubscriptionId: null,
+          needsPaymentSetup: true, trialAllowed,
+          discountPct: 0, seatsIncluded: 1, creditsIncluded: 0, creditsUsed: 0,
+          enrichmentCredits: 0, funnelsAllowed: 0, phoneLinesAllowed: 0,
+          callRecording: false, aiSummaries: false, prices: priceTable(),
+        },
+      });
+      return;
+    }
 
     // Auto-sync: org has a Stripe customer but no linked subscription — check
     // for one and adopt it. Heals missed checkout webhooks for ANY plan (an
@@ -103,6 +137,9 @@ router.get(
         // before using the app. True only for orgs flagged at creation with
         // no subscription yet; drives the frontend gate + /start-trial page.
         needsPaymentSetup: !!org.cardSetupRequired && !org.stripeSubscriptionId,
+        // Whether the payment wall offers a free trial (false = pay immediately;
+        // set for additional workspaces created by an existing member).
+        trialAllowed: org.trialAllowed ?? true,
         discountPct: org.discountPct ?? 0,
         // Limits — use actual org values from DB, not plan defaults
         seatsIncluded: org.seatsIncluded,
@@ -114,11 +151,7 @@ router.get(
         callRecording: config.callRecording,
         aiSummaries: config.aiSummaries,
         // Pricing (per seat, GBP pence)
-        prices: {
-          starter: { priceId: process.env.STRIPE_STARTER_PRICE_ID || "", amount: 4900 },
-          growth: { priceId: process.env.STRIPE_GROWTH_PRICE_ID || "", amount: 6900 },
-          scale: { priceId: process.env.STRIPE_SCALE_PRICE_ID || "", amount: 9900 },
-        },
+        prices: priceTable(),
       },
     });
   }),
@@ -155,7 +188,10 @@ router.post(
     // Signup free trial: capture the card and start a 30-day Stripe trial that
     // auto-charges at the end. Only the /start-trial wall passes trial:true;
     // the in-app upgrade buttons omit it → immediate paid subscription.
-    const trialDays = trial ? 30 : undefined;
+    // Authoritative guard: a trial is only granted when the ORG is eligible
+    // (org.trialAllowed) — an additional workspace created by an existing member
+    // can never obtain a trial even if the client forges trial:true.
+    const trialDays = trial && org.trialAllowed ? 30 : undefined;
     const cancelFallback = trial
       ? `${appOrigin()}/start-trial`
       : `${appOrigin()}/dashboard/settings?tab=billing`;

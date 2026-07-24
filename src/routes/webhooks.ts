@@ -20,7 +20,7 @@ import { setLeadCustomFields, ensureFieldDefinition } from "../lib/custom-fields
 import { pushLeadsToSmartlead } from "../lib/smartlead-sync";
 import { stripe, getPlanFromPriceId, getPlanConfig, getPlanGrantCredits } from "../lib/stripe";
 import { addCredits, billEnrichmentResults } from "../lib/credits";
-import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments, upsertMembership, deleteMembership, deleteAllMembershipsForUser } from "../lib/org-membership";
+import { invalidateOrgMembership, syncUserPrimaryOrg, cleanupUserOrgAssignments, upsertMembership, deleteMembership, deleteAllMembershipsForUser, userBelongsToAnyOtherOrg } from "../lib/org-membership";
 import { invalidateUserPermissions } from "../lib/permission-service";
 import { fireTrigger, fireTriggerForLead, notifyWorkflowEvent } from "../services/workflow-engine";
 import { suppressEmail } from "../lib/suppression";
@@ -473,6 +473,20 @@ router.post("/clerk", async (req: Request, res: Response) => {
     switch (type) {
       // ── Organization events ──
       case "organization.created": {
+        // Free trial only for a genuine first-time signup. If the creator
+        // already belongs to another org, this is an ADDITIONAL workspace — no
+        // trial, they must pay immediately (stops unlimited free-trial abuse).
+        // Fail-open to trial on a Clerk error so a hiccup never blocks a real
+        // first signup.
+        const creatorId: string | undefined = data.created_by;
+        let trialAllowed = true;
+        try {
+          if (creatorId && (await userBelongsToAnyOtherOrg(creatorId, data.id))) {
+            trialAllowed = false;
+          }
+        } catch (err) {
+          console.error("[org.created] trial-eligibility check failed (defaulting to trial):", err);
+        }
         await db.insert(organizations).values({
           id: data.id,
           name: data.name,
@@ -480,10 +494,12 @@ router.post("/clerk", async (req: Request, res: Response) => {
           imageUrl: data.image_url,
           plan: "trial",
           planStatus: "trialing",
-          trialEndsAt: new Date(Date.now() + 30 * 86400000), // 30-day trial
-          // New orgs must add a card + start a Stripe trial subscription before
-          // using the app (signup payment wall). Cleared once a subscription is
-          // attached. The trialEndsAt above is just a pre-card display default.
+          // No free trial window for must-pay (additional) orgs.
+          trialEndsAt: trialAllowed ? new Date(Date.now() + 30 * 86400000) : null,
+          trialAllowed,
+          // New orgs must add a card before using the app (signup payment wall).
+          // Cleared once a subscription is attached. For trial-allowed orgs the
+          // wall starts a 30-day trial; otherwise it charges immediately.
           cardSetupRequired: true,
           createdAt: new Date(data.created_at),
           updatedAt: new Date(data.updated_at),

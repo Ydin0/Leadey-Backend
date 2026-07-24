@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN IF NOT EXISTS "trial_allowed" boolean DEFAULT true NOT NULL;

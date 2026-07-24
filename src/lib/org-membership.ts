@@ -228,6 +228,17 @@ async function fetchMemberOrgIds(userId: string): Promise<Set<string>> {
   return orgs;
 }
 
+/** Whether a user already belongs to ANY organization other than `excludeOrgId`,
+ *  per Clerk (the source of truth). Used at org-creation time to decide if the
+ *  creator is an existing member (→ must pay, no free trial) vs a first-time
+ *  signup. Fetches fresh (not the TTL cache) so the decision is authoritative;
+ *  callers should treat a thrown error as "allow trial" (fail-open). */
+export async function userBelongsToAnyOtherOrg(userId: string, excludeOrgId: string): Promise<boolean> {
+  if (!userId) return false;
+  const list = await clerkClient.users.getOrganizationMembershipList({ userId, limit: 100 });
+  return list.data.some((m) => m.organization.id !== excludeOrgId);
+}
+
 /** Whether a user is a member of an org per Clerk (the source of truth),
  *  cached. Use this instead of the local `users.organizationId` column when
  *  checking membership: that column is single-org, so a user who belongs to

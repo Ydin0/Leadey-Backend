@@ -18,6 +18,11 @@ export const organizations = pgTable("organizations", {
    *  Cleared to FALSE once a Stripe subscription is attached. Existing orgs
    *  were backfilled FALSE so they are never walled. */
   cardSetupRequired: boolean("card_setup_required").notNull().default(false),
+  /** Whether this org may start a FREE trial. False when it was created by a
+   *  user who already belonged to another org (an additional workspace) — those
+   *  must pay immediately, so people can't spin up unlimited free trials. True
+   *  for genuine first-time signups (and all pre-existing orgs). */
+  trialAllowed: boolean("trial_allowed").notNull().default(true),
   currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
   seatsIncluded: integer("seats_included").notNull().default(5),
   /** Platform-admin seat override: a ± delta applied ON TOP of the Stripe
