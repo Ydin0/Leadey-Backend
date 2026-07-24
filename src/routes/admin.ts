@@ -601,6 +601,24 @@ router.delete(
       .from(organizations)
       .where(eq(organizations.id, req.params.id));
 
+    // Cancel any live Stripe subscription FIRST so deleting the org can never
+    // leave the customer being charged for something that no longer exists.
+    // Best-effort + immediate (the org is being destroyed, so there's no
+    // "until period end"). Safe to run even if already cancelled.
+    let subscriptionCancelled = false;
+    if (before?.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(before.stripeSubscriptionId);
+        subscriptionCancelled = true;
+      } catch (err: any) {
+        // A 404 (already gone) is fine; anything else we log but don't block
+        // the delete — the admin explicitly chose to remove the org.
+        if (err?.code !== "resource_missing") {
+          console.error(`[admin] org ${req.params.id} sub cancel on delete failed:`, err?.message || err);
+        }
+      }
+    }
+
     await clerkFetch(`/organizations/${req.params.id}`, { method: "DELETE" });
 
     await recordAudit({
@@ -608,10 +626,11 @@ router.delete(
       action: "org.delete",
       targetType: "organization",
       targetId: req.params.id,
+      metadata: { subscriptionCancelled, stripeSubscriptionId: before?.stripeSubscriptionId ?? null },
       before,
     });
 
-    res.json({ data: { id: req.params.id, deleted: true } });
+    res.json({ data: { id: req.params.id, deleted: true, subscriptionCancelled } });
   }),
 );
 
